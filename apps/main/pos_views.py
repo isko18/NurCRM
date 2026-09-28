@@ -90,6 +90,7 @@ def _ekassa_checkout_hint(company):
         return {"queued": True}
     return None
 from apps.main.services_agent_pos import checkout_agent_cart, AgentNotEnoughStock
+from apps.main.notifications_market import notify_sale_created
 from apps.main.utils_numbers import ensure_sale_doc_number
 from apps.main.views import CompanyBranchRestrictedMixin, SupplierReceiptLimitPagination
 from apps.construction.models import Cashbox, CashShift
@@ -2849,6 +2850,8 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                     payload["sale"] = _serialize_pos_sale(request, active_open)
                     payload["carts"] = [_serialize_pos_cart_tab(c, ordered) for c in ordered]
 
+        notify_sale_created(sale, actor=request.user)
+
         hint = _ekassa_checkout_hint(sale.company)
         if hint:
             payload["ekassa"] = hint
@@ -3350,6 +3353,62 @@ def _resolve_return_shift(sale: Sale, user, cashbox, payload: Optional[Dict] = N
     return None
 
 
+def _create_refund_cash_kept_flow(*, sale, cashbox, user, shift, amount, method, idempotency_key):
+    """
+    Чек был оплачен наличными, а деньги вернули безналом — наличные физически
+    остались в ящике. Строки оплат при возврате уже «унесли» их из расчёта смены,
+    поэтому возвращаем сумму обратно отдельным приходом, иначе при закрытии
+    смены появится ложная недостача.
+    """
+    from apps.construction.models import CashFlow
+    from apps.construction.auto_cashflow import create_auto_cashflow
+
+    return create_auto_cashflow(
+        company=sale.company,
+        branch=sale.branch,
+        cashbox=cashbox,
+        user=user,
+        shift=shift,
+        type=CashFlow.Type.INCOME,
+        amount=amount,
+        source_kind=CashFlow.SourceKind.POS_SALE_RETURN,
+        source_id=str(sale.id),
+        idempotency_key=f"{idempotency_key}:{method}:cash-kept" if idempotency_key else None,
+        affects_shift_drawer=True,
+        name=f"Наличные остались в кассе: возврат по чеку №{sale.doc_number or sale.id} отдан безналом",
+        source_business_operation_id="pos_sale_return",
+    )
+
+
+def _refund_drawer_effect(original_method, refund_method, has_shift):
+    """
+    Как возврат влияет на наличный ящик смены, с учётом способа, которым деньги
+    фактически отдали (`refund_method` в теле запроса).
+
+    Ящик считается по строкам оплат живых чеков, поэтому обычный возврат он
+    отражает сам: полный уводит чек из paid, частичный уменьшает строки оплат.
+    Трогать ящик нужно только когда способ возврата разошёлся с исходной оплатой:
+
+      * чек оплачен безналом, деньги отдали наличными → наличные ушли из ящика,
+        но по строкам оплат там их и не было → нужен расход (expense_affects);
+      * чек оплачен наличными, деньги вернули переводом → строки оплат уже
+        «унесли» наличные из ящика, хотя физически они остались → нужен
+        компенсирующий приход (income_adjust).
+
+    Возвращает (expense_affects_drawer, needs_income_adjustment).
+    """
+    orig_cash = str(original_method or "cash").strip().lower() == "cash"
+    rm = str(refund_method or "").strip().lower() or None
+    if rm in (None, "original", "same"):
+        refund_cash = orig_cash
+    else:
+        refund_cash = (rm == "cash")
+
+    if not has_shift:
+        return False, False
+    return (refund_cash and not orig_cash), (orig_cash and not refund_cash)
+
+
 def _broadcast_return_realtime(sale: Sale, created_flows, shift=None):
     try:
         from asgiref.sync import async_to_sync
@@ -3374,7 +3433,11 @@ def _broadcast_return_realtime(sale: Sale, created_flows, shift=None):
                     },
                 },
             )
-        if shift and any(getattr(cf, "affects_shift_drawer", False) for cf in created_flows):
+        # Раньше условием был affects_shift_drawer у компенсирующего движения. Теперь
+        # возврат ящик через движение не уменьшает (сумма уже учтена через статус
+        # чека и пересчитанные строки оплат), но drawer_expected_cash при этом всё
+        # равно меняется — значит экран смены надо обновлять при любом возврате.
+        if shift and created_flows:
             totals = shift.calc_live_totals()
             async_to_sync(channel_layer.group_send)(
                 company_group,
@@ -3408,6 +3471,8 @@ def _execute_sale_return(
     is_agent_sale = sale.agent_allocations.exists()
     payload = payload or {}
     idempotency_key = payload.get("idempotency_key")
+    # Чем деньги фактически отдали: "cash" | "original" (по умолчанию) | способ безнала.
+    refund_method = payload.get("refund_method")
 
     if not partial_items:
         returned_money = sale.total or Decimal("0.00")
@@ -3516,7 +3581,11 @@ def _execute_sale_return(
                 for p in payments:
                     p_amt = p.amount
                     p_m = str(p.method or "cash").lower()
-                    affects_drawer = (p_m == "cash") and (actual_shift is not None)
+                    # Способ, которым деньги фактически отдали, может отличаться от
+                    # исходной оплаты — тогда ящик надо поправить (см. _refund_drawer_effect).
+                    affects_drawer, _needs_income = _refund_drawer_effect(
+                        p_m, refund_method, actual_shift is not None
+                    )
                     ik = f"{idempotency_key}:{p_m}" if idempotency_key else None
                     cf = create_auto_cashflow(
                         company=sale.company,
@@ -3535,6 +3604,14 @@ def _execute_sale_return(
                     )
                     if cf:
                         created_flows.append(cf)
+                    if _needs_income:
+                        adj = _create_refund_cash_kept_flow(
+                            sale=sale, cashbox=cashbox, user=user, shift=actual_shift,
+                            amount=cf.amount if cf else None, method=p_m,
+                            idempotency_key=idempotency_key,
+                        )
+                        if adj:
+                            created_flows.append(adj)
             else:
                 total_orig = sum(p.amount for p in payments) or sale.total
                 ratio = (cash_to_refund / total_orig) if total_orig > 0 else Decimal("0")
@@ -3542,7 +3619,11 @@ def _execute_sale_return(
                     part_amt = money(p.amount * ratio)
                     if part_amt > Decimal("0.00"):
                         p_m = str(p.method or "cash").lower()
-                        affects_drawer = (p_m == "cash") and (actual_shift is not None)
+                        # Способ, которым деньги фактически отдали, может отличаться от
+                        # исходной оплаты — тогда ящик надо поправить (см. _refund_drawer_effect).
+                        affects_drawer, _needs_income = _refund_drawer_effect(
+                            p_m, refund_method, actual_shift is not None
+                        )
                         ik = f"{idempotency_key}:{p_m}" if idempotency_key else None
                         cf = create_auto_cashflow(
                             company=sale.company,
@@ -3561,11 +3642,23 @@ def _execute_sale_return(
                         )
                         if cf:
                             created_flows.append(cf)
+                        if _needs_income:
+                            adj = _create_refund_cash_kept_flow(
+                                sale=sale, cashbox=cashbox, user=user, shift=actual_shift,
+                                amount=cf.amount if cf else None, method=p_m,
+                                idempotency_key=idempotency_key,
+                            )
+                            if adj:
+                                created_flows.append(adj)
         else:
             p_m = str(sale.payment_method or "cash").lower()
             if p_m == "debt":
                 p_m = "cash"
-            affects_drawer = (p_m == "cash") and (actual_shift is not None)
+            # Способ, которым деньги фактически отдали, может отличаться от
+            # исходной оплаты — тогда ящик надо поправить (см. _refund_drawer_effect).
+            affects_drawer, _needs_income = _refund_drawer_effect(
+                p_m, refund_method, actual_shift is not None
+            )
             cf = create_auto_cashflow(
                 company=sale.company,
                 branch=sale.branch,
@@ -3583,6 +3676,14 @@ def _execute_sale_return(
             )
             if cf:
                 created_flows.append(cf)
+            if _needs_income:
+                adj = _create_refund_cash_kept_flow(
+                    sale=sale, cashbox=cashbox, user=user, shift=actual_shift,
+                    amount=cf.amount if cf else None, method=p_m,
+                    idempotency_key=idempotency_key,
+                )
+                if adj:
+                    created_flows.append(adj)
 
     if idempotency_key:
         from apps.main.models import SaleReturn
@@ -5096,9 +5197,17 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
 
             pm = payment_method or Sale.PaymentMethod.CASH
             cr = cash_received
+            prepay_req = request.data.get("prepayment") or request.data.get("prepayment_amount")
+            if prepay_req is not None and str(prepay_req).strip() != "":
+                prepay_val = Decimal(str(prepay_req))
+            else:
+                prepay_val = cr if (cr is not None and cr > Decimal("0.00")) else Decimal("0.00")
+
             if pm == Sale.PaymentMethod.CASH:
                 if cr is None:
                     cr = sale.total
+            elif pm == Sale.PaymentMethod.DEBT:
+                cr = prepay_val
             else:
                 cr = Decimal("0.00")
 
@@ -5146,7 +5255,9 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                         unlinked_deal.sale = sale
                         if not unlinked_deal.amount or unlinked_deal.amount == Decimal("0.00"):
                             unlinked_deal.amount = debt_amt
-                        unlinked_deal.save(update_fields=["sale", "amount", "updated_at"])
+                        if prepay_val > Decimal("0.00") and unlinked_deal.prepayment == Decimal("0.00"):
+                            unlinked_deal.prepayment = prepay_val
+                        unlinked_deal.save(update_fields=["sale", "amount", "prepayment", "updated_at"])
                     else:
                         d_days = request.data.get("debt_days") or debt_sched.get("count")
                         d_months = request.data.get("debt_months")
@@ -5163,7 +5274,7 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                             title=f"Продажа в долг №{sale.id}",
                             kind=ClientDeal.Kind.DEBT,
                             amount=debt_amt,
-                            prepayment=Decimal("0.00"),
+                            prepayment=prepay_val,
                             schedule_version=sch_version,
                             debt_days=int(d_days) if d_days else (None if d_months else 30),
                             debt_months=int(d_months) if d_months else None,
@@ -5251,6 +5362,8 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                 payload["receipt_print_path"] = (
                     f"/api/main/pos/sales/{sale.id}/receipt/?wait_ekassa=1&receipt_text=1"
                 )
+
+        notify_sale_created(sale, actor=request.user)
 
         hint = _ekassa_checkout_hint(sale.company)
         if hint:

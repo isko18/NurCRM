@@ -3,9 +3,12 @@ from decimal import Decimal
 
 from django.db.models import Sum, Count, Avg, F, Case, When, DurationField, ExpressionWrapper, Q
 from django.db.models.functions import TruncDate
+from django.utils import timezone
+from django.utils.dateparse import parse_date
 
 from ..models import (
     LeadConsalting, StageTransitionConsalting, FunnelStageConsalting, SaleConsalting,
+    SaleRefundConsalting,
 )
 
 
@@ -210,6 +213,11 @@ class SalesAnalytics:
     def compute(company, date_from=None, date_to=None, branch=None, user=None, service=None):
         from ..models import RequestsConsalting
 
+        # The sale itself is an event at ``created_at``.  Refunds and
+        # cancellations are separate events and must be selected by their own
+        # timestamps, otherwise a later correction rewrites a past report.
+        date_to_value = parse_date(str(date_to)) if date_to else None
+
         qs = SaleConsalting.objects.filter(company=company)
         if branch:
             qs = qs.filter(branch_id=branch)
@@ -223,14 +231,35 @@ class SalesAnalytics:
             qs = qs.filter(created_at__date__lte=date_to)
 
         completed_qs = qs.filter(
-            status__in=[SaleConsalting.Status.COMPLETED, SaleConsalting.Status.PENDING_CONFIRMATION, SaleConsalting.Status.REFUNDED]
+            status__in=[SaleConsalting.Status.COMPLETED, SaleConsalting.Status.REFUNDED]
         )
-        canceled_qs = qs.filter(status=SaleConsalting.Status.CANCELED)
+        canceled_qs = SaleConsalting.objects.filter(company=company, status=SaleConsalting.Status.CANCELED)
+        if branch:
+            canceled_qs = canceled_qs.filter(branch_id=branch)
+        if user:
+            canceled_qs = canceled_qs.filter(user_id=user)
+        if service:
+            canceled_qs = canceled_qs.filter(services_id=service)
+        if date_from:
+            canceled_qs = canceled_qs.filter(canceled_at__date__gte=date_from)
+        if date_to:
+            canceled_qs = canceled_qs.filter(canceled_at__date__lte=date_to)
+
+        refunds_qs = SaleRefundConsalting.objects.filter(company=company)
+        if branch:
+            refunds_qs = refunds_qs.filter(sale__branch_id=branch)
+        if user:
+            refunds_qs = refunds_qs.filter(sale__user_id=user)
+        if service:
+            refunds_qs = refunds_qs.filter(sale__services_id=service)
+        if date_from:
+            refunds_qs = refunds_qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            refunds_qs = refunds_qs.filter(created_at__date__lte=date_to)
 
         agg_completed = completed_qs.aggregate(
             revenue=Sum("total"),
             count=Count("id"),
-            refunded=Sum("refunded_amount"),
             subscription_total=Sum("subscription_amount"),
         )
         agg_canceled = canceled_qs.aggregate(
@@ -239,7 +268,7 @@ class SalesAnalytics:
         )
 
         gross_revenue = Decimal(str(agg_completed["revenue"] or "0"))
-        refunded_amt = Decimal(str(agg_completed["refunded"] or "0"))
+        refunded_amt = refunds_qs.aggregate(refunded=Sum("amount"))["refunded"] or Decimal("0")
         canceled_amt = Decimal(str(agg_canceled["canceled_total"] or "0"))
         cancellations = refunded_amt + canceled_amt
         net_revenue = max(Decimal("0.00"), gross_revenue - refunded_amt)
@@ -286,19 +315,43 @@ class SalesAnalytics:
             "canceled": req_counts.get("canceled", 0),
         }
 
-        # 2. Уникальные и повторные клиенты
+        # 2. Уникальные и повторные клиенты.  A client who bought before the
+        # selected period is still a repeat client after one sale in it.
         clients_qs = (
             completed_qs.filter(client__isnull=False)
             .values("client_id")
             .annotate(sales_cnt=Count("id"))
         )
         unique_clients = len(clients_qs)
-        repeat_clients = sum(1 for c in clients_qs if c["sales_cnt"] > 1)
+        period_client_ids = [c["client_id"] for c in clients_qs]
+        history_qs = SaleConsalting.objects.filter(
+            company=company,
+            status__in=[SaleConsalting.Status.COMPLETED, SaleConsalting.Status.REFUNDED],
+            client_id__in=period_client_ids,
+        )
+        if date_to_value:
+            history_qs = history_qs.filter(created_at__date__lte=date_to_value)
+        repeat_clients = history_qs.values("client_id").annotate(sales_cnt=Count("id")).filter(sales_cnt__gt=1).count()
 
         # 3. Расчёт MRR (абонентская плата) — только реальные активные подписки (§5.2)
         from apps.consalting.models import SubscriptionConsalting
         sub_mrr = Decimal("0.00")
-        active_subs = SubscriptionConsalting.objects.filter(company=company, status=SubscriptionConsalting.Status.ACTIVE).select_related("tariff")
+        # MRR is a snapshot, not turnover for the selected range.  Use the end
+        # of that range as the snapshot date and scope subscriptions by their
+        # sale/client branch.
+        mrr_as_of = date_to_value or timezone.localdate()
+        active_subs = SubscriptionConsalting.objects.filter(
+            company=company,
+            start_date__lte=mrr_as_of,
+        ).filter(
+            Q(status=SubscriptionConsalting.Status.ACTIVE) |
+            Q(canceled_at__date__gt=mrr_as_of)
+        ).select_related("tariff")
+        if branch:
+            active_subs = active_subs.filter(
+                Q(sale__branch_id=branch) |
+                Q(sale__isnull=True, client__branch_id=branch)
+            )
         for sub in active_subs:
             amt = sub.amount or (sub.tariff.subscription_amount if sub.tariff else Decimal("0.00"))
             period = sub.period or (sub.tariff.subscription_period if sub.tariff else "month")
@@ -397,13 +450,19 @@ class SalesAnalytics:
             })
         by_employee.sort(key=lambda x: x["revenue"], reverse=True)
 
-        # 6. Динамика по дням
+        # 6. Daily net revenue: sale date adds revenue, refund date subtracts
+        # it.  Thus the chart always reconciles with ``net_revenue``.
+        daily = {}
+        for row in completed_qs.annotate(d=TruncDate("created_at")).values("d").annotate(v=Sum("total"), c=Count("id")):
+            if row["d"]:
+                daily[row["d"]] = {"revenue": row["v"] or Decimal("0"), "count": row["c"]}
+        for row in refunds_qs.annotate(d=TruncDate("created_at")).values("d").annotate(v=Sum("amount")):
+            if row["d"]:
+                entry = daily.setdefault(row["d"], {"revenue": Decimal("0"), "count": 0})
+                entry["revenue"] -= row["v"] or Decimal("0")
         by_day = [
-            {"date": r["d"].isoformat() if r["d"] else None, "revenue": float(r["v"] or 0), "count": r["c"]}
-            for r in (
-                completed_qs.annotate(d=TruncDate("created_at"))
-                .values("d").annotate(v=Sum("total"), c=Count("id")).order_by("d")
-            )
+            {"date": day.isoformat(), "revenue": float(values["revenue"]), "count": values["count"]}
+            for day, values in sorted(daily.items())
         ]
 
         # 7. Зарегистрированный факт оплаты
@@ -434,6 +493,7 @@ class SalesAnalytics:
             "paid_income": float(paid_income),
             "pending_cash": pending_cash,
             "subscription_mrr": subscription_mrr,
+            "subscription_mrr_as_of": mrr_as_of.isoformat(),
             "sales_count": sales_count,
             "requests_count": requests_count,
             "avg_check": round(float(net_revenue) / sales_count, 2) if sales_count else 0.0,
@@ -458,6 +518,7 @@ class SalesAnalytics:
                 "paid_income": float(paid_income),
                 "pending_cash": pending_cash,
                 "subscription_mrr": subscription_mrr,
+                "subscription_mrr_as_of": mrr_as_of.isoformat(),
                 "addon_revenue": addon_revenue,
                 "addon_count": addon_count,
             },
@@ -467,4 +528,3 @@ class SalesAnalytics:
             "by_day": by_day,
             "requests_by_status": requests_by_status,
         }
-

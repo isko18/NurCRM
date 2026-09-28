@@ -84,6 +84,7 @@ class CashShiftListSerializer(serializers.ModelSerializer):
     non_drawer_expenses_total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     cash_diff = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     payment_breakdown = serializers.SerializerMethodField()
+    cashier_breakdown = serializers.SerializerMethodField()
     resolved_cashbox_id = serializers.SerializerMethodField()
     resolved_cashbox_name = serializers.SerializerMethodField()
 
@@ -116,6 +117,7 @@ class CashShiftListSerializer(serializers.ModelSerializer):
             "non_drawer_expenses_total",
             "cash_diff",
             "payment_breakdown",
+            "cashier_breakdown",
         ]
         read_only_fields = fields
 
@@ -142,6 +144,9 @@ class CashShiftListSerializer(serializers.ModelSerializer):
 
     def get_payment_breakdown(self, obj):
         return obj.calc_payment_breakdown() or []
+
+    def get_cashier_breakdown(self, obj):
+        return obj.calc_cashier_breakdown() or []
 
     def to_representation(self, obj):
         data = super().to_representation(obj)
@@ -171,6 +176,8 @@ class CashShiftListSerializer(serializers.ModelSerializer):
         data["resolved_cashbox_id"] = str(obj.cashbox_id) if obj.cashbox_id else None
         data["resolved_cashbox_name"] = self.get_cashbox_name(obj)
         data["payment_breakdown"] = obj.calc_payment_breakdown() or []
+        # cashier_breakdown уже посчитан SerializerMethodField в super() —
+        # второй вызов здесь дал бы лишний запрос на каждую смену.
 
         return data
 
@@ -754,6 +761,38 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
 
             if user and (not _is_owner_like(user)) and shift.cashier_id != user.id:
                 raise serializers.ValidationError({"shift": "Это не ваша смена."})
+
+        # «Оплачено из кассы (ящика) смены» — shift-drawer-funding-purchases-backend.md.
+        # Обычная ручная запись ящик не трогает: calc_live_totals учитывает только
+        # движения, привязанные к смене И помеченные affects_shift_drawer. Оба
+        # признака проставляем по явному source_kind, чтобы не менять поведение
+        # остальных ручных операций кассы. Сам флаг выставляет CashFlow.save().
+        source_kind = attrs.get("source_kind") or getattr(self.instance, "source_kind", None)
+        if source_kind == CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW:
+            flow_type = attrs.get("type") or getattr(self.instance, "type", None)
+            if flow_type != CashFlow.Type.EXPENSE:
+                raise serializers.ValidationError(
+                    {"type": "Списание из кассы смены возможно только расходом."}
+                )
+            if not cashbox:
+                raise serializers.ValidationError({"cashbox": "Укажите кассу смены."})
+
+            if shift is None:
+                open_qs = CashShift.objects.filter(cashbox=cashbox, status=CashShift.Status.OPEN)
+                if user and not _is_owner_like(user):
+                    open_qs = open_qs.filter(cashier=user)
+                candidates = list(open_qs.order_by("-opened_at")[:2])
+                if not candidates:
+                    raise serializers.ValidationError(
+                        {"shift": "На этой кассе нет открытой смены — списывать из ящика нечего."}
+                    )
+                if len(candidates) > 1:
+                    # Общая касса на несколько смен: угадывать, из чьего ящика
+                    # ушли деньги, нельзя — пусть вызывающий укажет смену явно.
+                    raise serializers.ValidationError(
+                        {"shift": "На кассе открыто несколько смен — укажите смену явно."}
+                    )
+                attrs["shift"] = candidates[0]
 
         # ✅ если shift не передали или shift=None — это “общий режим”, разрешаем
         return attrs

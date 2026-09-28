@@ -2423,7 +2423,8 @@ class Sale(models.Model):
             if self.payment_method == self.PaymentMethod.DEBT:
                 self.status = self.Status.DEBT
                 self.paid_at = None
-                self.cash_received = Decimal("0.00")
+                if cash_received is not None:
+                    self.cash_received = cash_received
                 self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
                 return
 

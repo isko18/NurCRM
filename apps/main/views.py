@@ -993,6 +993,31 @@ class ProductBarcodeAwareSearchFilter(filters.SearchFilter):
         return getattr(view, "search_fields", None)
 
 
+def _cashflows_by_product_map(products):
+    """
+    Движения кассы по всем товарам страницы одним запросом.
+
+    ProductSerializer.get_cashflows иначе делает запрос на каждый товар —
+    на странице в 100 позиций это ~100 запросов и самая дорогая часть ответа.
+    """
+    from apps.construction.models import CashFlow
+    from apps.construction.auto_cashflow import serialize_auto_cashflows
+
+    ids = [str(p.id) for p in products]
+    if not ids:
+        return {}
+    company_ids = {p.company_id for p in products if p.company_id}
+
+    flows = CashFlow.objects.filter(source_id__in=ids)
+    if company_ids:
+        flows = flows.filter(company_id__in=company_ids)
+
+    grouped = {}
+    for cf in flows.select_related("cashbox", "cashbox__branch"):
+        grouped.setdefault(cf.source_id, []).append(cf)
+    return {pid: serialize_auto_cashflows(items) for pid, items in grouped.items()}
+
+
 class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = ProductSerializer
     filter_backends = [ProductBarcodeAwareSearchFilter, filters.OrderingFilter]
@@ -1022,11 +1047,27 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
                 # (по ~100 доп. запросов на страницу): промо-ступени и поставщики.
                 "promotion_tiers",
                 Prefetch("suppliers", queryset=Client.objects.only("id", "full_name")),
+                # Те же ~100 лишних запросов на страницу давали доп. штрихкоды и
+                # партии срока годности — теперь грузятся одним запросом каждый.
+                "alternate_barcodes",
+                "expiry_batches",
                 product_images_prefetch,
             )
         )
         qs = _filter_products_company_only(self, qs)
         return _annotate_product_is_favorite(qs)
+
+    def paginate_queryset(self, queryset):
+        page = super().paginate_queryset(queryset)
+        self._page_for_cashflows = page
+        return page
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        page = getattr(self, "_page_for_cashflows", None)
+        if page:
+            ctx["cashflows_by_product"] = _cashflows_by_product_map(page)
+        return ctx
 
     def filter_queryset(self, queryset):
         qs = super().filter_queryset(queryset)
@@ -2697,7 +2738,14 @@ class MarkAllNotificationsReadView(APIView):
         if cat:
             qs = qs.filter(Q(category=cat) | Q(type=cat))
         qs.update(is_read=True)
-        return Response({"status": "Все уведомления прочитаны"}, status=status.HTTP_200_OK)
+        from apps.main.notifications_market import push_unread_count
+
+        push_unread_count(request.user)
+        unread = Notification.objects.filter(user=request.user, is_read=False).count()
+        return Response(
+            {"status": "Все уведомления прочитаны", "unread_count": unread},
+            status=status.HTTP_200_OK,
+        )
 
 
 class MarkNotificationReadView(APIView):
@@ -2711,7 +2759,14 @@ class MarkNotificationReadView(APIView):
         if not notification.is_read:
             notification.is_read = True
             notification.save(update_fields=["is_read"])
-        return Response({"id": str(notification.id), "is_read": True}, status=status.HTTP_200_OK)
+            from apps.main.notifications_market import push_unread_count
+
+            push_unread_count(request.user)
+        unread = Notification.objects.filter(user=request.user, is_read=False).count()
+        return Response(
+            {"id": str(notification.id), "is_read": True, "unread_count": unread},
+            status=status.HTTP_200_OK,
+        )
 
 
 class POSQuickSlotsAPIView(CompanyBranchRestrictedMixin, APIView):
@@ -3223,19 +3278,25 @@ class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
         # ✅ Защита от дублирования сделок при продаже в долг (если фронтенд вызывает POST /deals/ сразу после checkout):
         kind = serializer.validated_data.get("kind")
         sale = serializer.validated_data.get("sale")
-        if kind == ClientDeal.Kind.DEBT and not sale and client:
-            from datetime import timedelta
-            recent_deal = (
-                ClientDeal.objects.filter(
-                    client=client,
-                    kind=ClientDeal.Kind.DEBT,
+        if kind == ClientDeal.Kind.DEBT and client:
+            target_deal = None
+            if sale:
+                target_deal = ClientDeal.objects.filter(sale=sale).first()
+            if not target_deal:
+                recent_deal = (
+                    ClientDeal.objects.filter(
+                        client=client,
+                        kind=ClientDeal.Kind.DEBT,
+                    )
+                    .order_by("-created_at")
+                    .first()
                 )
-                .order_by("-created_at")
-                .first()
-            )
-            if recent_deal and abs((timezone.now() - recent_deal.created_at).total_seconds()) <= 120:
-                serializer.update(recent_deal, serializer.validated_data.copy())
-                serializer.instance = recent_deal
+                if recent_deal and abs((timezone.now() - recent_deal.created_at).total_seconds()) <= 120:
+                    target_deal = recent_deal
+
+            if target_deal:
+                serializer.update(target_deal, serializer.validated_data.copy())
+                serializer.instance = target_deal
                 return
 
 

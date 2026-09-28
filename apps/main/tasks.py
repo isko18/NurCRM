@@ -121,3 +121,16 @@ def product_expiry_digest():
     count = send_product_expiry_digest_for_all_companies()
     logger.info("product_expiry_digest finished: created %d notifications", count)
     return {"created_notifications_count": count}
+
+
+@shared_task(name="apps.main.tasks.send_tariff_notifications")
+def send_tariff_notifications():
+    """
+    Ежедневная проверка окончания подписок: tariff.expiring за 7/3/1 день
+    владельцу компании (realtime-notifications-backend.md §6.5).
+    """
+    from apps.main.realtime import check_and_create_tariff_notifications
+
+    created = check_and_create_tariff_notifications()
+    logger.info("send_tariff_notifications finished: created %d notifications", len(created))
+    return {"created_notifications_count": len(created)}

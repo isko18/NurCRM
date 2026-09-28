@@ -41,6 +41,10 @@ class SaleItemHistorySerializer(serializers.ModelSerializer):
 class SaleHistorySerializer(serializers.ModelSerializer):
     change = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     client_name = serializers.SerializerMethodField()
+    # Продавец чека. `user` остаётся для обратной совместимости, `cashier_id` —
+    # явный стабильный ключ для фильтра/группировки на фронте (Q2 в ТЗ):
+    # по `cashier_display` тёзки склеиваются в одного человека.
+    cashier_id = serializers.SerializerMethodField()
     cashier_display = serializers.SerializerMethodField()
     items = SaleItemHistorySerializer(many=True, read_only=True)
 
@@ -71,6 +75,7 @@ class SaleHistorySerializer(serializers.ModelSerializer):
             "client",
             "client_name",
             "user",
+            "cashier_id",
             "cashier_display",
 
             "items",
@@ -82,6 +87,10 @@ class SaleHistorySerializer(serializers.ModelSerializer):
         if not c:
             return None
         return getattr(c, "name", None) or str(c)
+
+    def get_cashier_id(self, obj):
+        # Строкой — как в cashier_breakdown смены, чтобы фронт сравнивал их напрямую.
+        return str(obj.user_id) if obj.user_id else None
 
     def get_cashier_display(self, obj):
         u = getattr(obj, "user", None)

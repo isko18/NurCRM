@@ -19,6 +19,7 @@ from rest_framework.pagination import PageNumberPagination
 
 from apps.construction.models import Cashbox, CashFlow, CashFlowCategory, CashShift
 
+from apps.main.notifications_market import notify_shift_closed, notify_shift_opened
 from apps.ekassa.runtime import schedule_after_commit
 from apps.ekassa.shift_bridge import (
     sync_ekassa_after_local_shift_close_by_id,
@@ -1116,6 +1117,17 @@ class CashShiftDetailView(CompanyBranchScopedMixin, generics.RetrieveAPIView):
 
         return qs
 
+    def retrieve(self, request, *args, **kwargs):
+        response = super().retrieve(request, *args, **kwargs)
+        shift = self.get_object()
+        # Ключ есть всегда (null — если предупреждать не о чем), чтобы фронту не
+        # приходилось различать «поля нет» и «поле пустое». У закрытой смены
+        # предупреждать уже поздно и не о чем.
+        response.data["cashbox_warning"] = (
+            shift.cashbox_shared_warning() if shift.status == CashShift.Status.OPEN else None
+        )
+        return response
+
 
 class CashShiftOpenView(CompanyBranchScopedMixin, generics.CreateAPIView):
     """
@@ -1131,8 +1143,13 @@ class CashShiftOpenView(CompanyBranchScopedMixin, generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         shift = serializer.save()
+        notify_shift_opened(shift, actor=request.user)
         schedule_after_commit(sync_ekassa_after_local_shift_open_by_id, shift.id)
         out = CashShiftListSerializer(shift, context={"request": request}).data
+        # Не блокируем открытие: бывают легитимные схемы с общей кассой. Но если на
+        # этой кассе уже открыта чужая смена — показываем, чья и сколько по её данным
+        # в ящике, чтобы кассир заметил чужую кассу до закрытия смены.
+        out["cashbox_warning"] = shift.cashbox_shared_warning()
         return Response(out, status=201)
 
 
@@ -1163,6 +1180,7 @@ class CashShiftCloseView(APIView):
         except Exception as e:
             raise ValidationError(str(e))
 
+        notify_shift_closed(shift, actor=request.user)
         schedule_after_commit(sync_ekassa_after_local_shift_close_by_id, shift.id)
         out = CashShiftListSerializer(shift, context={"request": request}).data
         return Response(out, status=200)

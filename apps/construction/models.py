@@ -429,7 +429,38 @@ class CashShift(models.Model):
         cash_sales_total = (pay_agg["cash_sum"] or z) + (legacy_agg["cash_sum"] or z)
         noncash_sales_total = (pay_agg["noncash_sum"] or z) + (legacy_agg["noncash_sum"] or z)
 
-        drawer_expected_cash = (self.opening_cash or z) + cash_sales_total + income_total - expense_total
+        # Наличные, реально осевшие в ящике. Отличается от cash_sales_total (витрина,
+        # только status=paid) двумя вещами:
+        #   * частично возвращённые чеки учитываются — их строки оплат уже уменьшены
+        #     до остатка (_rescale_sale_payments_after_partial_return), значит там
+        #     лежит именно та наличность, что осталась в ящике;
+        #   * полностью отменённые НЕ учитываются — деньги вернули покупателю.
+        # Компенсирующее движение pos_sale_return при этом из ящика НЕ вычитается
+        # (affects_shift_drawer=False): возврат уже учтён здесь, иначе сумма
+        # снималась бы дважды.
+        drawer_cash_in = (
+            SalePayment.objects.filter(
+                sale__shift_id=self.id,
+                sale__status__in=[Sale.Status.PAID, Sale.Status.PARTIALLY_RETURNED],
+                method=Sale.PaymentMethod.CASH,
+            ).aggregate(s=Sum("amount"))["s"]
+            or z
+        )
+        drawer_legacy_cash = (
+            Sale.objects.filter(
+                shift_id=self.id,
+                status__in=[Sale.Status.PAID, Sale.Status.PARTIALLY_RETURNED],
+                payment_method=Sale.PaymentMethod.CASH,
+            )
+            .annotate(pay_cnt=Count("payments"))
+            .filter(pay_cnt=0)
+            .aggregate(s=Sum("total"))["s"]
+            or z
+        )
+
+        drawer_expected_cash = (
+            (self.opening_cash or z) + drawer_cash_in + drawer_legacy_cash + income_total - expense_total
+        )
         expected_cash = drawer_expected_cash
 
         # non_drawer_expenses_total: закупки/расходы за период смены, не влияющие на ящик
@@ -571,6 +602,108 @@ class CashShift(models.Model):
                 "amount": str(item["amount"].quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
             })
 
+        return res
+
+    def other_open_shifts_on_cashbox(self) -> list:
+        """
+        Чужие открытые смены на той же кассе.
+
+        Касса — это один физический денежный ящик, но открытых смен на ней может
+        быть несколько (по одной на кассира), и у каждой свой независимый
+        opening_cash. Из-за этого один и тот же ящик считается дважды, и сверка
+        при закрытии даёт расхождение на чужие деньги. Отдаём данные, чтобы
+        предупредить кассира до того, как он введёт свой остаток.
+        """
+        if not self.cashbox_id:
+            return []
+
+        qs = (
+            CashShift.objects
+            .filter(cashbox_id=self.cashbox_id, status=CashShift.Status.OPEN)
+            .exclude(pk=self.pk)
+            .select_related("cashier")
+            .order_by("opened_at")
+        )
+
+        res = []
+        for sh in qs:
+            u = sh.cashier
+            display = ""
+            if u is not None:
+                display = (
+                    f"{(u.first_name or '').strip()} {(u.last_name or '').strip()}".strip()
+                    or getattr(u, "email", "") or ""
+                )
+            res.append({
+                "shift_id": str(sh.id),
+                "cashier_id": str(sh.cashier_id) if sh.cashier_id else None,
+                "cashier_display": display,
+                "opened_at": sh.opened_at.isoformat() if sh.opened_at else None,
+                "opening_cash": str(sh.opening_cash or Decimal("0.00")),
+                "drawer_expected_cash": str(sh.drawer_expected_cash),
+            })
+        return res
+
+    def cashbox_shared_warning(self) -> dict | None:
+        """Готовое предупреждение для UI или None, если касса занята только этой сменой."""
+        others = self.other_open_shifts_on_cashbox()
+        if not others:
+            return None
+
+        cashbox_name = getattr(self.cashbox, "name", None) or "касса"
+        first = others[0]
+        who = first["cashier_display"] or "другой кассир"
+        expected = first["drawer_expected_cash"]
+        tail = "" if len(others) == 1 else f" (всего открытых смен на кассе: {len(others) + 1})"
+        return {
+            "code": "cashbox_has_other_open_shift",
+            "message": (
+                f"На кассе «{cashbox_name}» уже открыта смена: {who}. "
+                f"По её данным в ящике ожидается {expected} сом. "
+                f"Проверьте, что вы открыли смену на своей кассе — иначе при закрытии "
+                f"будет расхождение на чужие деньги.{tail}"
+            ),
+            "cashbox_id": str(self.cashbox_id),
+            "cashbox_name": cashbox_name,
+            "open_shifts": others,
+        }
+
+    def calc_cashier_breakdown(self) -> list:
+        """
+        Разбивка продаж смены по продавцам чеков (shift-sales-cashier-filter-backend.md §4.2).
+
+        Группируем по `Sale.user` — это тот, кто пробил чек, а не владелец смены
+        (`shift.cashier`): в общей смене на одну кассу это разные люди. Отменённые
+        и возвращённые чеки исключаем — как в calc_payment_breakdown.
+        """
+        Sale = self.sales.model
+
+        excluded_statuses = ["cancelled", "canceled", "refunded", "returned"]
+        rows = (
+            Sale.objects
+            .filter(shift_id=self.id)
+            .exclude(status__in=excluded_statuses)
+            .values("user_id", "user__first_name", "user__last_name", "user__email")
+            .annotate(sales_count=models.Count("id"), sales_total=models.Sum("total"))
+        )
+
+        res = []
+        for r in rows:
+            display = " ".join(
+                part for part in [
+                    (r.get("user__first_name") or "").strip(),
+                    (r.get("user__last_name") or "").strip(),
+                ] if part
+            ).strip() or (r.get("user__email") or "") or "Без кассира"
+            total = r.get("sales_total") or Decimal("0.00")
+            res.append({
+                "cashier_id": str(r["user_id"]) if r["user_id"] else None,
+                "cashier_display": display,
+                "sales_count": int(r.get("sales_count") or 0),
+                "sales_total": str(Decimal(total).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+            })
+
+        res.sort(key=lambda x: (Decimal(x["sales_total"]), x["sales_count"]), reverse=True)
         return res
 
     def recalc_totals_for_close(self):

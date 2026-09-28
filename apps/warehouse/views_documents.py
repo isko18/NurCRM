@@ -5,6 +5,7 @@ from rest_framework.views import APIView
 from rest_framework import generics
 from django.shortcuts import get_object_or_404
 from django.db.models import Q, Prefetch
+from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 
 from decimal import Decimal
@@ -489,7 +490,17 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
             allow_negative = request.data.get('allow_negative', False)
             if isinstance(allow_negative, str):
                 allow_negative = allow_negative.lower() in ('true', '1', 'yes')
-            services.post_document(doc, allow_negative=allow_negative, user=request.user)
+            # Осознанное повторение такого же документа (редкий, но законный случай):
+            # ?allow_duplicate=true снимает защиту от дубля.
+            allow_duplicate = request.data.get('allow_duplicate', False)
+            if isinstance(allow_duplicate, str):
+                allow_duplicate = allow_duplicate.lower() in ('true', '1', 'yes')
+            services.post_document(
+                doc,
+                allow_negative=allow_negative,
+                user=request.user,
+                allow_duplicate=bool(allow_duplicate),
+            )
             doc.refresh_from_db()
 
             # Если при проведении наличной продажи документ перешёл в CASH_PENDING (включено подтверждение кассы):
@@ -850,6 +861,33 @@ class CounterpartyPagination(PageNumberPagination):
         return super().get_page_size(request)
 
 
+# Значения, включающие режим «только не оплатившие» (должники).
+_UNPAID_FLAGS = {"1", "true", "yes", "unpaid", "debt", "debtors", "not_paid"}
+
+
+def _wants_only_unpaid(request) -> bool:
+    qp = getattr(request, "query_params", None) or {}
+    raw = (
+        qp.get("only_unpaid")
+        or qp.get("unpaid")
+        or qp.get("payment_status")
+        or ""
+    ).strip().lower()
+    return raw in _UNPAID_FLAGS
+
+
+def _shown_in_unpaid_mode(row) -> bool:
+    """
+    Режим одного дня (only_unpaid): контрагент виден, если на конец дня
+    остался долг, ИЛИ в этот день было погашение (оплата/возврат) — чтобы
+    в день оплаты она была видна. На следующий день без долга и движений
+    контрагент из списка уходит.
+    """
+    has_debt = (row["closing_debit"] - row["closing_credit"]) > 0
+    paid_today = row["turnover_credit"] > 0
+    return has_debt or paid_today
+
+
 class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     queryset = models.Counterparty.objects.all()
     serializer_class = serializers_documents.CounterpartySerializer
@@ -883,27 +921,35 @@ class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
         finally:
             self._counterparty_analytics_map = None
 
+    def _unpaid_counterparty_ids(self, on_date):
+        """
+        Контрагенты с непогашенным долгом на дату (сальдо на конец по дебету
+        больше, чем по кредиту — как в акте сверки) или с погашением в этот день.
+        """
+        period_map = services_money.counterparty_period_balances(
+            self, date_from=on_date, date_to=on_date, per_counterparty=True,
+        )
+        return [cid for cid, row in period_map.items() if _shown_in_unpaid_mode(row)]
+
     def get_queryset(self):
         qs = filter_qs_company_branch_or_global(self, models.Counterparty.objects.all())
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
         date_from, date_to = services_money.get_requested_date_range(self)
-        if date_from or date_to:
-            doc_qs = models.Document.objects.filter(counterparty_id__isnull=False)
-            doc_qs = self._filter_qs_company_branch(
-                doc_qs,
-                company_field="warehouse_from__company_id",
-                branch_field="warehouse_from__branch",
-            )
-            doc_qs = services_money.apply_requested_date_range(doc_qs, "date", self)
-
-            money_qs = self._filter_qs_company_branch(models.MoneyDocument.objects.filter(counterparty_id__isnull=False))
-            money_qs = services_money.apply_requested_date_range(money_qs, "date", self)
-
-            qs = qs.filter(
-                Q(pk__in=doc_qs.values("counterparty_id")) | Q(pk__in=money_qs.values("counterparty_id"))
-            ).distinct()
+        only_unpaid = _wants_only_unpaid(self.request)
+        if only_unpaid:
+            # Режим одного дня: показываем тех, кто не оплатил (есть долг на конец
+            # выбранной даты, даже без движений в этот день), и тех, кто погасил
+            # долг именно в этот день.
+            on_date = date_to or date_from or timezone.localdate()
+            return qs.filter(pk__in=self._unpaid_counterparty_ids(on_date)).distinct()
+        # Период НЕ сужает состав списка: страница «Контрагенты» — это ещё и
+        # справочник, и контрагент без документов должен остаться в нём с нулями
+        # (иначе при выборе месяца из таблицы пропадают сотни живых клиентов).
+        # Суммы строк при этом сходятся с карточками: нулевые строки ничего не
+        # добавляют. Период влияет только на цифры в строках, а состав сужает
+        # лишь режим одного дня (only_unpaid).
         return qs
 
     def perform_create(self, serializer):
@@ -996,12 +1042,62 @@ class CounterpartyBalanceSummaryView(CompanyBranchRestrictedMixin, APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+        counterparty_ids = None
+
+        # Фильтр по агенту — тот же, что в списке контрагентов (?agent=<uuid>),
+        # иначе карточки считаются по всем контрагентам и не сходятся с таблицей.
+        # Агент (не владелец) видит итоги только по своим контрагентам.
+        agent_raw = (request.query_params.get("agent") or "").strip()
+        user = request.user
+        if agent_raw or not _is_owner_like(user):
+            agent_qs = filter_qs_company_branch_or_global(self, models.Counterparty.objects.all())
+            if counterparty_type:
+                agent_qs = agent_qs.filter(type=counterparty_type)
+            agent_qs = agent_qs.filter(agent_id=agent_raw or user.pk)
+            try:
+                counterparty_ids = list(agent_qs.values_list("id", flat=True))
+            except (ValueError, DjangoValidationError):
+                return Response(
+                    {"detail": "Параметр agent должен быть UUID."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if _wants_only_unpaid(request):
+            # Тот же режим, что и в списке контрагентов: не оплатившие
+            # и те, кто погасил долг в этот день.
+            per_cp = services_money.counterparty_period_balances(
+                self, date_from=date_to, date_to=date_to,
+                counterparty_type=counterparty_type, counterparty_ids=counterparty_ids,
+                per_counterparty=True,
+            )
+            counterparty_ids = [cid for cid, r in per_cp.items() if _shown_in_unpaid_mode(r)]
+
         row = services_money.counterparty_period_balances(
             self, date_from=date_from, date_to=date_to,
-            counterparty_type=counterparty_type, per_counterparty=False,
+            counterparty_type=counterparty_type, counterparty_ids=counterparty_ids,
+            per_counterparty=False,
         )
+        # net = дебет − кредит: «сколько в итоге должен». Дебет — начислено
+        # (отгрузки, выдачи денег), кредит — погашено (оплаты, возвраты).
+        # Положительный net — должен контрагент, отрицательный — переплата.
+        def _block(prefix):
+            debit = row[f"{prefix}_debit"]
+            credit = row[f"{prefix}_credit"]
+            net = debit - credit
+            return {"debit": str(debit), "credit": str(credit), "net": str(net)}
+
+        closing_net = row["closing_debit"] - row["closing_credit"]
         return Response({
-            "opening": {"debit": str(row["opening_debit"]), "credit": str(row["opening_credit"])},
-            "turnover": {"debit": str(row["turnover_debit"]), "credit": str(row["turnover_credit"])},
-            "closing": {"debit": str(row["closing_debit"]), "credit": str(row["closing_credit"])},
+            "opening": _block("opening"),
+            "turnover": _block("turnover"),
+            "closing": _block("closing"),
+            "totals": {
+                "debt_total": str(row["opening_debit"] + row["turnover_debit"]),
+                "paid_total": str(row["opening_credit"] + row["turnover_credit"]),
+                "debt_remaining": str(closing_net),
+                # Стороны берём как есть, без свёртки между контрагентами:
+                # долг одного не гасится переплатой другого (§2.3 ТЗ).
+                "counterparties_owe": str(row["closing_debit"]),
+                "company_owes": str(row["closing_credit"]),
+            },
         }, status=status.HTTP_200_OK)

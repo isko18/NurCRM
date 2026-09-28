@@ -6376,7 +6376,8 @@ class RegionalFunnelRoutingView(CompanyBranchQuerysetMixin, generics.GenericAPIV
         rules_data = data.get("rules")
         if rules_data is not None and isinstance(rules_data, list):
             with transaction.atomic():
-                existing_rules = {str(r.id): r for r in routing.rules.all()}
+                existing_rules_by_id = {str(r.id): r for r in routing.rules.all()}
+                existing_rules_by_code = {r.region_code: r for r in routing.rules.all()}
                 kept_rule_ids = set()
 
                 for order, r_item in enumerate(rules_data):
@@ -6387,13 +6388,15 @@ class RegionalFunnelRoutingView(CompanyBranchQuerysetMixin, generics.GenericAPIV
                     if not funnel:
                         continue
 
+                    region_code = r_item.get("region_code") or "other"
                     rule_id = str(r_item.get("id") or "")
-                    rule_obj = existing_rules.get(rule_id)
+
+                    rule_obj = existing_rules_by_id.get(rule_id) or existing_rules_by_code.get(region_code)
                     if not rule_obj:
-                        rule_obj = RegionalFunnelRuleConsalting(routing=routing, funnel=funnel)
+                        rule_obj = RegionalFunnelRuleConsalting(routing=routing, funnel=funnel, region_code=region_code)
 
                     rule_obj.funnel = funnel
-                    rule_obj.region_code = r_item.get("region_code") or "other"
+                    rule_obj.region_code = region_code
                     rule_obj.label = r_item.get("label") or ""
                     rule_obj.is_active = bool(r_item.get("is_active", True))
                     rule_obj.phone_prefixes = r_item.get("phone_prefixes") or []
@@ -6406,7 +6409,7 @@ class RegionalFunnelRoutingView(CompanyBranchQuerysetMixin, generics.GenericAPIV
                     kept_rule_ids.add(str(rule_obj.id))
 
                 # Удаляем правила, которых нет в новом списке
-                for r_id, r_obj in existing_rules.items():
+                for r_id, r_obj in existing_rules_by_id.items():
                     if r_id not in kept_rule_ids:
                         r_obj.delete()
 

@@ -840,6 +840,39 @@ class SaleConsultantCommissionTests(TestCase):
         self.assertEqual(consultant_row["consultant_commission_period"], "100.00")
         self.assertEqual(consultant_row["percent_bonus"], "100.00")
 
+    def test_salary_percent_is_calculated_per_sale(self):
+        from apps.main.models import Cart, CartItem
+        from apps.main.services import checkout_cart
+        from apps.main.analytics_market import AnalyticsView, Period
+        from django.utils import timezone
+        import datetime
+
+        # Две продажи по 10.50 при 3%: по отдельности 0.32 + 0.32 = 0.64,
+        # от общей суммы было бы 21.00 * 3% = 0.63.
+        for _ in range(2):
+            cart = Cart.objects.create(
+                company=self.company, branch=self.branch, user=self.cashier, shift=self.shift, status=Cart.Status.ACTIVE
+            )
+            CartItem.objects.create(cart=cart, company=self.company, product=self.product, quantity=Decimal("1"), unit_price=Decimal("10.50"))
+            checkout_cart(cart).mark_paid()
+
+        now = timezone.now()
+        period = Period(start=now - datetime.timedelta(days=1), end=now + datetime.timedelta(days=1))
+
+        rf = APIRequestFactory()
+        req = rf.get("/main/analytics/market/?tab=salary")
+        req.user = self.cashier
+
+        res = AnalyticsView()._salary(req, self.company, self.branch, period)
+        rows = res["rows"] if "rows" in res else res["tables"]["rows"]
+        cashier_row = {r["user_id"]: r for r in rows}[str(self.cashier.id)]
+
+        self.assertEqual(cashier_row["employee_sales_period"], "21.00")
+        self.assertEqual(cashier_row["percent_bonus"], "0.64")
+        self.assertEqual(len(cashier_row["sales"]), 2)
+        self.assertEqual([s["commission"] for s in cashier_row["sales"]], ["0.32", "0.32"])
+        self.assertTrue(all(s["role"] == "cashier" for s in cashier_row["sales"]))
+
     def test_partial_return_recalculates_commission(self):
         from apps.main.models import Cart, CartItem, Sale, SaleItem
         from apps.main.services import checkout_cart

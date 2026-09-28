@@ -7,7 +7,6 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.main.models import Notification, Product
-from apps.main.realtime import company_group_name, user_group_name
 from apps.users.models import Company
 
 logger = logging.getLogger("crm.product_expiry")
@@ -105,44 +104,15 @@ def send_product_expiry_digest_for_company(company, today=None):
         data=meta,
     )
 
-    # Публикация в Channels
+    # Публикация в Channels — только в личную группу получателя.
+    # Раньше дайджест уходил ещё и в notif_company_<id>, и владелец получал
+    # один и тот же тост дважды (он подписан на обе группы).
     def _publish_ws():
-        try:
-            from channels.layers import get_channel_layer
-            from asgiref.sync import async_to_sync
+        from apps.main.notifications_market import push_unread_count
+        from apps.main.realtime import publish_notification
 
-            layer = get_channel_layer()
-            if not layer:
-                return
-
-            ws_data = {
-                "id": str(notif.id),
-                "type": "market.product.expiring",
-                "title": notif.title,
-                "message": notif.message,
-                "category": notif.category,
-                "level": notif.level,
-                "is_read": False,
-                "created_at": notif.created_at.isoformat(),
-                "url": notif.url,
-                "cta_label": "Открыть",
-                "meta": meta,
-            }
-
-            groups = [
-                company_group_name(company.id),
-                user_group_name(recipient.id),
-            ]
-            for g in groups:
-                async_to_sync(layer.group_send)(
-                    g,
-                    {
-                        "type": "notify",
-                        "data": ws_data,
-                    },
-                )
-        except Exception as e:
-            logger.warning("Failed to broadcast market.product.expiring ws: %s", e)
+        publish_notification(notif)
+        push_unread_count(recipient)
 
     try:
         if transaction.get_connection().in_atomic_block:

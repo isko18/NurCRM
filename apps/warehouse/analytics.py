@@ -683,6 +683,7 @@ def build_agent_warehouse_analytics_payload(
         returns_qs = returns_qs.filter(warehouse_from__branch__isnull=True)
     returns_count = returns_qs.count()
     returns_amount = returns_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
+    net_sales_amount = sales_amount - returns_amount
 
     write_off_qs = wm.Document.objects.filter(
         warehouse_from__company=company,
@@ -756,6 +757,35 @@ def build_agent_warehouse_analytics_payload(
         }
         for row in sales_by_date_qs
     ]
+    returns_by_date = {
+        _period_iso(row["period"]): {
+            "returns_count": row["returns_count"],
+            "returns_amount": row["returns_amount"],
+        }
+        for row in (
+            returns_qs.annotate(period=trunc_sales)
+            .values("period")
+            .annotate(
+                returns_count=Count("id"),
+                returns_amount=Coalesce(Sum("total"), ZERO_MONEY),
+            )
+            .order_by("period")
+        )
+    }
+    sales_by_date_map = {row["date"]: row for row in sales_by_date}
+    for day, values in returns_by_date.items():
+        row = sales_by_date_map.setdefault(
+            day, {"date": day, "sales_count": 0, "sales_amount": "0.00"}
+        )
+        row["returns_count"] = values["returns_count"]
+        row["returns_amount"] = _money_str(values["returns_amount"])
+    for row in sales_by_date_map.values():
+        row.setdefault("returns_count", 0)
+        row.setdefault("returns_amount", "0.00")
+        row["net_sales_amount"] = _money_str(
+            Decimal(row["sales_amount"]) - Decimal(row["returns_amount"])
+        )
+    sales_by_date = [sales_by_date_map[day] for day in sorted(sales_by_date_map)]
 
     cp_debts = _build_agent_counterparty_debts(company=company, branch=branch, agent=agent)
 
@@ -773,6 +803,7 @@ def build_agent_warehouse_analytics_payload(
             "sales_amount": _money_str(sales_amount),
             "returns_count": returns_count,
             "returns_amount": _money_str(returns_amount),
+            "net_sales_amount": _money_str(net_sales_amount),
             "write_off_count": write_off_count,
             "write_off_qty": str(write_off_qty),
             "on_hand_qty": str(on_hand_qty),
@@ -846,6 +877,23 @@ def build_owner_warehouse_analytics_payload(
     sales_count = sales_qs.count()
     sales_amount = sales_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
 
+    # Returns are independent posted documents. Expose gross and return
+    # amounts separately and use their difference for the owner net metric.
+    returns_qs = wm.Document.objects.filter(
+        warehouse_from__company=company,
+        agent__isnull=False,
+        status=wm.Document.Status.POSTED,
+        doc_type=wm.Document.DocType.SALE_RETURN,
+        date__gte=dt_from,
+        date__lt=dt_to_excl,
+    )
+    returns_qs = _apply_branch_scope(
+        returns_qs, branch, path="warehouse_from__branch", all_branches=all_branches
+    )
+    returns_count = returns_qs.count()
+    returns_amount = returns_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
+    net_sales_amount = sales_amount - returns_amount
+
     on_hand_qs = wm.AgentStockBalance.objects.select_related("product", "agent").filter(company=company)
     on_hand_qs = _apply_branch_scope(on_hand_qs, branch, all_branches=all_branches)
 
@@ -875,6 +923,36 @@ def build_owner_warehouse_analytics_payload(
         }
         for row in sales_by_date_qs
     ]
+
+    returns_by_date = {
+        _period_iso(row["period"]): {
+            "returns_count": row["returns_count"],
+            "returns_amount": row["returns_amount"],
+        }
+        for row in (
+            returns_qs.annotate(period=trunc_sales)
+            .values("period")
+            .annotate(
+                returns_count=Count("id"),
+                returns_amount=Coalesce(Sum("total"), ZERO_MONEY),
+            )
+            .order_by("period")
+        )
+    }
+    sales_by_date_map = {row["date"]: row for row in sales_by_date}
+    for day, values in returns_by_date.items():
+        row = sales_by_date_map.setdefault(
+            day, {"date": day, "sales_count": 0, "sales_amount": "0.00"}
+        )
+        row["returns_count"] = values["returns_count"]
+        row["returns_amount"] = _money_str(values["returns_amount"])
+    for row in sales_by_date_map.values():
+        row.setdefault("returns_count", 0)
+        row.setdefault("returns_amount", "0.00")
+        row["net_sales_amount"] = _money_str(
+            Decimal(row["sales_amount"]) - Decimal(row["returns_amount"])
+        )
+    sales_by_date = [sales_by_date_map[day] for day in sorted(sales_by_date_map)]
 
     sales_items_qs = wm.DocumentItem.objects.filter(document__in=sales_qs)
     sales_by_product_qs = (
@@ -1033,6 +1111,9 @@ def build_owner_warehouse_analytics_payload(
             "items_approved": str(items_approved_qty),
             "sales_count": sales_count,
             "sales_amount": _money_str(sales_amount),
+            "returns_count": returns_count,
+            "returns_amount": _money_str(returns_amount),
+            "net_sales_amount": _money_str(net_sales_amount),
             "on_hand_qty": str(on_hand_qty),
             "on_hand_amount": _money_str(on_hand_amount),
             **cash["summary"],

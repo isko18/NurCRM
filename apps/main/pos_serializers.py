@@ -421,6 +421,8 @@ class CheckoutSerializer(serializers.Serializer):
         allow_null=True,
     )
     cash_received = MoneyField(required=False, allow_null=True)
+    prepayment = MoneyField(required=False, allow_null=True)
+    prepayment_amount = MoneyField(required=False, allow_null=True)
     payments = CheckoutPaymentLineSerializer(many=True, required=False)
 
     # v2 отсрочка (extra-поля для кассы, не ведут к 400)
@@ -756,6 +758,7 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
     sale_item_id = serializers.UUIDField(source="id", read_only=True)
     price_manually_edited = serializers.BooleanField(read_only=True)
     price_override_reason = serializers.SerializerMethodField()
+    returnable_qty = serializers.SerializerMethodField()
 
     class Meta:
         model = SaleItem
@@ -775,6 +778,7 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
             "line_total",
             "price_manually_edited",
             "price_override_reason",
+            "returnable_qty",
         )
         read_only_fields = fields
 
@@ -785,6 +789,18 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
         base = (obj.unit_price or Decimal("0")) * Decimal(obj.quantity or 0)
         disc = Decimal(str(getattr(obj, "line_discount", None) or 0))
         return money(base - disc)
+
+    def get_returnable_qty(self, obj):
+        """
+        Сколько ещё можно вернуть по этой строке.
+
+        Отдельного счётчика возвратов у строки нет: частичный возврат уменьшает
+        саму `quantity` (а полностью возвращённая строка удаляется), поэтому
+        остаток к возврату — это и есть текущее количество. Поле отдаём явно,
+        чтобы фронт ограничивал «Макс. возврат» по стабильному имени, а не
+        догадывался по `quantity`.
+        """
+        return qty3(Decimal(str(obj.quantity or 0)))
 
     def get_price_override_reason(self, obj):
         if getattr(obj, "price_manually_edited", False):
@@ -962,6 +978,8 @@ class AgentCheckoutSerializer(serializers.Serializer):
         required=False,
     )
     cash_received = MoneyField(required=False, allow_null=True)
+    prepayment = MoneyField(required=False, allow_null=True)
+    prepayment_amount = MoneyField(required=False, allow_null=True)
 
     # если хочешь сохранять кассу в продаже — оставь
     cashbox_id = OptionalUUIDField(required=False, allow_null=True)

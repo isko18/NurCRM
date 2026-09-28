@@ -1273,6 +1273,12 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         ]
 
     def get_cashflows(self, obj):
+        # В списке товаров вью кладёт в контекст готовую карту по всей странице
+        # (один запрос вместо запроса на каждый товар — было ~100 на страницу).
+        batch = self.context.get("cashflows_by_product")
+        if batch is not None:
+            return batch.get(str(obj.id), [])
+
         from apps.construction.models import CashFlow
         from apps.construction.auto_cashflow import serialize_auto_cashflows
         cfs = CashFlow.objects.filter(company_id=obj.company_id, source_id=str(obj.id))
@@ -1291,9 +1297,21 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         }
 
     def get_expiry_batches(self, obj):
-        batches = obj.expiry_batches.filter(
-            status=ProductExpiryBatch.Status.ACTIVE, remaining_quantity__gt=0
-        ).order_by(F("expires_at").asc(nulls_last=True), "received_at")[:10]
+        # Если партии уже загружены prefetch-ем — фильтруем в памяти, иначе
+        # .filter() на менеджере сделал бы отдельный запрос на каждый товар.
+        cached = obj.__dict__.get("_prefetched_objects_cache", {}).get("expiry_batches")
+        if cached is not None:
+            batches = [
+                b for b in cached
+                if b.status == ProductExpiryBatch.Status.ACTIVE
+                and (b.remaining_quantity or 0) > 0
+            ]
+            batches.sort(key=lambda b: (b.expires_at is None, b.expires_at, b.received_at))
+            batches = batches[:10]
+        else:
+            batches = obj.expiry_batches.filter(
+                status=ProductExpiryBatch.Status.ACTIVE, remaining_quantity__gt=0
+            ).order_by(F("expires_at").asc(nulls_last=True), "received_at")[:10]
         return ProductExpiryBatchSerializer(batches, many=True).data
 
     def __init__(self, *args, **kwargs):
@@ -2361,7 +2379,9 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         if target_sale and not instance:
             existing = ClientDeal.objects.filter(sale=target_sale).first()
             if existing:
-                raise serializers.ValidationError({"sale_id": f"По этой продаже уже создана сделка (ID: {existing.id})."})
+                attrs["_existing_deal"] = existing
+                instance = existing
+                self.instance = existing
 
         # прод: если уже есть платежи — условия сделки нельзя менять
         if instance and instance.pk and instance.payments.exists():
@@ -2431,6 +2451,10 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
     def create(self, validated_data):
         custom_inst = validated_data.pop("installments", None)
         validated_data.pop("sale_id", None)
+
+        existing = validated_data.pop("_existing_deal", None)
+        if existing:
+            return self.update(existing, validated_data)
 
         instance = ClientDeal(**validated_data)
         if custom_inst and isinstance(custom_inst, (list, tuple)):

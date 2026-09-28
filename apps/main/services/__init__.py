@@ -212,8 +212,12 @@ def checkout_cart(
                 unlinked_deal.sale = sale
                 if not unlinked_deal.amount or unlinked_deal.amount == Decimal("0.00"):
                     unlinked_deal.amount = debt_amt
-                unlinked_deal.save(update_fields=["sale", "amount", "updated_at"])
+                prepay_val = getattr(sale, "cash_received", Decimal("0.00")) or Decimal("0.00")
+                if unlinked_deal and prepay_val > Decimal("0.00") and unlinked_deal.prepayment == Decimal("0.00"):
+                    unlinked_deal.prepayment = prepay_val
+                unlinked_deal.save(update_fields=["sale", "amount", "prepayment", "updated_at"])
             else:
+                prepay_val = getattr(sale, "cash_received", Decimal("0.00")) or Decimal("0.00")
                 ClientDeal.objects.create(
                     company=sale.company,
                     branch=sale.branch,
@@ -222,7 +226,7 @@ def checkout_cart(
                     title=f"Продажа в долг №{sale.id}",
                     kind=ClientDeal.Kind.DEBT,
                     amount=debt_amt,
-                    prepayment=Decimal("0.00"),
+                    prepayment=prepay_val,
                     debt_days=30,
                 )
 
