@@ -3755,6 +3755,10 @@ def _execute_sale_return(
     import json
     from django.core.serializers.json import DjangoJSONEncoder
     items_payload_safe = json.loads(json.dumps(partial_items, cls=DjangoJSONEncoder)) if partial_items else None
+    # Денег не выдавали (например, чек в долг) — смена возврата = открытая смена кассира.
+    if actual_shift is None and user is not None and getattr(user, "is_authenticated", False):
+        actual_shift = _find_open_shift_for_cashier(company=sale.company, cashier=user)
+
     # Запись о возврате ведём всегда (список возвратов, отчёт смены);
     # без ключа от кассы — служебный уникальный ключ.
     ret_key = str(idempotency_key) if idempotency_key else f"auto:{uuid.uuid4()}"

@@ -381,3 +381,36 @@ class WebhookTests(KassaBase):
     def test_rejects_internal_url(self):
         r = self.api.post("/api/users/webhooks/", {"url": "http://127.0.0.1/x", "events": ["sale.paid"]}, format="json")
         self.assertEqual(r.status_code, 400)
+
+
+class ReviewFixesTests(KassaBase):
+    def test_shift_opened_webhook(self):
+        WebhookEndpoint.objects.create(company=self.company, url="https://bot.example.kg/h", events=["shift.opened"],
+                                       secret="s" * 32)
+        with mock.patch("apps.integrations.tasks._opener.open", return_value=_ok_delivery()) as op, \
+                mock.patch("apps.integrations.events.validate_public_url"), \
+                self.captureOnCommitCallbacks(execute=True):
+            CashShift.objects.create(company=self.company, cashbox=self.cashbox, cashier=self.cashier,
+                                     status=CashShift.Status.OPEN)
+        body = json.loads(op.call_args.args[0].data)
+        self.assertEqual(body["event"], "shift.opened")
+        self.assertEqual(body["data"]["cashier"], str(self.cashier.id))
+
+    def test_debt_return_gets_items_and_shift(self):
+        sale_id = self.quick(client=str(self.client_obj.id), payment={"method": "debt", "received": "0"}).data["id"]
+        r = self.api.post(f"/api/main/pos/sales/{sale_id}/return/", {}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        ret = self.api.get("/api/main/pos/returns/").data[0]
+        self.assertEqual(ret["shift"], str(self.shift.id))
+        self.assertEqual(ret["items"][0]["qty"], "2.000")
+
+    def test_backfill_old_returns(self):
+        from django.core.management import call_command
+
+        sale_id = self.quick().data["id"]
+        self.api.post(f"/api/main/pos/sales/{sale_id}/return/", {}, format="json")
+        SaleReturn.objects.update(returned_items=None, shift=None)
+        call_command("backfill_sale_returns", stdout=mock.MagicMock())
+        r = SaleReturn.objects.get()
+        self.assertEqual(r.shift_id, self.shift.id)
+        self.assertEqual(r.returned_items[0]["qty"], "2.000")

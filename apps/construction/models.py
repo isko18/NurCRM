@@ -352,8 +352,24 @@ class CashShift(models.Model):
         if update_fields is not None and touched:
             kwargs["update_fields"] = list(set(update_fields) | touched)
 
+        is_new = self._state.adding
         self.full_clean()
-        return super().save(*args, **kwargs)
+        result = super().save(*args, **kwargs)
+        if is_new and self.status == self.Status.OPEN:
+            from apps.integrations.events import emit_event
+
+            emit_event(
+                self.company_id,
+                "shift.opened",
+                {
+                    "shift": self.pk,
+                    "cashbox": self.cashbox_id,
+                    "cashier": self.cashier_id,
+                    "opened_at": self.opened_at,
+                    "opening_cash": self.opening_cash,
+                },
+            )
+        return result
 
     def calc_live_totals(self, *, refresh: bool = False) -> dict:
         # Свойства expected_cash / drawer_expected_cash / ledger_expected_cash /

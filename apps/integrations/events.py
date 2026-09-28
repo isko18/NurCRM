@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 EVENTS = (
     "sale.paid",
     "sale.returned",
+    "shift.opened",
     "shift.closed",
     "stock.low",
     "company.updated",
