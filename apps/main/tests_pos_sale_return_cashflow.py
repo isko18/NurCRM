@@ -159,7 +159,10 @@ class POSSaleReturnCashflowTests(TestCase):
         self.assertIsNotNone(return_flow)
         self.assertEqual(return_flow.type, CashFlow.Type.EXPENSE)
         self.assertEqual(return_flow.amount, Decimal("1000.00"))
-        self.assertTrue(return_flow.affects_shift_drawer)
+        # Движение ящик не уменьшает: возвращённый чек ушёл из paid, его наличные
+        # уже не попадают в drawer_expected_cash. Флаг True снимал бы сумму дважды
+        # (было −500 вместо 500 — этот тест и падал).
+        self.assertFalse(return_flow.affects_shift_drawer)
         self.assertEqual(return_flow.shift_id, self.shift.id)
 
         # Shift expected cash after return: 1500 - 1000 = 500
@@ -224,7 +227,28 @@ class POSSaleReturnCashflowTests(TestCase):
         ).first()
         self.assertIsNotNone(return_flow)
         self.assertEqual(return_flow.amount, Decimal("500.00"))
-        self.assertTrue(return_flow.affects_shift_drawer)
+        # Частичный возврат уже уменьшил строки оплат чека до остатка
+        # (_rescale_sale_payments_after_partial_return) — вычитать ещё и это
+        # движение значило бы снять 500 дважды.
+        self.assertFalse(return_flow.affects_shift_drawer)
+
+    def test_partial_cash_return_keeps_remainder_in_drawer(self):
+        """Заплатили 1000 наличными, вернули 500 → в ящике должно остаться +500."""
+        sale = self._create_paid_sale(quantity=2, price=Decimal("500.00"), payment_method="cash")
+        item = sale.items.first()
+
+        before = self.shift.calc_live_totals()["drawer_expected_cash"]
+        req = self.factory.post(
+            f"/main/pos/sales/{sale.id}/return/",
+            {"items": [{"sale_item_id": str(item.id), "quantity": 1}],
+             "idempotency_key": str(uuid.uuid4())},
+            format="json",
+        )
+        force_authenticate(req, user=self.cashier)
+        self.assertEqual(SaleReturnAPIView.as_view()(req, pk=sale.id).status_code, 200)
+
+        after = self.shift.calc_live_totals()["drawer_expected_cash"]
+        self.assertEqual(before - after, Decimal("500.00"))
 
     def test_split_payment_return_creates_separate_expenses(self):
         payments = [
@@ -253,13 +277,14 @@ class POSSaleReturnCashflowTests(TestCase):
             ).order_by("amount")
         )
         self.assertEqual(len(flows), 2)
-        transfer_flow = [f for f in flows if not f.affects_shift_drawer][0]
-        cash_flow = [f for f in flows if f.affects_shift_drawer][0]
+        # Раньше движения различали по affects_shift_drawer; теперь его нет ни у
+        # одного возврата, поэтому разделяем по сумме.
+        transfer_flow, cash_flow = flows[0], flows[1]
 
         self.assertEqual(transfer_flow.amount, Decimal("400.00"))
-        self.assertFalse(transfer_flow.affects_shift_drawer)
         self.assertEqual(cash_flow.amount, Decimal("600.00"))
-        self.assertTrue(cash_flow.affects_shift_drawer)
+        self.assertFalse(transfer_flow.affects_shift_drawer)
+        self.assertFalse(cash_flow.affects_shift_drawer)
 
     def test_debt_sale_with_prepayment_returns_cash_refund(self):
         total = Decimal("2000.00")
@@ -319,7 +344,7 @@ class POSSaleReturnCashflowTests(TestCase):
         ).first()
         self.assertIsNotNone(return_flow)
         self.assertEqual(return_flow.amount, Decimal("500.00"))
-        self.assertTrue(return_flow.affects_shift_drawer)
+        self.assertFalse(return_flow.affects_shift_drawer)
 
     def test_pure_debt_sale_no_cashflow(self):
         total = Decimal("1000.00")
@@ -492,3 +517,212 @@ class POSSaleReturnCashflowTests(TestCase):
         with self.assertRaises(ValidationError) as ctx:
             handle_cashflow_reject(orig_flow, user=self.cashier)
         self.assertEqual(ctx.exception.get_codes(), {"detail": "reject_cascade_failed"})
+
+
+class SaleReturnRealtimeBroadcastTests(POSSaleReturnCashflowTests):
+    """
+    R9: возврат чека должен слать в WS `market.cashflow.created` (лента кассы)
+    и `market.shift.updated` (экран смены кассира).
+    """
+
+    def _capture_group_sends(self):
+        """Подменяет channel layer и собирает отправленные события."""
+        from unittest.mock import patch, MagicMock
+
+        sent = []
+
+        layer = MagicMock()
+
+        # group_send должен быть корутиной: код шлёт через async_to_sync,
+        # обычная функция роняет отправку после первого события.
+        async def _group_send(group, message):
+            sent.append((group, message))
+
+        layer.group_send = _group_send
+        cm = patch("channels.layers.get_channel_layer", return_value=layer)
+        return cm, sent
+
+    def _return_sale(self, sale):
+        req = self.factory.post(
+            f"/main/pos/sales/{sale.id}/return/",
+            {"idempotency_key": str(uuid.uuid4())},
+            format="json",
+        )
+        force_authenticate(req, user=self.cashier)
+        return SaleReturnAPIView.as_view()(req, pk=sale.id)
+
+    def test_return_broadcasts_cashflow_and_shift_events(self):
+        sale = self._create_paid_sale(quantity=2, price=Decimal("500.00"), payment_method="cash")
+
+        cm, sent = self._capture_group_sends()
+        with cm:
+            self.assertEqual(self._return_sale(sale).status_code, 200)
+
+        events = [m.get("event") for _, m in sent]
+        self.assertIn("market.cashflow.created", events)
+        # Возврат меняет drawer_expected_cash даже без affects_shift_drawer —
+        # экран смены должен обновиться.
+        self.assertIn("market.shift.updated", events)
+
+        groups = {g for g, _ in sent}
+        self.assertEqual(groups, {f"notif_company_{self.company.id}"})
+        for _, m in sent:
+            self.assertEqual(m["type"], "market.notification")
+
+    def test_noncash_return_also_updates_shift_screen(self):
+        sale = self._create_paid_sale(quantity=2, price=Decimal("500.00"), payment_method="transfer")
+
+        cm, sent = self._capture_group_sends()
+        with cm:
+            self.assertEqual(self._return_sale(sale).status_code, 200)
+
+        events = [m.get("event") for _, m in sent]
+        self.assertIn("market.cashflow.created", events)
+        self.assertIn("market.shift.updated", events)
+
+
+class SaleItemReturnableQtyTests(POSSaleReturnCashflowTests):
+    """§16: фронту нужен остаток к возврату по строке, чтобы ограничить «Макс. возврат»."""
+
+    def test_returnable_qty_reflects_remaining_quantity(self):
+        from apps.main.pos_serializers import SaleItemReadSerializer
+
+        sale = self._create_paid_sale(quantity=2, price=Decimal("500.00"), payment_method="cash")
+        item = sale.items.first()
+        self.assertEqual(SaleItemReadSerializer(item).data["returnable_qty"], Decimal("2.000"))
+
+        req = self.factory.post(
+            f"/main/pos/sales/{sale.id}/return/",
+            {"items": [{"sale_item_id": str(item.id), "quantity": 1}],
+             "idempotency_key": str(uuid.uuid4())},
+            format="json",
+        )
+        force_authenticate(req, user=self.cashier)
+        self.assertEqual(SaleReturnAPIView.as_view()(req, pk=sale.id).status_code, 200)
+
+        item.refresh_from_db()
+        # Частичный возврат уменьшил строку — вернуть можно только остаток.
+        self.assertEqual(SaleItemReadSerializer(item).data["returnable_qty"], Decimal("1.000"))
+
+    def test_partial_return_status_is_partially_returned(self):
+        sale = self._create_paid_sale(quantity=2, price=Decimal("500.00"), payment_method="cash")
+        item = sale.items.first()
+        req = self.factory.post(
+            f"/main/pos/sales/{sale.id}/return/",
+            {"items": [{"sale_item_id": str(item.id), "quantity": 1}],
+             "idempotency_key": str(uuid.uuid4())},
+            format="json",
+        )
+        force_authenticate(req, user=self.cashier)
+        SaleReturnAPIView.as_view()(req, pk=sale.id)
+        sale.refresh_from_db()
+        self.assertEqual(sale.status, "partially_returned")
+
+
+class RefundMethodOverrideTests(POSSaleReturnCashflowTests):
+    """
+    §9.1: способ, которым деньги фактически отдали, может отличаться от способа
+    исходной оплаты. Без этого ящик смены расходится в обе стороны.
+    """
+
+    def _return(self, sale, **payload):
+        body = {"idempotency_key": str(uuid.uuid4())}
+        body.update(payload)
+        req = self.factory.post(f"/main/pos/sales/{sale.id}/return/", body, format="json")
+        force_authenticate(req, user=self.cashier)
+        return SaleReturnAPIView.as_view()(req, pk=sale.id)
+
+    def _drawer(self):
+        return CashShift.objects.get(pk=self.shift.pk).calc_live_totals()["drawer_expected_cash"]
+
+    # ── инцидент: чек безналом, деньги отдали наличными ──
+    def test_noncash_sale_refunded_in_cash_reduces_drawer(self):
+        sale = self._create_paid_sale(quantity=2, price=Decimal("970.00"), payment_method="transfer")
+        before = self._drawer()
+
+        self.assertEqual(self._return(sale, refund_method="cash").status_code, 200)
+
+        # Наличные ушли из ящика, хотя по чеку их там не было.
+        self.assertEqual(before - self._drawer(), Decimal("1940.00"))
+        flow = CashFlow.objects.get(
+            source_kind=CashFlow.SourceKind.POS_SALE_RETURN, source_id=str(sale.id),
+        )
+        self.assertTrue(flow.affects_shift_drawer)
+
+    def test_noncash_sale_refunded_as_usual_leaves_drawer_intact(self):
+        sale = self._create_paid_sale(quantity=2, price=Decimal("970.00"), payment_method="transfer")
+        before = self._drawer()
+
+        self.assertEqual(self._return(sale).status_code, 200)
+
+        self.assertEqual(self._drawer(), before)
+        flow = CashFlow.objects.get(
+            source_kind=CashFlow.SourceKind.POS_SALE_RETURN, source_id=str(sale.id),
+        )
+        self.assertFalse(flow.affects_shift_drawer)
+
+    # ── обратное направление: чек наличными, вернули переводом ──
+    def test_cash_sale_refunded_by_transfer_keeps_cash_in_drawer(self):
+        sale = self._create_paid_sale(quantity=2, price=Decimal("500.00"), payment_method="cash")
+        before = self._drawer()          # 500 размен + 1000 наличных
+
+        self.assertEqual(self._return(sale, refund_method="transfer").status_code, 200)
+
+        # Чек ушёл из paid и унёс свои наличные из расчёта, но физически они
+        # остались — компенсирующий приход возвращает их обратно.
+        self.assertEqual(self._drawer(), before)
+        adj = CashFlow.objects.filter(
+            source_kind=CashFlow.SourceKind.POS_SALE_RETURN,
+            source_id=str(sale.id), type=CashFlow.Type.INCOME,
+        ).first()
+        self.assertIsNotNone(adj)
+        self.assertTrue(adj.affects_shift_drawer)
+        self.assertEqual(adj.amount, Decimal("1000.00"))
+
+    def test_cash_sale_refunded_in_cash_is_unchanged(self):
+        sale = self._create_paid_sale(quantity=2, price=Decimal("500.00"), payment_method="cash")
+        before = self._drawer()
+
+        self.assertEqual(self._return(sale, refund_method="cash").status_code, 200)
+
+        # Деньги и так наличные — поведение прежнее, ящик падает на сумму чека.
+        self.assertEqual(before - self._drawer(), Decimal("1000.00"))
+        self.assertFalse(
+            CashFlow.objects.filter(
+                source_kind=CashFlow.SourceKind.POS_SALE_RETURN,
+                source_id=str(sale.id), type=CashFlow.Type.INCOME,
+            ).exists()
+        )
+
+    # ── частичный возврат: сумма только по возвращённым позициям ──
+    def test_partial_noncash_refund_in_cash_uses_returned_amount_only(self):
+        sale = self._create_paid_sale(quantity=2, price=Decimal("500.00"), payment_method="transfer")
+        item = sale.items.first()
+        before = self._drawer()
+
+        resp = self._return(
+            sale, items=[{"sale_item_id": str(item.id), "quantity": 1}], refund_method="cash",
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        # Из ящика ушла стоимость одной позиции, а не всего чека.
+        self.assertEqual(before - self._drawer(), Decimal("500.00"))
+
+    # ── "original" эквивалентен отсутствию поля ──
+    def test_refund_method_original_matches_default(self):
+        sale = self._create_paid_sale(quantity=1, price=Decimal("300.00"), payment_method="transfer")
+        before = self._drawer()
+        self.assertEqual(self._return(sale, refund_method="original").status_code, 200)
+        self.assertEqual(self._drawer(), before)
+
+    # ── без открытой смены ящика нет, корректировок быть не должно ──
+    def test_no_shift_means_no_drawer_adjustment(self):
+        self.shift.status = CashShift.Status.CLOSED
+        self.shift.save(update_fields=["status"])
+        sale = self._create_paid_sale(quantity=1, price=Decimal("300.00"), payment_method="transfer")
+
+        self.assertEqual(self._return(sale, refund_method="cash").status_code, 200)
+        for f in CashFlow.objects.filter(
+            source_kind=CashFlow.SourceKind.POS_SALE_RETURN, source_id=str(sale.id)
+        ):
+            self.assertFalse(f.affects_shift_drawer)

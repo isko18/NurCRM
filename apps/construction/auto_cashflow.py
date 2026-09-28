@@ -484,6 +484,17 @@ def create_auto_cashflow(
         payment_method=pm_clean,
     )
     cf.save()
+
+    # Колокольчик/WS: market.cashflow.created | market.cashflow.pending
+    try:
+        from apps.main.notifications_market import notify_cashflow
+
+        notify_cashflow(cf, actor=actual_cashier)
+    except Exception:
+        logging.getLogger("nurcrm.websocket.notifications").error(
+            "notify_cashflow hook failed for cf=%s", cf.id, exc_info=True
+        )
+
     return cf
 
 

@@ -348,6 +348,20 @@ class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 # ===========================
 # Client
 # ===========================
+def normalize_barber_phone(phone):
+    if not phone:
+        return None
+    phone = phone.strip()
+    digits = "".join(c for c in phone if c.isdigit())
+    if not digits:
+        return phone
+    if len(digits) == 10 and digits.startswith("0"):
+        return "996" + digits[1:]
+    elif len(digits) == 9 and not digits.startswith("996"):
+        return "996" + digits
+    return digits
+
+
 class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -363,24 +377,29 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         ref_name = "BarberClient"
 
     def validate(self, attrs):
-        """
-        Клиент создаётся глобально или в текущем филиале пользователя.
-        Поле branch read-only, поэтому клиент не может его подменить.
-        Проверяем уникальность телефона в рамках компании (глобально или по филиалу).
-        """
-        phone = (attrs.get("phone") or "").strip() if attrs.get("phone") else None
+        raw_phone = attrs.get("phone")
+        if raw_phone:
+            norm_phone = normalize_barber_phone(raw_phone)
+            attrs["phone"] = norm_phone or raw_phone
+            phone = attrs["phone"]
+        else:
+            phone = None
+
         if not phone:
             return attrs
 
         company = self._user_company()
-        # Use branch from view context (ClientListCreateView) so validation matches save()
         branch = self.context.get("active_branch")
         if branch is None:
             branch = self._auto_branch()
         if not company:
             return attrs
 
-        qs = Client.objects.filter(company=company, phone=phone)
+        from django.db.models import Q
+        last9 = phone[-9:] if len(phone) >= 9 else phone
+        qs = Client.objects.filter(company=company).filter(
+            Q(phone=phone) | Q(phone__endswith=last9)
+        )
         if branch is not None:
             qs = qs.filter(branch=branch)
         else:
@@ -394,9 +413,6 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         return attrs
 
 
-# ===========================
-# ClientDocument
-# ===========================
 class ClientDocumentSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")

@@ -100,17 +100,42 @@ def _period_sums(qs, amount_field, debit_types, credit_types, date_from, date_to
     return qs.aggregate(**ann)
 
 
+def _split_sides(net):
+    """Свёрнутое сальдо → (дебет, кредит). Заполнена всегда только одна сторона."""
+    z = Decimal("0.00")
+    net = _dec_q2(net)
+    return (net, z) if net > 0 else (z, -net)
+
+
 def _combine_period_rows(doc_row, money_row) -> dict:
+    """
+    Сальдо по одному контрагенту.
+
+    Сальдо — свёрнутое: дебет и кредит не могут быть заполнены одновременно.
+    Дебет на конец — сколько контрагент остался должен, кредит — переплата
+    (мы должны ему товар). Раньше стороны накапливались независимо
+    (`closing = opening + turnover` по каждой), и в таблице висели две
+    огромные суммы вместо одного остатка.
+
+    Оборот, наоборот, НЕ сворачивается: это реальные движения периода —
+    дебет = новые отгрузки, кредит = поступившие оплаты.
+    """
     doc_row = doc_row or {}
     money_row = money_row or {}
     od = _dec_q2(doc_row.get("opening_debit")) + _dec_q2(money_row.get("opening_debit"))
     oc = _dec_q2(doc_row.get("opening_credit")) + _dec_q2(money_row.get("opening_credit"))
     td = _dec_q2(doc_row.get("turnover_debit")) + _dec_q2(money_row.get("turnover_debit"))
     tc = _dec_q2(doc_row.get("turnover_credit")) + _dec_q2(money_row.get("turnover_credit"))
+
+    opening_net = _dec_q2(od - oc)
+    closing_net = _dec_q2(opening_net + td - tc)
+    opening_debit, opening_credit = _split_sides(opening_net)
+    closing_debit, closing_credit = _split_sides(closing_net)
+
     return {
-        "opening_debit": _dec_q2(od), "opening_credit": _dec_q2(oc),
+        "opening_debit": opening_debit, "opening_credit": opening_credit,
         "turnover_debit": _dec_q2(td), "turnover_credit": _dec_q2(tc),
-        "closing_debit": _dec_q2(od + td), "closing_credit": _dec_q2(oc + tc),
+        "closing_debit": closing_debit, "closing_credit": closing_credit,
     }
 
 
@@ -167,9 +192,18 @@ def counterparty_period_balances(
             out[cid] = _combine_period_rows(doc_map.get(cid), money_map.get(cid))
         return out
 
-    doc_row = _period_sums(docs, "total", DOC_DEBIT_TYPES, DOC_CREDIT_TYPES, date_from, date_to, group=False)
-    money_row = _period_sums(money, "amount", money_debit, money_credit, date_from, date_to, group=False)
-    return _combine_period_rows(doc_row, money_row)
+    # Итог по всем контрагентам считаем как сумму СВЁРНУТЫХ сальдо каждого, а не
+    # как свёртку общих сумм: иначе переплата одного клиента гасила бы долг
+    # другого, и «переплат ни у кого нет» переставало быть правдой.
+    doc_map = _period_sums(docs, "total", DOC_DEBIT_TYPES, DOC_CREDIT_TYPES, date_from, date_to, group=True)
+    money_map = _period_sums(money, "amount", money_debit, money_credit, date_from, date_to, group=True)
+
+    total = _empty_period_balance()
+    for cid in set(doc_map) | set(money_map):
+        row = _combine_period_rows(doc_map.get(cid), money_map.get(cid))
+        for key in total:
+            total[key] = _dec_q2(total[key] + row[key])
+    return total
 
 
 def bulk_counterparty_mini_analytics(mixin, counterparty_ids) -> dict:
@@ -292,6 +326,21 @@ def bulk_counterparty_mini_analytics(mixin, counterparty_ids) -> dict:
         for cid in ids:
             row = period_map.get(cid) or _empty_period_balance()
             out[cid]["debts"].update({k: str(v) for k, v in row.items()})
+
+            # Долг — величина накопительная: это сальдо на конец периода, а не
+            # оборот внутри него. Без этого контрагент без операций в периоде
+            # показывался бы с нулевым долгом, хотя должен с прошлых месяцев.
+            balance = _dec_q2(row["closing_debit"] - row["closing_credit"])
+            out[cid]["debts"].update({
+                # Явные имена под три колонки таблицы контрагентов:
+                # общий долг / оплачено / сколько в итоге должен.
+                "debt_total": str(_dec_q2(row["opening_debit"] + row["turnover_debit"])),
+                "paid_total": str(_dec_q2(row["opening_credit"] + row["turnover_credit"])),
+                "debt_remaining": str(balance),
+                "balance": str(balance),
+                "counterparty_owes_company": str(_dec_q2(balance if balance > 0 else 0)),
+                "company_owes_counterparty": str(_dec_q2((-balance) if balance < 0 else 0)),
+            })
 
     return out
 

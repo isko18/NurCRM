@@ -1930,7 +1930,6 @@ class Cart(models.Model):
         # Скидка на чек: либо % от остатка суммы чека (после скидок на товары), либо фиксированная сумма
         discountable_subtotal = max(Decimal("0"), subtotal - line_discount_total)
         order_percent = getattr(self, "order_discount_percent", None)
-        discountable_subtotal = max(Decimal("0"), subtotal - line_discount_total)
         if order_percent is not None and Decimal(str(order_percent)) > 0:
             requested_extra = _money(discountable_subtotal * Decimal(str(order_percent)) / Decimal("100"))
         else:
@@ -2424,7 +2423,8 @@ class Sale(models.Model):
             if self.payment_method == self.PaymentMethod.DEBT:
                 self.status = self.Status.DEBT
                 self.paid_at = None
-                self.cash_received = Decimal("0.00")
+                if cash_received is not None:
+                    self.cash_received = cash_received
                 self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
                 return
 

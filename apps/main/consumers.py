@@ -69,6 +69,11 @@ class NotificationsConsumer(AsyncWebsocketConsumer):
             "type": "connection_established",
             "user_id": self.user_id,
         }))
+        # Сразу отдаём бейдж, чтобы колокольчик был верным до первого REST-запроса.
+        await self.send(json.dumps({
+            "type": "unread_count",
+            "count": await self._unread_count(),
+        }))
 
     async def disconnect(self, code):
         for group in getattr(self, "groups_subscribed", []):
@@ -81,8 +86,14 @@ class NotificationsConsumer(AsyncWebsocketConsumer):
             data = json.loads(text_data)
         except Exception:
             return
-        if data.get("action") == "ping":
+        action = data.get("action")
+        if action == "ping":
             await self.send(json.dumps({"type": "pong"}))
+        elif action == "unread_count":
+            await self.send(json.dumps({
+                "type": "unread_count",
+                "count": await self._unread_count(),
+            }))
 
     # ---- доставка уведомления (group_send type="notify") ----
     async def notify(self, event):
@@ -91,6 +102,28 @@ class NotificationsConsumer(AsyncWebsocketConsumer):
             "data": event.get("data") or {},
         }))
 
+    # ---- бейдж непрочитанных (group_send type="unread") ----
+    async def unread(self, event):
+        await self.send(json.dumps({
+            "type": "unread_count",
+            "count": int(event.get("count") or 0),
+        }))
+
+    # ---- служебные market-события кассы/смены (group_send type="market.notification") ----
+    async def market_notification(self, event):
+        """POS шлёт в notif_company_<id> сырые события (cashflow/shift) для live-обновления
+        экранов кассы. Без этого хендлера Channels роняет соединение на неизвестном типе."""
+        await self.send(json.dumps({
+            "type": event.get("event") or "market.event",
+            "data": event.get("data") or {},
+        }))
+
     @database_sync_to_async
     def _get_company_and_branch(self, user):
         return resolve_user_company_and_branch(user)
+
+    @database_sync_to_async
+    def _unread_count(self):
+        from apps.main.models import Notification
+
+        return Notification.objects.filter(user_id=self.user_id, is_read=False).count()

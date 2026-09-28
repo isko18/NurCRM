@@ -1,3 +1,4 @@
+from datetime import timedelta
 from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
@@ -23,6 +24,49 @@ AGENT_MULTI_WAREHOUSE_DOC_TYPES = frozenset({
     models.Document.DocType.PURCHASE_RETURN,
     models.Document.DocType.WRITE_OFF,
 })
+
+
+# Окно, внутри которого повторное проведение документа с тем же составом
+# считается дублем: двойной клик по «Провести», повтор запроса после таймаута
+# или потери связи. Такие дубли удваивают остаток на складе.
+DUPLICATE_POST_WINDOW_SECONDS = 180
+
+
+def _document_items_signature(document) -> tuple:
+    """Состав документа: набор пар (товар, количество), независимо от порядка строк."""
+    return tuple(sorted(
+        (str(item.product_id), str(q_qty(item.qty)))
+        for item in document.items.all()
+    ))
+
+
+def find_recent_duplicate_document(document, window_seconds: int = DUPLICATE_POST_WINDOW_SECONDS):
+    """
+    Недавно проведённый документ-близнец: тот же тип, склады, контрагент, агент,
+    сумма и точно такой же состав позиций. Возвращает найденный документ или None.
+    """
+    window_start = timezone.now() - timedelta(seconds=window_seconds)
+    candidates = (
+        models.Document.objects
+        .filter(
+            doc_type=document.doc_type,
+            status__in=(models.Document.Status.POSTED, models.Document.Status.CASH_PENDING),
+            warehouse_from_id=document.warehouse_from_id,
+            warehouse_to_id=document.warehouse_to_id,
+            counterparty_id=document.counterparty_id,
+            agent_id=document.agent_id,
+            total=document.total,
+            created_at__gte=window_start,
+        )
+        .exclude(pk=document.pk)
+        .order_by("-created_at")
+        .prefetch_related("items")[:5]
+    )
+    signature = _document_items_signature(document)
+    for candidate in candidates:
+        if _document_items_signature(candidate) == signature:
+            return candidate
+    return None
 
 
 def document_allows_multi_warehouse(document) -> bool:
@@ -500,7 +544,12 @@ def apply_cash_request_effects(document: models.Document, *, user=None, note: st
     return money_doc
 
 
-def post_document(document: models.Document, allow_negative: bool = None, user=None) -> models.Document:
+def post_document(
+    document: models.Document,
+    allow_negative: bool = None,
+    user=None,
+    allow_duplicate: bool = False,
+) -> models.Document:
     if document.status in (document.Status.CASH_PENDING, document.Status.POSTED):
         raise ValueError("Document already posted")
 
@@ -550,6 +599,17 @@ def post_document(document: models.Document, allow_negative: bool = None, user=N
             _ensure_number(document)
 
         recalc_document_totals(document)
+
+        # Защита от дубля: тот же документ, отправленный дважды подряд (двойной клик,
+        # ретрай после таймаута), иначе остаток на складе меняется дважды.
+        if not allow_duplicate:
+            twin = find_recent_duplicate_document(document)
+            if twin is not None:
+                raise ValueError(
+                    f"Точно такой же документ уже проведён минуту назад: {twin.number or twin.pk}. "
+                    "Похоже на повторную отправку. Если это действительно вторая такая же операция, "
+                    "проведите документ ещё раз с параметром allow_duplicate=true."
+                )
 
         # Оптимизация: предзагружаем items с продуктами
         items = list(document.items.select_related("product", "product__warehouse", "product__brand", "product__category").all())

@@ -8,6 +8,7 @@ from django.db.models.signals import post_save
 from django.dispatch import receiver
 
 from apps.main.models import Product, ProductImage, Notification, ManufactureSubreal, ReturnFromAgent
+from apps.main.models import Debt, DebtPayment
 
 logger = logging.getLogger("crm.webhooks")
 
@@ -163,16 +164,18 @@ def product_webhook_on_delete(sender, instance: Product, **kwargs):
 # Канал доставки — существующий GET /main/notifications/.
 # ─────────────────────────────────────────────────────────────
 def _safe_create_notification(*, company, user, message, branch=None,
-                              type="system", title="", level="info", url=""):
+                              type="system", title="", level="info", url="",
+                              category="system", data=None):
     """Создаёт уведомление и публикует его в WS; не роняет основную операцию при ошибке."""
     if not user:
         return
     try:
-        from apps.main.realtime import create_and_publish_notification
+        from apps.main.notifications_market import publish_event
 
-        create_and_publish_notification(
-            company=company, branch=branch, user=user, message=message,
-            type=type, title=title, level=level, url=url,
+        publish_event(
+            company=company, branch=branch, recipients=[user], event_type=type,
+            title=title, message=message, level=level, url=url,
+            category=category, meta=data or {},
         )
     except Exception:
         logger.error(
@@ -194,9 +197,17 @@ def notify_agent_on_transfer(sender, instance: ManufactureSubreal, created, **kw
         branch=instance.branch,
         user=instance.agent,
         message=message,
-        type="agent_transfer",
-        title="Передача товара",
+        type="market.transfer.received",
+        title="Вам передана новая партия товара",
         level="info",
+        url="/crm/pending",
+        data={
+            "source_kind": "subreal_transfer",
+            "source_id": str(instance.id),
+            "product_id": str(instance.product_id) if instance.product_id else None,
+            "qty": str(instance.qty_transferred),
+            "cta_label": "Принять",
+        },
     ))
 
 
@@ -222,7 +233,94 @@ def notify_agent_on_return_decision(sender, instance: ReturnFromAgent, created, 
         branch=instance.branch,
         user=instance.returned_by,
         message=message,
-        type="agent_return",
+        type="market.product.status_changed",
         title=f"{kind} {verb}",
         level="success" if instance.status == ReturnFromAgent.Status.ACCEPTED else "warning",
+        url="/crm/documents",
+        data={
+            "source_kind": "return_request",
+            "source_id": str(instance.id),
+            "status": "approved" if instance.status == ReturnFromAgent.Status.ACCEPTED else "rejected",
+            "is_defect": bool(instance.is_defect),
+        },
     ))
+
+
+# ─────────────────────────────────────────────────────────────
+# Долги клиентов: market.debt.created / market.debt.paid
+# Кому: владельцы и администраторы компании.
+# ─────────────────────────────────────────────────────────────
+@receiver(post_save, sender=Debt)
+def notify_debt_created(sender, instance: Debt, created: bool, **kwargs):
+    if not created:
+        return
+
+    def _publish():
+        from apps.main.notifications_market import (
+            DEBT_CREATED, fmt_money, owner_like_users, publish_event,
+        )
+
+        recipients = owner_like_users(instance.company)
+        if not recipients:
+            return
+        publish_event(
+            company=instance.company,
+            branch=instance.branch,
+            recipients=recipients,
+            event_type=DEBT_CREATED,
+            title="Новый долг",
+            message=f"{instance.name}: {fmt_money(instance.amount)} сом",
+            level="info",
+            url="/crm/debts",
+            cta_label="Открыть долги",
+            source_kind="debt",
+            source_id=instance.id,
+            meta={
+                "debt_id": str(instance.id),
+                "amount": f"{instance.amount:.2f}",
+                "client_name": instance.name,
+                "phone": instance.phone,
+            },
+        )
+
+    transaction.on_commit(_publish)
+
+
+@receiver(post_save, sender=DebtPayment)
+def notify_debt_paid(sender, instance: DebtPayment, created: bool, **kwargs):
+    if not created:
+        return
+
+    def _publish():
+        from apps.main.notifications_market import (
+            DEBT_PAID, fmt_money, owner_like_users, publish_event,
+        )
+
+        debt = instance.debt
+        recipients = owner_like_users(instance.company)
+        if not recipients:
+            return
+        balance = debt.balance
+        tail = "долг закрыт" if balance <= 0 else f"остаток {fmt_money(balance)} сом"
+        publish_event(
+            company=instance.company,
+            branch=instance.branch,
+            recipients=recipients,
+            event_type=DEBT_PAID,
+            title="Погашение долга",
+            message=f"{debt.name}: +{fmt_money(instance.amount)} сом, {tail}",
+            level="success",
+            url="/crm/debts",
+            cta_label="Открыть долги",
+            source_kind="debt_payment",
+            source_id=instance.id,
+            meta={
+                "debt_id": str(debt.id),
+                "payment_id": str(instance.id),
+                "amount": f"{instance.amount:.2f}",
+                "balance": f"{balance:.2f}",
+                "client_name": debt.name,
+            },
+        )
+
+    transaction.on_commit(_publish)

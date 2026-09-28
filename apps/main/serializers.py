@@ -984,16 +984,8 @@ def sync_product_alternate_barcodes(product: Product, raw):
             n = str(x.get("name") or "").strip()
             raw_qty = x.get("quantity")
         else:
-            s = str(x or "").strip()
-            if not s:
-                continue
-            m = re.match(r"^([^\s\[]+)(?:\s*\[(.*)\])?$", s)
-            if m:
-                b = m.group(1).strip()
-                n = (m.group(2) or "").strip()
-            else:
-                b = s
-                n = ""
+            b = str(x or "").strip()
+            n = ""
             raw_qty = None
         if not b:
             continue
@@ -1074,51 +1066,6 @@ class RecipeItemReadSerializer(serializers.ModelSerializer):
         qty = Decimal(str(obj.qty_per_unit or 0))
         price = Decimal(str(getattr(obj.item_make, "price", 0) or 0))
         return (qty * price).quantize(Decimal("0.01"))
-
-
-class ProductListSerializer(serializers.ListSerializer):
-    """
-    Собирает движения по всем товарам страницы одним запросом.
-
-    До этого ProductSerializer.get_cashflows делал по запросу на товар, а
-    serialize_auto_cashflows добирал кассу на каждое движение: страница из 100
-    товаров стоила ~190 лишних запросов.
-    """
-
-    def to_representation(self, data):
-        items = list(data)
-        bulk = self._cashflows_map(items)
-        if bulk is not None:
-            self.child.context["_product_cashflows_map"] = bulk
-        else:
-            # Не смогли собрать карту — пусть сериализатор сходит в БД по
-            # каждому товару: медленнее, но данные корректные.
-            self.child.context.pop("_product_cashflows_map", None)
-        return super().to_representation(items)
-
-    @staticmethod
-    def _cashflows_map(items):
-        try:
-            from apps.construction.models import CashFlow
-
-            bulk = {}
-            company_ids = {getattr(p, "company_id", None) for p in items}
-            company_ids.discard(None)
-            source_ids = [str(getattr(p, "id", "")) for p in items if getattr(p, "id", None)]
-            if not company_ids or not source_ids:
-                return bulk
-
-            rows = CashFlow.objects.filter(
-                company_id__in=company_ids, source_id__in=source_ids
-            ).select_related("cashbox", "cashbox__branch")
-            for cf in rows:
-                bulk.setdefault(cf.source_id, []).append(cf)
-            return bulk
-        except Exception:
-            logging.getLogger(__name__).exception(
-                "Не удалось собрать карту cashflows для списка товаров"
-            )
-            return None
 
 
 class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
@@ -1267,7 +1214,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
     class Meta:
         model = Product
-        list_serializer_class = ProductListSerializer
         fields = [
             "id", "company", "branch",
             "kind",
@@ -1327,20 +1273,15 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         ]
 
     def get_cashflows(self, obj):
-        from apps.construction.auto_cashflow import serialize_auto_cashflows
-
-        # В списке карта собрана одним запросом в ProductListSerializer.
-        # Раньше тут был запрос на каждый товар плюс добор кассы на каждое
-        # движение внутри serialize_auto_cashflows — до ~200 запросов на страницу.
-        bulk = self.context.get("_product_cashflows_map")
-        if bulk is not None:
-            return serialize_auto_cashflows(bulk.get(str(obj.id), []))
+        # В списке товаров вью кладёт в контекст готовую карту по всей странице
+        # (один запрос вместо запроса на каждый товар — было ~100 на страницу).
+        batch = self.context.get("cashflows_by_product")
+        if batch is not None:
+            return batch.get(str(obj.id), [])
 
         from apps.construction.models import CashFlow
-
-        cfs = CashFlow.objects.filter(
-            company_id=obj.company_id, source_id=str(obj.id)
-        ).select_related("cashbox", "cashbox__branch")
+        from apps.construction.auto_cashflow import serialize_auto_cashflows
+        cfs = CashFlow.objects.filter(company_id=obj.company_id, source_id=str(obj.id))
         return serialize_auto_cashflows(cfs)
         extra_kwargs = {
             "kind": {"required": False, "default": Product.Kind.PRODUCT},
@@ -1356,11 +1297,17 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         }
 
     def get_expiry_batches(self, obj):
-        # В списках партии приезжают одним Prefetch (to_attr), иначе это был
-        # отдельный запрос на каждый товар — ~100 на страницу.
-        prefetched = getattr(obj, "active_expiry_batches", None)
-        if prefetched is not None:
-            batches = prefetched[:10]
+        # Если партии уже загружены prefetch-ем — фильтруем в памяти, иначе
+        # .filter() на менеджере сделал бы отдельный запрос на каждый товар.
+        cached = obj.__dict__.get("_prefetched_objects_cache", {}).get("expiry_batches")
+        if cached is not None:
+            batches = [
+                b for b in cached
+                if b.status == ProductExpiryBatch.Status.ACTIVE
+                and (b.remaining_quantity or 0) > 0
+            ]
+            batches.sort(key=lambda b: (b.expires_at is None, b.expires_at, b.received_at))
+            batches = batches[:10]
         else:
             batches = obj.expiry_batches.filter(
                 status=ProductExpiryBatch.Status.ACTIVE, remaining_quantity__gt=0
@@ -1677,32 +1624,12 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             self._sanitize_decimal_fields(instance)
             data = super().to_representation(instance)
         try:
-            # .all() вместо .order_by("barcode") — иначе prefetch_related в
-            # списке не срабатывает и получается запрос на каждый товар.
-            # Порядок задан в самом Prefetch (см. ProductListView.get_queryset)
-            # и в Meta.ordering модели; для одиночных вызовов досортируем тут.
-            alts = instance.alternate_barcodes.all()
-            if not hasattr(instance, "_prefetched_objects_cache") or (
-                "alternate_barcodes" not in instance._prefetched_objects_cache
-            ):
-                alts = alts.order_by("barcode")
-            res_alts = []
-            legacy_alts = []
-            for item in alts:
-                res_alts.append({
-                    "barcode": item.barcode,
-                    "name": item.name,
-                    "quantity": item.quantity,
-                })
-                if item.name:
-                    legacy_alts.append(f"{item.barcode} [{item.name}]")
-                else:
-                    legacy_alts.append(str(item.barcode))
-            data["alternate_barcodes"] = res_alts
-            data["barcodes"] = legacy_alts
+            data["alternate_barcodes"] = [
+                {"barcode": item.barcode, "name": item.name, "quantity": item.quantity}
+                for item in instance.alternate_barcodes.order_by("barcode")
+            ]
         except Exception:
             data["alternate_barcodes"] = []
-            data["barcodes"] = []
         return data
 
     # ==== CREATE / UPDATE ====
@@ -2452,7 +2379,9 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         if target_sale and not instance:
             existing = ClientDeal.objects.filter(sale=target_sale).first()
             if existing:
-                raise serializers.ValidationError({"sale_id": f"По этой продаже уже создана сделка (ID: {existing.id})."})
+                attrs["_existing_deal"] = existing
+                instance = existing
+                self.instance = existing
 
         # прод: если уже есть платежи — условия сделки нельзя менять
         if instance and instance.pk and instance.payments.exists():
@@ -2523,6 +2452,10 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         custom_inst = validated_data.pop("installments", None)
         validated_data.pop("sale_id", None)
 
+        existing = validated_data.pop("_existing_deal", None)
+        if existing:
+            return self.update(existing, validated_data)
+
         instance = ClientDeal(**validated_data)
         if custom_inst and isinstance(custom_inst, (list, tuple)):
             instance._custom_installments = custom_inst
@@ -2567,6 +2500,7 @@ class DealPayInputSerializer(serializers.Serializer):
     branch_id = serializers.UUIDField(required=False, allow_null=True)
     cashbox_role = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     shift_id = serializers.UUIDField(required=False, allow_null=True)
+
 
 class DealPayAnyInputSerializer(serializers.Serializer):
     """Input for one atomic payment distributed across a client's debts."""

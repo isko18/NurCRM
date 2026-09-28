@@ -1928,17 +1928,12 @@ class LeadConsaltingListCreateView(LeadVisibilityMixin, CompanyBranchQuerysetMix
         channel = serializer.validated_data.get("channel") or "manual"
         queue_status = serializer.validated_data.get("queue_status") or "new"
 
-        owner = serializer.validated_data.get("owner")
-        if not owner:
-            owner = self.request.user
-
         lead = serializer.save(
             company=company,
             funnel=funnel,
             stage=stage,
             channel=channel,
             queue_status=queue_status,
-            owner=owner,
             address=serializer.validated_data.get("address") or "",
         )
 
@@ -1948,6 +1943,7 @@ class LeadConsaltingListCreateView(LeadVisibilityMixin, CompanyBranchQuerysetMix
                 lead=lead,
                 full_name=lead.full_name or lead.title,
                 phone=lead.phone,
+                email=lead.email,
                 source=lead.channel or "manual",
                 message=lead.description,
                 status=lead.queue_status,
@@ -2580,10 +2576,13 @@ class LeadTransferView(LeadVisibilityMixin, CompanyBranchQuerysetMixin, generics
             except (FunnelStageConsalting.DoesNotExist, ValueError, TypeError):
                 return Response({"target_stage": "Стадия не найдена."}, status=status.HTTP_400_BAD_REQUEST)
             if target_stage.funnel_id != target_funnel.id:
-                return Response({"target_stage": "Стадия относится к другой воронке."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"target_stage": "Стадия относится к другой воронке."},
+                                status=status.HTTP_400_BAD_REQUEST)
         else:
             target_stage = (
-                FunnelStageConsalting.objects.filter(funnel=target_funnel, system_key="intake").first()
+                FunnelStageConsalting.objects.filter(
+                    funnel=target_funnel, system_key="intake"
+                ).first()
                 or FunnelStageConsalting.objects.filter(funnel=target_funnel).order_by("order").first()
             )
 
@@ -4267,13 +4266,7 @@ class InboundLeadListCreateView(CompanyBranchQuerysetMixin, generics.ListCreateA
 
         source_param = self.request.query_params.get("source")
         if source_param:
-            if str(source_param).lower() in ("whatsapp", "ватсап"):
-                qs = qs.filter(
-                    Q(source__icontains="whatsapp") |
-                    Q(source__icontains="ватсап")
-                )
-            else:
-                qs = qs.filter(source=source_param)
+            qs = qs.filter(source=source_param)
 
         search_param = self.request.query_params.get("search")
         if search_param:
@@ -6383,7 +6376,8 @@ class RegionalFunnelRoutingView(CompanyBranchQuerysetMixin, generics.GenericAPIV
         rules_data = data.get("rules")
         if rules_data is not None and isinstance(rules_data, list):
             with transaction.atomic():
-                existing_rules = {str(r.id): r for r in routing.rules.all()}
+                existing_rules_by_id = {str(r.id): r for r in routing.rules.all()}
+                existing_rules_by_code = {r.region_code: r for r in routing.rules.all()}
                 kept_rule_ids = set()
 
                 for order, r_item in enumerate(rules_data):
@@ -6394,13 +6388,15 @@ class RegionalFunnelRoutingView(CompanyBranchQuerysetMixin, generics.GenericAPIV
                     if not funnel:
                         continue
 
+                    region_code = r_item.get("region_code") or "other"
                     rule_id = str(r_item.get("id") or "")
-                    rule_obj = existing_rules.get(rule_id)
+
+                    rule_obj = existing_rules_by_id.get(rule_id) or existing_rules_by_code.get(region_code)
                     if not rule_obj:
-                        rule_obj = RegionalFunnelRuleConsalting(routing=routing, funnel=funnel)
+                        rule_obj = RegionalFunnelRuleConsalting(routing=routing, funnel=funnel, region_code=region_code)
 
                     rule_obj.funnel = funnel
-                    rule_obj.region_code = r_item.get("region_code") or "other"
+                    rule_obj.region_code = region_code
                     rule_obj.label = r_item.get("label") or ""
                     rule_obj.is_active = bool(r_item.get("is_active", True))
                     rule_obj.phone_prefixes = r_item.get("phone_prefixes") or []
@@ -6413,7 +6409,7 @@ class RegionalFunnelRoutingView(CompanyBranchQuerysetMixin, generics.GenericAPIV
                     kept_rule_ids.add(str(rule_obj.id))
 
                 # Удаляем правила, которых нет в новом списке
-                for r_id, r_obj in existing_rules.items():
+                for r_id, r_obj in existing_rules_by_id.items():
                     if r_id not in kept_rule_ids:
                         r_obj.delete()
 

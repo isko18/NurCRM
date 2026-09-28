@@ -92,7 +92,7 @@ class GreenApiWebhookConsaltingView(APIView):
                     company_id=company_id,
                     phone=clean_phone,
                     defaults={
-                        "name": sender_name,
+                        "full_name": sender_name,
                         "source": "GreenAPI (whatsapp)",
                         "message": text or "[Вложение]",
                         "updated_at": timezone.now(),
@@ -125,7 +125,7 @@ class GreenApiWebhookConsaltingView(APIView):
                             "message_id": wa_msg.message_id,
                             "lead_id": str(lead.id) if lead else "",
                             "phone": clean_phone,
-                            "name": sender_name,
+                            "full_name": sender_name,
                             "direction": direction,
                             "text": text,
                             "content_uri": content_uri,

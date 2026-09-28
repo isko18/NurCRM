@@ -50,6 +50,7 @@ def notification_payload(notification) -> dict:
             f"{(actor.first_name or '').strip()} {(actor.last_name or '').strip()}".strip()
             or getattr(actor, "email", "") or ""
         )
+    data = notification.data or {}
     return {
         "id": str(notification.id),
         "category": getattr(notification, "category", "other"),
@@ -60,7 +61,11 @@ def notification_payload(notification) -> dict:
         "level": notification.level,
         "is_read": bool(notification.is_read),
         "actor_name": actor_name,
-        "data": notification.data or {},
+        "data": data,
+        # FE (nur-market) читает доп. контекст из `meta`, старые экраны — из `data`.
+        # Держим оба ключа с одним и тем же содержимым.
+        "meta": data,
+        "cta_label": data.get("cta_label", "") if isinstance(data, dict) else "",
         "created_at": notification.created_at.isoformat() if notification.created_at else None,
     }
 
@@ -115,7 +120,10 @@ def create_and_publish_notification(*, company, user, message, title="", categor
     )
 
     def _publish():
+        from apps.main.notifications_market import push_unread_count
+
         publish_notification(notification)
+        push_unread_count(user)
 
     try:
         if transaction.get_connection().in_atomic_block:
@@ -160,11 +168,17 @@ def check_and_create_tariff_notifications():
                     title=title,
                     message=f"До окончания подписки компании '{company.name}' осталось {days_left} дн. Пожалуйста, продлите тариф.",
                     category="tariff",
-                    type="tariff",
-                    level=Notification.Level.HIGH if days_left <= 3 else Notification.Level.WARNING,
+                    type="tariff.expiring",
+                    level=(
+                        Notification.Level.CRITICAL if days_left <= 1
+                        else Notification.Level.WARNING if days_left <= 3
+                        else Notification.Level.INFO
+                    ),
                     url="/crm/subscription",
                     data={
                         "days_left": days_left,
+                        "source_kind": "tariff",
+                        "source_id": f"{company.id}-{days_left}d",
                         "cta_label": "Продлить",
                         "cta_url": "/crm/subscription",
                     },

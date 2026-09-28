@@ -370,6 +370,11 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.main.tasks.product_expiry_digest',
         'schedule': crontab(hour=8, minute=0),
     },
+    # Тарифные уведомления за 7/3/1 день до окончания подписки (09:00 Asia/Bishkek).
+    'main-send-tariff-notifications': {
+        'task': 'apps.main.tasks.send_tariff_notifications',
+        'schedule': crontab(hour=9, minute=0),
+    },
 }
 
 # ===========================
