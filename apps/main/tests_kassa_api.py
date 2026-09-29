@@ -272,6 +272,163 @@ class CheckoutMixedSplitTests(KassaBase):
         )
 
 
+class IdempotentCheckoutTests(KassaBase):
+    def test_checkout_repeated_with_same_key_returns_same_201_no_duplicate(self):
+        cart = Cart.objects.create(company=self.company, user=self.owner, shift=self.shift, status=Cart.Status.ACTIVE)
+        CartItem(company=self.company, cart=cart, product=self.product, quantity=Decimal("2"),
+                 unit_price=Decimal("100.00")).save(skip_full_clean=True)
+        init_qty = self.product.quantity
+        key = str(uuid.uuid4())
+
+        r1 = self.api.post(
+            f"/api/main/pos/sales/{cart.id}/checkout/",
+            {"payment_method": "cash", "cash_received": "200.00"},
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=key,
+        )
+        self.assertEqual(r1.status_code, 201, r1.data)
+        sale_id = r1.data["sale_id"]
+        self.assertEqual(Sale.objects.filter(company=self.company).count(), 1)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.quantity, init_qty - Decimal("2"))
+
+        # Повторный запрос с тем же Idempotency-Key
+        r2 = self.api.post(
+            f"/api/main/pos/sales/{cart.id}/checkout/",
+            {"payment_method": "cash", "cash_received": "200.00"},
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=key,
+        )
+        self.assertEqual(r2.status_code, 201)
+        self.assertEqual(r2.data["sale_id"], sale_id)
+        self.assertEqual(r2.headers.get("Idempotent-Replayed"), "true")
+        self.assertEqual(Sale.objects.filter(company=self.company).count(), 1)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.quantity, init_qty - Decimal("2"))
+
+    def test_checkout_with_body_idempotency_key(self):
+        cart = Cart.objects.create(company=self.company, user=self.owner, shift=self.shift, status=Cart.Status.ACTIVE)
+        CartItem(company=self.company, cart=cart, product=self.product, quantity=Decimal("1"),
+                 unit_price=Decimal("100.00")).save(skip_full_clean=True)
+        key = f"body-key-{uuid.uuid4()}"
+
+        r1 = self.api.post(
+            f"/api/main/pos/sales/{cart.id}/checkout/",
+            {"payment_method": "cash", "cash_received": "100.00", "idempotency_key": key},
+            format="json",
+        )
+        self.assertEqual(r1.status_code, 201, r1.data)
+        sale_id = r1.data["sale_id"]
+
+        r2 = self.api.post(
+            f"/api/main/pos/sales/{cart.id}/checkout/",
+            {"payment_method": "cash", "cash_received": "100.00", "idempotency_key": key},
+            format="json",
+        )
+        self.assertEqual(r2.status_code, 201)
+        self.assertEqual(r2.data["sale_id"], sale_id)
+        self.assertEqual(r2.headers.get("Idempotent-Replayed"), "true")
+        self.assertEqual(Sale.objects.filter(company=self.company).count(), 1)
+
+    def test_checkout_retry_after_400_error_retries_logic(self):
+        cart = Cart.objects.create(company=self.company, user=self.owner, shift=self.shift, status=Cart.Status.ACTIVE)
+        CartItem(company=self.company, cart=cart, product=self.product, quantity=Decimal("1"),
+                 unit_price=Decimal("100.00")).save(skip_full_clean=True)
+        key = str(uuid.uuid4())
+
+        # Недостаточно наличных -> 400
+        r1 = self.api.post(
+            f"/api/main/pos/sales/{cart.id}/checkout/",
+            {"payment_method": "cash", "cash_received": "50.00"},
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=key,
+        )
+        self.assertEqual(r1.status_code, 400)
+        self.assertEqual(Sale.objects.filter(company=self.company).count(), 0)
+
+        # Ретрай с тем же ключом и валидной суммой должен выполниться, а не вернуть 400
+        r2 = self.api.post(
+            f"/api/main/pos/sales/{cart.id}/checkout/",
+            {"payment_method": "cash", "cash_received": "100.00"},
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=key,
+        )
+        self.assertEqual(r2.status_code, 201, r2.data)
+        self.assertEqual(Sale.objects.filter(company=self.company).count(), 1)
+
+    def test_checkout_in_progress_returns_409(self):
+        from apps.integrations.models import IdempotencyRecord
+        from apps.integrations.idempotency import _body_hash
+        key = str(uuid.uuid4())
+        cart = Cart.objects.create(company=self.company, user=self.owner, shift=self.shift, status=Cart.Status.ACTIVE)
+        scope = f"POST /main/pos/sales/{cart.id}/checkout/"
+        payload = {"payment_method": "cash", "cash_received": "100.00"}
+        class DummyRequest:
+            data = payload
+        IdempotencyRecord.objects.create(
+            company=self.company,
+            key=key,
+            scope=scope,
+            body_hash=_body_hash(DummyRequest()),
+            state=IdempotencyRecord.State.IN_PROGRESS,
+        )
+        r = self.api.post(
+            f"/api/main/pos/sales/{cart.id}/checkout/",
+            payload,
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=key,
+        )
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.data.get("code"), "in_progress")
+
+    def test_start_sale_is_idempotent(self):
+        key = str(uuid.uuid4())
+        r1 = self.api.post(
+            "/api/main/pos/sales/start/",
+            {"shift": str(self.shift.id)},
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=key,
+        )
+        self.assertIn(r1.status_code, (200, 201), r1.data)
+        cart_id = r1.data.get("id") or r1.data.get("active_sale_id")
+
+        r2 = self.api.post(
+            "/api/main/pos/sales/start/",
+            {"shift": str(self.shift.id)},
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=key,
+        )
+        self.assertIn(r2.status_code, (200, 201))
+        self.assertEqual(r2.headers.get("Idempotent-Replayed"), "true")
+        self.assertEqual(r2.data.get("id") or r2.data.get("active_sale_id"), cart_id)
+
+    def test_key_length_validation(self):
+        cart = Cart.objects.create(company=self.company, user=self.owner, shift=self.shift, status=Cart.Status.ACTIVE)
+        CartItem(company=self.company, cart=cart, product=self.product, quantity=Decimal("1"),
+                 unit_price=Decimal("100.00")).save(skip_full_clean=True)
+        # 255 символов - ОК
+        key_255 = "k" * 255
+        r1 = self.api.post(
+            f"/api/main/pos/sales/{cart.id}/checkout/",
+            {"payment_method": "cash", "cash_received": "100.00"},
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=key_255,
+        )
+        self.assertEqual(r1.status_code, 201)
+
+        # 256 символов - 400
+        cart2 = Cart.objects.create(company=self.company, user=self.owner, shift=self.shift, status=Cart.Status.ACTIVE)
+        key_256 = "k" * 256
+        r2 = self.api.post(
+            f"/api/main/pos/sales/{cart2.id}/checkout/",
+            {"payment_method": "cash", "cash_received": "100.00"},
+            format="json",
+            HTTP_IDEMPOTENCY_KEY=key_256,
+        )
+        self.assertEqual(r2.status_code, 400)
+        self.assertEqual(r2.data.get("code"), "invalid")
+
+
 class DrawerInflowTests(KassaBase):
     def test_inflow_and_outflow_move_expected_cash_905_915_905(self):
         """BE2-05: внесение 10 → expected_cash 905 → 915, изъятие 10 → снова 905."""
@@ -894,6 +1051,7 @@ class DebtV2MonthsTests(KassaBase):
         self.assertEqual(r.status_code, 400)
         self.assertIn("debt_months", r.data)
 
+
 class SaleDealLinkageTests(KassaBase):
     """09-sale-deal-linkage: продажа в долг следует за погашением своей сделки."""
 
@@ -951,6 +1109,7 @@ class SaleDealLinkageTests(KassaBase):
                                          kind=ClientDeal.Kind.DEBT, amount=Decimal("100.00"), debt_months=1)
         sync_sale_status_from_deal(deal.id)  # не падает и ничего не трогает
 
+
 class ShiftReturnsReportingTests(KassaBase):
     """11-shift-returns-reporting: возвраты в итогах смены, по факту выдачи денег."""
 
@@ -1005,6 +1164,7 @@ class ShiftReturnsReportingTests(KassaBase):
             (data["returns_count"], data["returns_total"], data["returns_cash"], data["returns_noncash"]),
             (1, "200.00", "0.00", "0.00"),
         )
+
 
 class MassIncomingBatchTests(KassaBase):
     """mass-incoming-batch: «Провести приход» одним запросом, всё или ничего."""

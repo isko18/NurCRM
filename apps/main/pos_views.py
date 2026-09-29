@@ -2260,6 +2260,7 @@ class SaleReceiptDataAPIView(MarketCashierOnlyMixin, APIView):
 class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    @idempotent(body_key=True)
     def post(self, request, *args, **kwargs):
         user = request.user
         company = self._company() or user.company
@@ -2700,6 +2701,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
 class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    @idempotent(body_key=True)
     def post(self, request, pk, *args, **kwargs):
         return self.checkout(request, pk, request.data)
 
@@ -3851,7 +3853,7 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
 
     permission_classes = [permissions.IsAuthenticated]
 
-    @idempotent
+    @idempotent(body_key=True)
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
         payload = request.data or {}
@@ -5286,6 +5288,7 @@ class AgentSaleAddCustomItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestric
 class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    @idempotent(body_key=True)
     def post(self, request, pk, *args, **kwargs):
         with transaction.atomic():
             company = self._company() or request.user.company

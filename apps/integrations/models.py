@@ -93,7 +93,7 @@ class IdempotencyRecord(models.Model):
 
     id = models.BigAutoField(primary_key=True)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="idempotency_records")
-    key = models.CharField(max_length=128)
+    key = models.CharField(max_length=255)
     scope = models.CharField(max_length=255, help_text="Метод и адрес запроса")
     body_hash = models.CharField(max_length=64)
     state = models.CharField(max_length=16, choices=State.choices, default=State.IN_PROGRESS)

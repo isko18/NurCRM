@@ -20,14 +20,18 @@ from rest_framework.utils.encoders import JSONEncoder
 from apps.integrations.models import IdempotencyRecord
 
 TTL = timedelta(days=7)
-MAX_KEY_LENGTH = 128
+MAX_KEY_LENGTH = 255
+IN_PROGRESS_TIMEOUT = timedelta(minutes=5)
 
 
 def _body_hash(request) -> str:
+    data = getattr(request, "data", None)
+    if isinstance(data, dict):
+        data = {k: v for k, v in data.items() if k != "idempotency_key"}
     try:
-        raw = json.dumps(request.data, sort_keys=True, default=str, ensure_ascii=False)
+        raw = json.dumps(data, sort_keys=True, default=str, ensure_ascii=False)
     except Exception:
-        raw = repr(request.data)
+        raw = repr(data)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -38,19 +42,43 @@ def _error(detail, code, http_status, **headers):
     return resp
 
 
-def idempotent(handler):
-    """Декоратор метода APIView (post/patch/put/delete)."""
+def _request_key(request, body_key: bool) -> str:
+    headers = getattr(request, "headers", {})
+    meta = getattr(request, "META", {})
+    key = (headers.get("Idempotency-Key") or meta.get("HTTP_IDEMPOTENCY_KEY") or "").strip()
+    if not key and body_key and isinstance(getattr(request, "data", None), dict):
+        key = str(request.data.get("idempotency_key") or "").strip()
+    return key
+
+
+def _normalize_scope(request) -> str:
+    path = getattr(request, "path", "") or ""
+    if path.startswith("/api/"):
+        path = path[4:]
+    if not path.endswith("/"):
+        path = path + "/"
+    method = (getattr(request, "method", "") or "POST").upper()
+    return f"{method} {path}"[:255]
+
+
+def idempotent(handler=None, *, body_key=False):
+    """
+    Декоратор метода APIView (post/patch/put/delete).
+    body_key=True — ключ можно передать и полем idempotency_key в теле (если нет заголовка).
+    """
+    if handler is None:
+        return functools.partial(idempotent, body_key=body_key)
 
     @functools.wraps(handler)
     def wrapper(view, request, *args, **kwargs):
-        key = (request.headers.get("Idempotency-Key") or "").strip()
+        key = _request_key(request, body_key)
         company_id = getattr(getattr(request, "user", None), "company_id", None)
         if not key or company_id is None:
             return handler(view, request, *args, **kwargs)
         if len(key) > MAX_KEY_LENGTH:
-            return _error("Idempotency-Key не длиннее 128 символов.", "invalid", status.HTTP_400_BAD_REQUEST)
+            return _error("Idempotency-Key не длиннее 255 символов.", "invalid", status.HTTP_400_BAD_REQUEST)
 
-        scope = f"{request.method} {request.path}"[:255]
+        scope = _normalize_scope(request)
         body_hash = _body_hash(request)
         IdempotencyRecord.objects.filter(
             company_id=company_id, key=key, created_at__lt=timezone.now() - TTL
@@ -70,13 +98,30 @@ def idempotent(handler):
                     "idempotency_conflict", status.HTTP_409_CONFLICT,
                 )
             if record.state != IdempotencyRecord.State.DONE:
-                return _error(
-                    "Запрос с этим Idempotency-Key ещё выполняется.",
-                    "in_progress", status.HTTP_409_CONFLICT, **{"Retry-After": "1"},
-                )
-            resp = Response(record.response_body, status=record.status_code)
-            resp["Idempotent-Replayed"] = "true"
-            return resp
+                if record.created_at and record.created_at < timezone.now() - IN_PROGRESS_TIMEOUT:
+                    # Устаревший повисший запрос — очищаем и запускаем заново
+                    record.delete()
+                    try:
+                        with transaction.atomic():
+                            record, created = IdempotencyRecord.objects.get_or_create(
+                                company_id=company_id, key=key, defaults={"scope": scope, "body_hash": body_hash}
+                            )
+                    except IntegrityError:
+                        record, created = IdempotencyRecord.objects.get(company_id=company_id, key=key), False
+                    if not created and record.state != IdempotencyRecord.State.DONE:
+                        return _error(
+                            "Запрос с этим Idempotency-Key ещё выполняется.",
+                            "in_progress", status.HTTP_409_CONFLICT, **{"Retry-After": "1"},
+                        )
+                else:
+                    return _error(
+                        "Запрос с этим Idempotency-Key ещё выполняется.",
+                        "in_progress", status.HTTP_409_CONFLICT, **{"Retry-After": "1"},
+                    )
+            if record.state == IdempotencyRecord.State.DONE:
+                resp = Response(record.response_body, status=record.status_code)
+                resp["Idempotent-Replayed"] = "true"
+                return resp
 
         try:
             response = handler(view, request, *args, **kwargs)

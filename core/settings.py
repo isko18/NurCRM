@@ -87,6 +87,8 @@ SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-dev-only-change-me"
 
 # SECURITY WARNING: don't run with debug turned on in production!
 ALLOWED_HOSTS = _get_list_env("DJANGO_ALLOWED_HOSTS", DEFAULT_ALLOWED_HOSTS)
+if "testserver" not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append("testserver")
 CSRF_TRUSTED_ORIGINS = _get_list_env("DJANGO_CSRF_TRUSTED_ORIGINS", DEFAULT_CORS_ORIGINS)
 
 
@@ -174,14 +176,15 @@ ASGI_APPLICATION = "core.asgi.application"
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'nurcrm2',
-        'USER': 'nuruser',
-        'PASSWORD': 'nurpass2025',
-        'HOST': '127.0.0.1',
-        'PORT': '6432',
+        'NAME': os.environ.get('DB_NAME', 'nurcrm2'),
+        'USER': os.environ.get('DB_USER', 'nuruser'),
+        'PASSWORD': os.environ.get('DB_PASSWORD', 'nurpass2025'),
+        'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
+        'PORT': os.environ.get('DB_PORT', '6432'),
         'CONN_MAX_AGE': 0,
     }
 }
+
 
 
 
