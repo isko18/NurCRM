@@ -258,6 +258,7 @@ CLIENT_ZIP_URL = os.getenv(
 CLIENT_RELEASE_NOTES = os.getenv("CLIENT_RELEASE_NOTES", "Первый релиз")
 
 REST_FRAMEWORK = {
+    'EXCEPTION_HANDLER': 'core.exceptions.api_exception_handler',
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
         'apps.integrations.authentication.ApiKeyAuthentication',

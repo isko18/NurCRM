@@ -610,3 +610,44 @@ class ReturnLinesTests(KassaBase):
         self.assertEqual(r.status_code, 200, r.data)
         line = self.api.get("/api/main/pos/returns/").data[0]["items"][0]
         self.assertEqual((line["reason"], line["restock"], line["total"]), ("defect", False, "200.00"))
+
+
+class HealthAndErrorFormatTests(KassaBase):
+    """BE2-09 и п. 2.1/2.4: health без авторизации, JSON-ошибки с code."""
+
+    def test_health_ok_without_auth(self):
+        r = APIClient().get("/api/health/")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual((body["status"], body["db"]), ("ok", "ok"))
+        self.assertIn("time", body)
+        self.assertIn("version", body)
+
+    def test_health_db_down_is_503_json_with_retry_after(self):
+        with mock.patch("core.views_health.connection") as conn:
+            conn.cursor.side_effect = Exception("db is down")
+            r = APIClient().get("/api/health/")
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r["Retry-After"], "30")
+        self.assertEqual(r.json()["db"], "down")
+
+    def test_errors_carry_code(self):
+        r = APIClient().get("/api/main/pos/returns/")
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.data["code"], "not_authenticated")
+        r = self.api.get(f"/api/main/pos/sales/{uuid.uuid4()}/")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.data["code"], "not_found")
+
+    def test_field_errors_keep_their_shape(self):
+        r = self.api.get("/api/main/pos/returns/?date_from=bad")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(set(r.data), {"date_from"})
+
+    def test_django_validation_error_is_400_not_500(self):
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from core.exceptions import api_exception_handler
+
+        resp = api_exception_handler(DjangoValidationError("Остаток меньше нуля."), {})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual((resp.data["detail"], resp.data["code"]), ("Остаток меньше нуля.", "invalid"))

@@ -68,6 +68,7 @@ apps_includes = [
 api_urlpatterns = [
     path("api/media-proxy/", media_proxy, name="media-proxy"),
     path("api/version/", ClientVersionView.as_view(), name="client-version"),
+    path("api/health/", health_check, name="api-health-check"),
     path('api/', include(apps_includes)),
     path('', include(apps_includes)),
 ]
@@ -95,14 +96,14 @@ from django.http import JsonResponse
 
 def custom_handler404(request, exception=None):
     if request.path.startswith('/api/'):
-        return JsonResponse({"detail": "Запрашиваемый ресурс или страница не найдена (404)."}, status=404)
+        return JsonResponse({"detail": "Запрашиваемый ресурс или страница не найдена (404).", "code": "not_found"}, status=404)
     from django.views.defaults import page_not_found
     return page_not_found(request, exception)
 
 def custom_handler500(request):
     traceback.print_exc()
     if request.path.startswith('/api/'):
-        return JsonResponse({"detail": "Внутренняя ошибка сервера (500)."}, status=500)
+        return JsonResponse({"detail": "Внутренняя ошибка сервера (500).", "code": "server_error"}, status=500)
     from django.views.defaults import server_error
     return server_error(request)
 
