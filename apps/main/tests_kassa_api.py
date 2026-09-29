@@ -423,6 +423,24 @@ class CompanyTests(KassaBase):
         api.force_authenticate(self.cashier)
         self.assertEqual(api.patch("/api/users/company/", {"market_sphere": "grocery"}, format="json").status_code, 403)
 
+    def test_market_spheres_list_and_features_detail(self):
+        """BE2-02: несколько видов магазина и функции со сроком."""
+        import datetime
+
+        self.plan.features.add(Feature.objects.create(name="variants"))
+        CompanyAddon.objects.create(company=self.company, code="certificates", until=datetime.date(2027, 1, 1))
+        r = self.api.patch("/api/users/company/", {"market_spheres": ["clothing", "services"]}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual((r.data["market_sphere"], r.data["market_spheres"]), ("clothing", ["clothing", "services"]))
+        detail = {f["code"]: f["until"] for f in r.data["features_detail"]}
+        self.assertEqual(detail["certificates"][:10], "2027-01-01")
+        self.assertIn("variants", detail)
+
+        r = self.api.patch("/api/users/company/", {"market_sphere": "services"}, format="json")
+        self.assertEqual(r.data["market_spheres"], ["services"])
+        r = self.api.patch("/api/users/company/", {"market_spheres": ["cafe"]}, format="json")
+        self.assertEqual(r.status_code, 400)
+
 
 class ApiKeyTests(KassaBase):
     def test_read_only_key(self):

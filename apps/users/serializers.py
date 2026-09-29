@@ -1018,6 +1018,23 @@ def company_feature_codes(company):
     return list(dict.fromkeys(c for c in codes if c))
 
 
+def company_features_detail(company, *, plan_until=None):
+    """
+    BE2-02: [{code, until}] — функции тарифа действуют до конца подписки (plan_until),
+    платные функции — до своей даты (null — бессрочно). Только действующие.
+    """
+    out = {}
+    plan = getattr(company, "subscription_plan", None)
+    if plan is not None:
+        for code in plan.features.order_by("name").values_list("name", flat=True):
+            if code:
+                out[code] = plan_until
+    for a in company_addons_payload(company):
+        if a["active"]:
+            out[a["code"]] = a["until"]
+    return [{"code": code, "until": until} for code, until in out.items()]
+
+
 class CompanySerializer(serializers.ModelSerializer):
     industry = IndustrySerializer(read_only=True)
     subscription_plan = SubscriptionPlanSerializer(read_only=True)
@@ -1081,6 +1098,10 @@ class CompanySerializer(serializers.ModelSerializer):
         plan_code = sub["plan"]["code"] if sub.get("plan") else None
         data["limits"] = get_company_limits(instance, plan_code=plan_code)
         data["features"] = company_feature_codes(instance)
+        data["features_detail"] = company_features_detail(instance, plan_until=end_date_str)
+        data["market_spheres"] = instance.market_spheres or (
+            [instance.market_sphere] if instance.market_sphere else []
+        )
 
         return data
 
@@ -1179,9 +1200,28 @@ class CompanyUpdateSerializer(serializers.ModelSerializer):
             "appointment_work_start",
             "appointment_work_end",
             "market_sphere",
+            "market_spheres",
         ]
 
+    def validate_market_spheres(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Ожидается список видов магазина.")
+        allowed = set(Company.MarketSphere.values)
+        bad = [v for v in value if v not in allowed]
+        if bad:
+            raise serializers.ValidationError(f"Неизвестный вид магазина: {', '.join(map(str, bad))}.")
+        return list(dict.fromkeys(value))
+
     def validate(self, attrs):
+        # market_sphere и market_spheres держим согласованными: основной вид — первый в списке.
+        if "market_spheres" in attrs and "market_sphere" not in attrs:
+            attrs["market_sphere"] = attrs["market_spheres"][0] if attrs["market_spheres"] else None
+        elif "market_sphere" in attrs and "market_spheres" not in attrs:
+            attrs["market_spheres"] = [attrs["market_sphere"]] if attrs["market_sphere"] else []
+        elif "market_sphere" in attrs and attrs["market_sphere"]:
+            spheres = attrs["market_spheres"]
+            attrs["market_spheres"] = [attrs["market_sphere"]] + [v for v in spheres if v != attrs["market_sphere"]]
+
         for f in _OPTIONAL_TEXT:
             if f in attrs and (attrs[f] is None or str(attrs[f]).strip() == ""):
                 attrs[f] = None

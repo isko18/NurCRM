@@ -214,6 +214,8 @@ class Company(models.Model):
         blank=True,
         help_text="Под него перестраиваются кассы: каталог, карточка товара, запись, прокат.",
     )
+    # BE2-02: магазин может совмещать виды (одежда + услуги); market_sphere — основной, первый в списке.
+    market_spheres = models.JSONField("Виды магазина", default=list, blank=True)
 
 
     scale_api_token = models.CharField(
