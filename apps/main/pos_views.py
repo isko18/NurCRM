@@ -1,3 +1,4 @@
+from apps.integrations.idempotency import idempotent
 from rest_framework import generics, status, permissions, filters
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -3844,6 +3845,7 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
 
     permission_classes = [permissions.IsAuthenticated]
 
+    @idempotent
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
         payload = request.data or {}

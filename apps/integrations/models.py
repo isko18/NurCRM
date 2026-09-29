@@ -79,3 +79,29 @@ class WebhookEndpoint(models.Model):
 
     def __str__(self):
         return self.url
+
+
+class IdempotencyRecord(models.Model):
+    """
+    BE2-11: первый ответ операции по Idempotency-Key. Повтор с тем же ключом
+    возвращает этот ответ, а не выполняет операцию ещё раз. Хранится 7 суток.
+    """
+
+    class State(models.TextChoices):
+        IN_PROGRESS = "in_progress", "Выполняется"
+        DONE = "done", "Готово"
+
+    id = models.BigAutoField(primary_key=True)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="idempotency_records")
+    key = models.CharField(max_length=128)
+    scope = models.CharField(max_length=255, help_text="Метод и адрес запроса")
+    body_hash = models.CharField(max_length=64)
+    state = models.CharField(max_length=16, choices=State.choices, default=State.IN_PROGRESS)
+    status_code = models.PositiveSmallIntegerField(null=True, blank=True)
+    response_body = models.JSONField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["company", "key"], name="uniq_idempotency_company_key"),
+        ]

@@ -1,3 +1,4 @@
+from apps.integrations.idempotency import idempotent
 from decimal import Decimal, InvalidOperation
 
 from django.apps import apps
@@ -620,6 +621,11 @@ class CashFlowListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIVie
     )
     serializer_class = CashFlowSerializer
     pagination_class = CashFlowListPagination
+
+
+    @idempotent
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
 
     def get_queryset(self):
         qs = self._scoped_queryset(super().get_queryset())
@@ -1248,6 +1254,7 @@ class CashShiftOpenView(CompanyBranchScopedMixin, generics.CreateAPIView):
     """
     serializer_class = CashShiftOpenSerializer
 
+    @idempotent
     @transaction.atomic
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data, context={"request": request})
@@ -1266,6 +1273,7 @@ class CashShiftOpenView(CompanyBranchScopedMixin, generics.CreateAPIView):
 class CashShiftCloseView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    @idempotent
     @transaction.atomic
     def post(self, request, pk):
         company = _get_company(request.user)

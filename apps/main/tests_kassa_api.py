@@ -669,3 +669,101 @@ class HealthAndErrorFormatTests(KassaBase):
         resp = api_exception_handler(DjangoValidationError("Остаток меньше нуля."), {})
         self.assertEqual(resp.status_code, 400)
         self.assertEqual((resp.data["detail"], resp.data["code"]), ("Остаток меньше нуля.", "invalid"))
+
+
+class IdempotencyKeyTests(KassaBase):
+    """BE2-11: повтор операции с тем же Idempotency-Key не создаёт дубль."""
+
+    def test_return_twice_with_same_key_creates_one_return(self):
+        sale_id = self.quick(shift=str(self.shift.id)).data["id"]
+        url = f"/api/main/pos/sales/{sale_id}/return/"
+        r1 = self.api.post(url, {"reason": "брак"}, format="json", HTTP_IDEMPOTENCY_KEY="ret-1")
+        self.assertEqual(r1.status_code, 200, r1.data)
+        r2 = self.api.post(url, {"reason": "брак"}, format="json", HTTP_IDEMPOTENCY_KEY="ret-1")
+        self.assertEqual(r2.status_code, 200, r2.data)
+        self.assertEqual(r2["Idempotent-Replayed"], "true")
+        self.assertEqual(r2.json(), r1.json())
+        self.assertEqual(SaleReturn.objects.count(), 1)
+
+    def test_same_key_other_body_is_conflict(self):
+        body = {"cashbox": str(self.cashbox.id), "shift": str(self.shift.id), "type": "income", "name": "Внесение",
+                "amount": "10.00", "source_kind": "shift_drawer_inflow", "payment_method": "cash"}
+        r = self.api.post("/api/construction/cashflows/", body, format="json", HTTP_IDEMPOTENCY_KEY="cf-1")
+        self.assertEqual(r.status_code, 201, r.data)
+        r = self.api.post("/api/construction/cashflows/", body, format="json", HTTP_IDEMPOTENCY_KEY="cf-1")
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(CashFlow.objects.filter(source_kind="shift_drawer_inflow").count(), 1)
+        r = self.api.post("/api/construction/cashflows/", {**body, "amount": "20.00"}, format="json",
+                          HTTP_IDEMPOTENCY_KEY="cf-1")
+        self.assertEqual((r.status_code, r.data["code"]), (409, "idempotency_conflict"))
+
+    def test_client_create_and_shift_open_close(self):
+        body = {"full_name": "Айгуль", "phone": "+996700000001"}
+        ids = {self.api.post("/api/main/clients/", body, format="json", HTTP_IDEMPOTENCY_KEY="cl-1").data["id"]
+               for _ in range(2)}
+        self.assertEqual(len(ids), 1)
+
+        self.shift.status = CashShift.Status.CLOSED
+        self.shift.save()
+        open_body = {"cashbox": str(self.cashbox.id), "opening_cash": "100.00"}
+        r1 = self.api.post("/api/construction/shifts/open/", open_body, format="json", HTTP_IDEMPOTENCY_KEY="sh-1")
+        self.assertEqual(r1.status_code, 201, r1.data)
+        r2 = self.api.post("/api/construction/shifts/open/", open_body, format="json", HTTP_IDEMPOTENCY_KEY="sh-1")
+        self.assertEqual((r2.status_code, r2.data["id"]), (201, r1.data["id"]))
+
+        close_url = f"/api/construction/shifts/{r1.data['id']}/close/"
+        c1 = self.api.post(close_url, {"closing_cash": "100.00"}, format="json", HTTP_IDEMPOTENCY_KEY="sh-close")
+        self.assertIn(c1.status_code, (200, 201), c1.data)
+        c2 = self.api.post(close_url, {"closing_cash": "100.00"}, format="json", HTTP_IDEMPOTENCY_KEY="sh-close")
+        self.assertEqual(c2.status_code, c1.status_code)
+        self.assertEqual(c2["Idempotent-Replayed"], "true")
+
+    def test_failed_request_can_be_retried_with_same_key(self):
+        r = self.api.post("/api/main/clients/", {"phone": "x"}, format="json", HTTP_IDEMPOTENCY_KEY="cl-bad")
+        self.assertEqual(r.status_code, 400)
+        r = self.api.post("/api/main/clients/", {"full_name": "Бек", "phone": "+996700000002"}, format="json",
+                          HTTP_IDEMPOTENCY_KEY="cl-bad")
+        self.assertEqual(r.status_code, 201, r.data)
+
+
+class OfflineSaleTests(KassaBase):
+    """BE2-10: продажа без связи попадает в свой день и свою (даже закрытую) смену."""
+
+    def test_offline_sale_into_closed_shift_two_days_later(self):
+        from datetime import timedelta
+        from django.utils import timezone
+
+        sold_at = timezone.now() - timedelta(days=2)
+        CashShift.objects.filter(pk=self.shift.pk).update(opened_at=sold_at - timedelta(hours=1))
+        self.shift.refresh_from_db()
+        self.shift.close(closing_cash=Decimal("1000.00"))
+        self.assertEqual(self.shift.sales_count, 0)
+
+        body = {"offline": True, "offline_created_at": sold_at.isoformat(), "shift": str(self.shift.id)}
+        r = self.quick(key="off-1", **body)
+        self.assertEqual(r.status_code, 201, r.data)
+        sale = Sale.objects.get(id=r.data["id"])
+        self.assertTrue(sale.is_offline)
+        self.assertEqual(sale.shift_id, self.shift.id)
+        self.assertEqual((sale.created_at, sale.paid_at), (sold_at, sold_at))
+        self.assertIsNotNone(sale.received_at)
+        flow = CashFlow.objects.get(source_id=str(sale.id))
+        self.assertEqual((flow.created_at, flow.shift_id), (sold_at, self.shift.id))
+
+        self.shift.refresh_from_db()
+        self.assertEqual((self.shift.sales_count, self.shift.sales_total), (1, Decimal("200.00")))
+
+        again = self.quick(key="off-1", **body)
+        self.assertEqual((again.status_code, again.data["replayed"]), (200, True))
+        self.assertEqual(Sale.objects.count(), 1)
+
+    def test_offline_time_is_validated(self):
+        from datetime import timedelta
+        from django.utils import timezone
+
+        r = self.quick(offline=True)
+        self.assertEqual(r.status_code, 400)
+        r = self.quick(offline=True, offline_created_at=(timezone.now() + timedelta(hours=1)).isoformat())
+        self.assertEqual(r.status_code, 400)
+        r = self.quick(offline=True, offline_created_at=(timezone.now() - timedelta(days=8)).isoformat())
+        self.assertEqual(r.status_code, 400)

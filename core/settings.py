@@ -358,6 +358,11 @@ CELERY_BEAT_SCHEDULE = {
     # Ежедневная полная синхронизация каталога товаров с внешней системой.
     # Досылает все товары (product.updated), логирует товары без фото.
     # Запускается каждые 2 дня в 03:00 по Asia/Bishkek.
+    # Ключи идемпотентности кассы старше 7 суток (BE2-11).
+    'integrations-purge-idempotency-records': {
+        'task': 'apps.integrations.tasks.purge_idempotency_records',
+        'schedule': crontab(hour=4, minute=30),
+    },
     'main-catalog-webhook-sync': {
         'task': 'apps.main.tasks.catalog_webhook_sync',
         'schedule': crontab(hour=3, minute=0, day_of_month='*/2'),

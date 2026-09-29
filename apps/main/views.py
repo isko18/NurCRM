@@ -1,3 +1,4 @@
+from apps.integrations.idempotency import idempotent
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from uuid import UUID, uuid4, uuid5
 
@@ -3067,6 +3068,11 @@ class ClientListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateA
     search_fields = ["full_name", "phone", "email"]
     ordering_fields = ["created_at", "updated_at", "date"]
     ordering = ["-created_at"]
+
+
+    @idempotent
+    def post(self, request, *args, **kwargs):
+        return super().post(request, *args, **kwargs)
 
     def get_queryset(self):
         qs = self._filter_qs_company_branch(

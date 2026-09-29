@@ -2292,6 +2292,10 @@ class Sale(models.Model):
 
     created_at = models.DateTimeField(auto_now_add=True)
     paid_at = models.DateTimeField(null=True, blank=True)
+    # BE2-10: продажа сделана кассой без связи и дослана позже; created_at/paid_at — фактическое время
+    # продажи, received_at — когда сервер её принял.
+    is_offline = models.BooleanField(default=False, verbose_name="Продажа без связи")
+    received_at = models.DateTimeField(null=True, blank=True, verbose_name="Принята сервером")
 
     # Фискализация eKassa (после успешной оплаты, вне транзакции чекаута)
     ekassa_fiscal = models.JSONField(

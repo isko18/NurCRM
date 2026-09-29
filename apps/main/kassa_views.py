@@ -10,17 +10,20 @@
 """
 import uuid
 from collections import defaultdict
+from datetime import timedelta
 from decimal import Decimal
 
 from django.db import IntegrityError, transaction
 from django.db.models import DecimalField, OuterRef, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import permissions, serializers, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.construction.models import CashFlow, CashShift
 from apps.main.models import (
     Cart,
     CartItem,
@@ -32,6 +35,7 @@ from apps.main.models import (
     ProductPackage,
     ProductVariant,
     Sale,
+    SalePayment,
     SaleReturn,
 )
 from apps.main.pos_serializers import MoneyField, QtyField, _is_owner_like
@@ -115,6 +119,21 @@ class QuickCheckoutSerializer(serializers.Serializer):
     print_receipt = serializers.BooleanField(required=False, default=False)
     allow_minus = serializers.BooleanField(required=False, default=False)
     is_wholesale = serializers.BooleanField(required=False, default=False)
+    # BE2-10: продажа, сделанная без связи и досланная позже.
+    offline = serializers.BooleanField(required=False, default=False)
+    offline_created_at = serializers.DateTimeField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        if attrs.get("offline"):
+            at = attrs.get("offline_created_at")
+            if at is None:
+                raise serializers.ValidationError({"offline_created_at": "Для продажи без связи нужно время продажи."})
+            now = timezone.now()
+            if at > now + OFFLINE_CLOCK_SKEW:
+                raise serializers.ValidationError({"offline_created_at": "Время продажи в будущем."})
+            if at < now - OFFLINE_MAX_AGE:
+                raise serializers.ValidationError({"offline_created_at": "Продажа старше 7 суток — оформите её вручную."})
+        return attrs
 
 
 def _quick_result(sale: Sale) -> dict:
@@ -177,6 +196,38 @@ def _is_admin_for_discounts(user) -> bool:
     return getattr(user, "role", None) in ("owner", "admin")
 
 
+OFFLINE_MAX_AGE = timedelta(days=7)
+OFFLINE_CLOCK_SKEW = timedelta(minutes=5)
+
+
+def _resolve_offline_shift(*, company, shift_id, at):
+    """Смена, в которой касса сделала продажу без связи; она могла уже закрыться."""
+    shift = CashShift.objects.select_related("cashbox", "cashier").filter(id=shift_id, company=company).first()
+    if shift is None:
+        raise ValidationError({"shift": "Смена не найдена."})
+    if shift.opened_at and at < shift.opened_at - OFFLINE_CLOCK_SKEW:
+        raise ValidationError({"offline_created_at": "Время продажи раньше открытия смены."})
+    return shift
+
+
+def _backdate_offline_sale(sale, at):
+    """
+    Продажа без связи попадает в отчёты своего дня и своей смены: переносим время
+    продажи, её оплат и движений денег; итоги уже закрытой смены пересчитываем.
+    """
+    now = timezone.now()
+    Sale.objects.filter(pk=sale.pk).update(created_at=at, paid_at=at, is_offline=True, received_at=now)
+    SalePayment.objects.filter(sale_id=sale.pk).update(created_at=at)
+    CashFlow.objects.filter(company_id=sale.company_id, source_id=str(sale.pk)).update(created_at=at)
+    shift = sale.shift
+    if shift is not None and shift.status == CashShift.Status.CLOSED:
+        shift.recalc_totals_for_close()
+        shift.save(update_fields=[
+            "income_total", "expense_total", "sales_count", "sales_total",
+            "cash_sales_total", "noncash_sales_total",
+        ])
+
+
 class PosQuickCheckoutAPIView(APIView):
     """
     POST /api/main/pos/checkout/
@@ -210,7 +261,12 @@ class PosQuickCheckoutAPIView(APIView):
 
         try:
             with transaction.atomic():
-                if data.get("shift"):
+                offline_at = data.get("offline_created_at") if data.get("offline") else None
+                if data.get("shift") and offline_at:
+                    shift = _resolve_offline_shift(company=company, shift_id=data["shift"], at=offline_at)
+                    if shift.cashier_id != user.id and not _is_owner_like(user):
+                        raise ValidationError({"shift": "Это не ваша смена."})
+                elif data.get("shift"):
                     shift = _resolve_requested_open_shift(company=company, cashier=user, shift_id=data["shift"])
                     if shift.cashier_id != user.id and not _is_owner_like(user):
                         raise ValidationError({"shift": "Это не ваша смена."})
@@ -269,6 +325,8 @@ class PosQuickCheckoutAPIView(APIView):
                     bonus_redeemed=sale.bonus_redeemed,
                     discount_total=sale.discount_total,
                 )
+                if offline_at:
+                    _backdate_offline_sale(sale, offline_at)
         except IntegrityError:
             existing = Sale.objects.filter(company=company, idempotency_key=key).first()
             if existing:

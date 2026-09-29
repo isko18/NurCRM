@@ -74,3 +74,11 @@ def deliver_webhook(self, endpoint_id: str, envelope: dict):
         raise self.retry(countdown=30 * (2 ** self.request.retries))
     logger.warning("webhook %s gave up after retries: %s", endpoint_id, error)
     return "failed"
+
+
+@shared_task
+def purge_idempotency_records():
+    """BE2-11: ключи идемпотентности старше 7 суток больше не нужны."""
+    from apps.integrations.idempotency import purge_expired
+
+    return purge_expired()
