@@ -767,3 +767,53 @@ class OfflineSaleTests(KassaBase):
         self.assertEqual(r.status_code, 400)
         r = self.quick(offline=True, offline_created_at=(timezone.now() - timedelta(days=8)).isoformat())
         self.assertEqual(r.status_code, 400)
+
+
+class CatalogSyncTests(KassaBase):
+    """BE2-19: products/list/?updated_since= — изменённые, удалённые, server_time."""
+
+    def _sync(self, since):
+        r = self.api.get("/api/main/products/list/", {"updated_since": since})
+        self.assertEqual(r.status_code, 200, r.data)
+        return r.data, {row["id"] for row in r.data["results"]}
+
+    def _stale(self, *products):
+        from datetime import timedelta
+        from django.utils import timezone
+
+        Product.objects.filter(pk__in=[p.pk for p in products]).update(
+            updated_at=timezone.now() - timedelta(hours=1)
+        )
+
+    def test_changes_sales_promotions_and_deletions_are_synced(self):
+        from apps.main.models import ProductPromotionTier
+
+        other = Product.objects.create(company=self.company, name="Молоко", price=Decimal("80.00"),
+                                       quantity=Decimal("10"))
+        gone = Product.objects.create(company=self.company, name="Кефир", price=Decimal("70.00"),
+                                      quantity=Decimal("5"))
+        self._stale(self.product, other, gone)
+        since = self._sync("2000-01-01T00:00:00+06:00")[0]["server_time"]
+        self.assertEqual(self._sync(since)[1], set())
+
+        self.quick()  # продажа хлеба меняет остаток массовым bulk_update
+        ProductPromotionTier.objects.create(product=other, min_amount=Decimal("1"), discount_percent=Decimal("5"))
+        gone_id = str(gone.id)
+        gone.delete()
+
+        data, ids = self._sync(since)
+        self.assertEqual(ids, {str(self.product.id), str(other.id)})
+        self.assertEqual(data["deleted"], [gone_id])
+        self.assertIn("server_time", data)
+
+        data, ids = self._sync(data["server_time"])
+        self.assertEqual((ids, data["deleted"]), (set(), []))
+
+    def test_without_param_response_is_unchanged(self):
+        r = self.api.get("/api/main/products/list/")
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("deleted", r.data)
+
+    def test_bad_timestamp_is_400(self):
+        r = self.api.get("/api/main/products/list/", {"updated_since": "вчера"})
+        self.assertEqual(r.status_code, 400)

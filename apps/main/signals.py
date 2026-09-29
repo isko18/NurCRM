@@ -324,3 +324,29 @@ def notify_debt_paid(sender, instance: DebtPayment, created: bool, **kwargs):
         )
 
     transaction.on_commit(_publish)
+
+
+# --- BE2-19: быстрая синхронизация каталога кассы ---
+
+from django.db.models.signals import post_delete  # noqa: E402
+
+from apps.main.models import ProductDeletion, ProductPromotionTier  # noqa: E402
+
+
+@receiver(post_delete, sender=Product)
+def product_deletion_tombstone(sender, instance: Product, **kwargs):
+    """Удалённый товар попадает в deleted ответа products/list/?updated_since=."""
+    try:
+        if instance.company_id:
+            with transaction.atomic():
+                ProductDeletion.objects.create(company_id=instance.company_id, product_id=instance.pk)
+    except Exception:
+        # Каскадное удаление компании: писать уже некуда — это не должно мешать удалению.
+        logger.warning("product tombstone failed for %s", instance.pk, exc_info=True)
+
+
+@receiver(post_save, sender=ProductPromotionTier)
+@receiver(post_delete, sender=ProductPromotionTier)
+def promotion_tier_touches_product(sender, instance: ProductPromotionTier, **kwargs):
+    """Изменили акцию — товар должен прийти кассе при следующей быстрой синхронизации."""
+    Product.objects.filter(pk=instance.product_id).update()

@@ -18,6 +18,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+
+from apps.main.models import ProductDeletion
 from rest_framework.negotiation import DefaultContentNegotiation
 from rest_framework.parsers import JSONParser, FormParser, MultiPartParser
 from django.shortcuts import get_object_or_404
@@ -1056,7 +1058,39 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
             )
         )
         qs = _filter_products_company_only(self, qs)
+        since = self._updated_since()
+        if since is not None:
+            qs = qs.filter(updated_at__gte=since)
         return _annotate_product_is_favorite(qs)
+
+    def _updated_since(self):
+        """BE2-19: ?updated_since=<ISO-время> — только товары, изменённые с этого момента."""
+        if not hasattr(self, "_since"):
+            raw = (self.request.query_params.get("updated_since") or "").strip()
+            self._since = None
+            if raw:
+                dt = parse_datetime(raw.replace(" ", "+"))
+                if dt is None:
+                    raise ValidationError({"updated_since": "Ожидается дата-время ISO 8601."})
+                if timezone.is_naive(dt):
+                    dt = timezone.make_aware(dt)
+                self._since = dt
+        return self._since
+
+    def list(self, request, *args, **kwargs):
+        # server_time берём до выборки: изменения во время запроса придут в следующий раз.
+        server_time = timezone.now()
+        response = super().list(request, *args, **kwargs)
+        since = self._updated_since()
+        if since is not None and isinstance(response.data, dict):
+            company_id = getattr(request.user, "company_id", None)
+            response.data["deleted"] = [
+                str(pid) for pid in ProductDeletion.objects.filter(
+                    company_id=company_id, deleted_at__gte=since
+                ).values_list("product_id", flat=True).distinct()
+            ]
+            response.data["server_time"] = server_time.isoformat()
+        return response
 
     def paginate_queryset(self, queryset):
         page = super().paginate_queryset(queryset)

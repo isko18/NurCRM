@@ -622,6 +622,25 @@ def assert_barcode_unique_in_company(company_id, barcode, *, exclude_product_id=
         )
 
 
+class ProductQuerySet(models.QuerySet):
+    """
+    BE2-19: массовые update()/bulk_update() (остатки при продаже, приходе, возврате)
+    тоже двигают updated_at — иначе касса не увидит изменение в products/list/?updated_since=.
+    """
+
+    def update(self, **kwargs):
+        kwargs.setdefault("updated_at", timezone.now())
+        return super().update(**kwargs)
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        if "updated_at" not in fields:
+            now = timezone.now()
+            for obj in objs:
+                obj.updated_at = now
+            fields = [*fields, "updated_at"]
+        return super().bulk_update(objs, fields, batch_size=batch_size)
+
+
 class Product(models.Model):
 
     class Status(models.TextChoices):
@@ -879,6 +898,8 @@ class Product(models.Model):
 
     created_at = models.DateTimeField("Создан", auto_now_add=True)
     updated_at = models.DateTimeField("Обновлён", auto_now=True)
+
+    objects = ProductQuerySet.as_manager()
 
     # ---- Порядковый номер для стабильной пагинации ----
     # Монотонно возрастает в рамках компании (как code/plu), присваивается под тем же
@@ -6584,3 +6605,18 @@ class RentalItem(models.Model):
     product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="+")
     variant = models.ForeignKey(ProductVariant, on_delete=models.PROTECT, null=True, blank=True, related_name="+")
     quantity = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("1"))
+
+
+class ProductDeletion(models.Model):
+    """BE2-19: удалённые товары — касса убирает их из своего каталога при быстрой синхронизации."""
+
+    id = models.BigAutoField(primary_key=True)
+    # Без ограничения внешнего ключа: запись создаётся и при каскадном удалении самой компании.
+    company = models.ForeignKey(
+        Company, on_delete=models.DO_NOTHING, db_constraint=False, related_name="product_deletions"
+    )
+    product_id = models.UUIDField()
+    deleted_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["company", "deleted_at"], name="main_proddel_company_idx")]
