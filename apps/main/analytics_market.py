@@ -719,15 +719,119 @@ class AnalyticsView(APIView):
             data = self._finance(request, company, branch, period)
         elif tab == "salary":
             data = self._salary(request, company, branch, period)
+        elif tab == "abc":
+            data = self._abc(request, company, branch, period)
         else:
             return Response(
-                {"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts|products|suppliers|procurement|purchases|users|finance|salary"},
+                {"detail": "Unknown tab. Use: sales|stock|cashboxes|shifts|products|suppliers|procurement|purchases|users|finance|salary|abc"},
                 status=400,
             )
 
         ttl = getattr(settings, "CACHE_TIMEOUT_ANALYTICS", getattr(settings, "CACHE_TIMEOUT_MEDIUM", 300))
         cache.set(ck, data, ttl)
         return Response(data)
+
+    # ─────────────────────────────────────────────────────────
+    # ABC (BE2-13)
+    # ─────────────────────────────────────────────────────────
+    ABC_GROUPS = {
+        "product": ("product_id", "name_snapshot"),
+        "category": ("product__category_id", "product__category__name"),
+        "brand": ("product__brand_id", "product__brand__name"),
+    }
+    ABC_THRESHOLDS = {"A": 80, "B": 95}
+
+    def _abc(self, request, company, branch, period: Period):
+        """
+        ABC за период одним запросом: выручка, количество, прибыль по товарам
+        (?by=category|brand — по категориям/брендам), доля и класс по ?metric=.
+        Чеки — как во вкладке sales (оплаченные и с частичным возвратом, строки уже
+        уменьшены на возвращённое). Класс по накопленной доле cum_share: ≤ 80 % — A,
+        ≤ 95 % — B, остальное C; позиции с нулевым или отрицательным показателем — C.
+        """
+        by = (request.query_params.get("by") or "product").lower()
+        metric = (request.query_params.get("metric") or "revenue").lower()
+        if by not in self.ABC_GROUPS:
+            raise ValidationError({"by": "Используйте product|category|brand."})
+        if metric not in ("revenue", "profit", "qty"):
+            raise ValidationError({"metric": "Используйте revenue|profit|qty."})
+
+        Sale, SaleItem = get_sale_models()
+        ProductModel = apps.get_model("main.Product")
+        qs = Sale.objects.filter(company=company)
+        if branch is not None:
+            if self._include_global(request):
+                qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+            else:
+                qs = qs.filter(branch=branch)
+        qs = qs.filter(status__in=(Sale.Status.PAID, Sale.Status.PARTIALLY_RETURNED))
+        qs = qs.filter(paid_at__gte=period.start, paid_at__lt=period.end)
+        qs = self._apply_sale_filters(request, qs, Sale)
+
+        key_field, name_field = self.ABC_GROUPS[by]
+        items_qs = SaleItem.objects.filter(sale__in=qs)
+        if by != "product":
+            items_qs = items_qs.filter(product__isnull=False)
+        cogs_expr, _ok = _get_cogs_expr(SaleItem, ProductModel)
+        rows = items_qs.values(key_field, name_field).annotate(
+            revenue=Coalesce(Sum(_sale_item_net_line_revenue_expr(SaleItem)),
+                             Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+            qty=Coalesce(Sum("quantity"), Value(Z_QTY, output_field=QTY_FIELD), output_field=QTY_FIELD),
+            cogs=Coalesce(Sum(cogs_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+        )
+
+        merged = {}
+        for r in rows:
+            gid = r[key_field]
+            name = r[name_field] or ("Без названия" if by == "product" else "Без категории" if by == "category" else "Без бренда")
+            k = str(gid) if gid else f"name:{name}"
+            m = merged.setdefault(k, {"id": str(gid) if gid else None, "name": name,
+                                      "revenue": Z_MONEY, "qty": Z_QTY, "profit": Z_MONEY})
+            m["revenue"] += r["revenue"]
+            m["qty"] += r["qty"]
+            m["profit"] += r["revenue"] - r["cogs"]
+
+        items = sorted(merged.values(), key=lambda m: (-m[metric], m["name"]))
+        total = sum((m[metric] for m in items if m[metric] > 0), Decimal("0"))
+        cum = Decimal("0")
+        out = []
+        for m in items:
+            val = m[metric]
+            share = (val / total * 100) if total > 0 and val > 0 else Decimal("0")
+            cum += share
+            cum_r = round(cum, 1)
+            if val <= 0:
+                cls = "C"
+            elif cum_r <= self.ABC_THRESHOLDS["A"]:
+                cls = "A"
+            elif cum_r <= self.ABC_THRESHOLDS["B"]:
+                cls = "B"
+            else:
+                cls = "C"
+            out.append({
+                "id": m["id"],
+                "name": m["name"],
+                "revenue": str(_money(m["revenue"])),
+                "qty": str(m["qty"].quantize(Decimal("0.001"))),
+                "profit": str(_money(m["profit"])),
+                "share": round(float(share), 1),
+                "cum_share": round(float(min(cum, Decimal("100"))), 1),
+                "class": cls,
+            })
+
+        return {
+            "tab": "abc",
+            "period": {"from": period.start.isoformat(), "to": period.end.isoformat()},
+            "by": by,
+            "metric": metric,
+            "thresholds": self.ABC_THRESHOLDS,
+            "totals": {
+                "revenue": str(_money(sum((m["revenue"] for m in items), Decimal("0")))),
+                "qty": str(sum((m["qty"] for m in items), Decimal("0")).quantize(Decimal("0.001"))),
+                "profit": str(_money(sum((m["profit"] for m in items), Decimal("0")))),
+            },
+            "items": out,
+        }
 
     # ─────────────────────────────────────────────────────────
     # SALES

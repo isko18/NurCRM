@@ -817,3 +817,38 @@ class CatalogSyncTests(KassaBase):
     def test_bad_timestamp_is_400(self):
         r = self.api.get("/api/main/products/list/", {"updated_since": "вчера"})
         self.assertEqual(r.status_code, 400)
+
+
+class AbcAnalyticsTests(KassaBase):
+    """BE2-13: ABC на сервере вместо выгрузки всех чеков."""
+
+    def test_abc_by_product_revenue_and_profit(self):
+        from django.core.cache import cache
+        from django.utils import timezone
+
+        cache.clear()
+        plan = {"A-товар": ("700.00", "400.00"), "B-товар": ("200.00", "50.00"),
+                "B2-товар": ("70.00", "10.00"), "C-товар": ("30.00", "29.00")}
+        for name, (price, cost) in plan.items():
+            p = Product.objects.create(company=self.company, name=name, price=Decimal(price),
+                                       purchase_price=Decimal(cost), quantity=Decimal("10"))
+            r = self.quick(items=[{"product": str(p.id), "qty": "1", "price": price}],
+                           payment={"method": "cash", "received": price})
+            self.assertEqual(r.status_code, 201, r.data)
+
+        today = timezone.localdate().isoformat()
+        r = self.api.get("/api/main/analytics/market/", {"tab": "abc", "date_from": today, "date_to": today})
+        self.assertEqual(r.status_code, 200, r.data)
+        rows = [(i["name"], i["share"], i["cum_share"], i["class"]) for i in r.data["items"]]
+        self.assertEqual(rows, [("A-товар", 70.0, 70.0, "A"), ("B-товар", 20.0, 90.0, "B"),
+                                ("B2-товар", 7.0, 97.0, "C"), ("C-товар", 3.0, 100.0, "C")])
+        self.assertEqual(r.data["totals"]["revenue"], "1000.00")
+        self.assertEqual(r.data["thresholds"], {"A": 80, "B": 95})
+
+        r = self.api.get("/api/main/analytics/market/",
+                         {"tab": "abc", "metric": "profit", "date_from": today, "date_to": today})
+        self.assertEqual([(i["name"], i["profit"]) for i in r.data["items"]][:2],
+                         [("A-товар", "300.00"), ("B-товар", "150.00")])
+
+        r = self.api.get("/api/main/analytics/market/", {"tab": "abc", "by": "shelf"})
+        self.assertEqual(r.status_code, 400)
