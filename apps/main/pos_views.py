@@ -3798,6 +3798,10 @@ def _execute_sale_return(
 
     # Запись о возврате ведём всегда (список возвратов, отчёт смены);
     # без ключа от кассы — служебный уникальный ключ.
+    from apps.main.models import sale_refund_split
+
+    # Сколько денег отдали и каким способом — для итогов смены (returns_cash / returns_noncash).
+    refund_cash, refund_noncash = sale_refund_split(sale, refund_method, cash_to_refund)
     ret_key = str(idempotency_key) if idempotency_key else f"auto:{uuid.uuid4()}"
     sale_return, _ = SaleReturn.objects.get_or_create(
         company=sale.company,
@@ -3813,6 +3817,8 @@ def _execute_sale_return(
             "returned_items": returned_lines,
             "reason": str(payload.get("reason") or "")[:255],
             "refund_method": _effective_refund_method(sale, refund_method),
+            "refund_cash": refund_cash,
+            "refund_noncash": refund_noncash,
         }
     )
 

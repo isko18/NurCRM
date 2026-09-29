@@ -403,7 +403,10 @@ class CashShift(models.Model):
         )
 
         Sale = self.sales.model
-        sales_qs = Sale.objects.filter(shift_id=self.id, status=Sale.Status.PAID)
+        # Продажи смены — оплаченные и частично возвращённые: у последних total и строки
+        # оплат уже уменьшены на возврат, остаток — это продажа (11-shift-returns-reporting).
+        sold_statuses = [Sale.Status.PAID, Sale.Status.PARTIALLY_RETURNED]
+        sales_qs = Sale.objects.filter(shift_id=self.id, status__in=sold_statuses)
 
         from apps.main.models import SaleItem, Product, SalePayment
         from django.db.models import ExpressionWrapper, F
@@ -411,7 +414,7 @@ class CashShift(models.Model):
         service_sales = (
             SaleItem.objects.filter(
                 sale__shift_id=self.id,
-                sale__status=Sale.Status.PAID,
+                sale__status__in=sold_statuses,
                 product__kind=Product.Kind.SERVICE,
             ).aggregate(
                 total=Sum(
@@ -431,7 +434,7 @@ class CashShift(models.Model):
 
         pay_agg = SalePayment.objects.filter(
             sale__shift_id=self.id,
-            sale__status=Sale.Status.PAID,
+            sale__status__in=sold_statuses,
         ).aggregate(
             cash_sum=Sum(
                 "amount",
@@ -766,6 +769,27 @@ class CashShift(models.Model):
 
         res.sort(key=lambda x: (Decimal(x["sales_total"]), x["sales_count"]), reverse=True)
         return res
+
+    def returns_summary(self) -> dict:
+        """
+        11: возвраты, оформленные в этой смене (сама смена возврата, не смена продажи).
+        returns_total — сумма возвращённых товаров; returns_cash/returns_noncash —
+        сколько денег фактически отдали и каким способом. По чеку в долг деньги
+        могут не выдаваться: returns_cash + returns_noncash бывает меньше returns_total.
+        """
+        from apps.main.models import SaleReturn
+
+        z = Decimal("0.00")
+        agg = SaleReturn.objects.filter(shift_id=self.id).aggregate(
+            c=Count("id"), t=Sum("returned_amount"), cash=Sum("refund_cash"), noncash=Sum("refund_noncash"),
+        )
+        q = lambda v: (v or z).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)  # noqa: E731
+        return {
+            "returns_count": agg["c"] or 0,
+            "returns_total": str(q(agg["t"])),
+            "returns_cash": str(q(agg["cash"])),
+            "returns_noncash": str(q(agg["noncash"])),
+        }
 
     def recalc_totals_for_close(self):
         t = self.calc_live_totals(refresh=True)

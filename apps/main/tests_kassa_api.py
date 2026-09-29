@@ -950,3 +950,58 @@ class SaleDealLinkageTests(KassaBase):
         deal = ClientDeal.objects.create(company=self.company, client=self.client_obj, title="Без продажи",
                                          kind=ClientDeal.Kind.DEBT, amount=Decimal("100.00"), debt_months=1)
         sync_sale_status_from_deal(deal.id)  # не падает и ничего не трогает
+
+class ShiftReturnsReportingTests(KassaBase):
+    """11-shift-returns-reporting: возвраты в итогах смены, по факту выдачи денег."""
+
+    def _shift(self, shift=None):
+        r = self.api.get(f"/api/construction/shifts/{(shift or self.shift).id}/")
+        self.assertEqual(r.status_code, 200, r.data)
+        return r.data
+
+    def _return(self, sale_id, **body):
+        r = self.api.post(f"/api/main/pos/sales/{sale_id}/return/", body, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+
+    def test_full_and_partial_returns_by_actual_refund_method(self):
+        from apps.main.models import SaleItem
+
+        full_id = self.quick(shift=str(self.shift.id)).data["id"]  # 200 наличными
+        self._return(full_id)
+        part_id = self.quick(shift=str(self.shift.id)).data["id"]  # 200 наличными
+        item = SaleItem.objects.get(sale_id=part_id)
+        self._return(part_id, items=[{"sale_item_id": str(item.id), "quantity": 1}], refund_method="mbank")
+
+        data = self._shift()
+        self.assertEqual(
+            (data["returns_count"], data["returns_total"], data["returns_cash"], data["returns_noncash"]),
+            (2, "300.00", "200.00", "100.00"),
+        )
+        # полностью возвращённый чек не в продажах, от частичного осталась половина
+        self.assertEqual(Decimal(data["sales_total"]), Decimal("100.00"))
+        report = self.api.get(f"/api/construction/shifts/{self.shift.id}/report/").data
+        self.assertEqual((report["returns_cash"], report["returns_noncash"]), ("200.00", "100.00"))
+
+        listed = self.api.get("/api/construction/shifts/").data
+        row = next(s for s in listed.get("results", listed) if s["id"] == str(self.shift.id))
+        self.assertEqual(row["returns_count"], 2)
+
+    def test_return_counts_in_shift_where_it_was_made(self):
+        sale_id = self.quick(shift=str(self.shift.id)).data["id"]
+        self.shift.close(closing_cash=Decimal("1200.00"))
+        new_shift = CashShift.objects.create(company=self.company, cashbox=self.cashbox, cashier=self.owner,
+                                             status=CashShift.Status.OPEN, opening_cash=Decimal("0.00"))
+        self._return(sale_id)
+        self.assertEqual(self._shift()["returns_count"], 0)
+        data = self._shift(new_shift)
+        self.assertEqual((data["returns_count"], data["returns_cash"]), (1, "200.00"))
+
+    def test_debt_sale_return_gives_no_money(self):
+        sale_id = self.quick(client=str(self.client_obj.id), shift=str(self.shift.id),
+                             payment={"method": "debt"}).data["id"]
+        self._return(sale_id)
+        data = self._shift()
+        self.assertEqual(
+            (data["returns_count"], data["returns_total"], data["returns_cash"], data["returns_noncash"]),
+            (1, "200.00", "0.00", "0.00"),
+        )

@@ -1133,7 +1133,7 @@ class CashShiftListView(CompanyBranchScopedMixin, generics.ListAPIView):
 
 def build_shift_report(shift: CashShift) -> dict:
     """Сводка смены для владельца/кассы: продажи по способам оплаты, скидки, возвраты, внесения, изъятия."""
-    from apps.main.models import Sale, SalePayment, SaleReturn
+    from apps.main.models import Sale, SalePayment
 
     z = Decimal("0.00")
     q2 = lambda v: str((v or z).quantize(Decimal("0.01")))  # noqa: E731
@@ -1164,7 +1164,7 @@ def build_shift_report(shift: CashShift) -> dict:
     for row in sales.filter(status=Sale.Status.DEBT).values("total", "cash_received"):
         debt += max((row["total"] or z) - (row["cash_received"] or z), z)
 
-    returns = SaleReturn.objects.filter(shift=shift).aggregate(s=Sum("returned_amount"), c=Count("id"))
+    returns = shift.returns_summary()
     drawer = (
         CashFlow.objects.filter(shift=shift, status=CashFlow.Status.APPROVED, request_kind__isnull=True)
         .values("source_kind")
@@ -1192,8 +1192,7 @@ def build_shift_report(shift: CashShift) -> dict:
         },
         "discounts": q2(sales.exclude(status=Sale.Status.CANCELED).aggregate(s=Sum("discount_total"))["s"]),
         "bonus_redeemed": q2(sales.exclude(status=Sale.Status.CANCELED).aggregate(s=Sum("bonus_redeemed"))["s"]),
-        "returns_total": q2(returns["s"]),
-        "returns_count": returns["c"] or 0,
+        **returns,
         "deposits": q2(drawer.get(CashFlow.SourceKind.SHIFT_DRAWER_INFLOW)),
         "withdrawals": q2(drawer.get(CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW)),
         "income_total": q2(totals.get("income_total")),

@@ -176,6 +176,7 @@ class CashShiftListSerializer(serializers.ModelSerializer):
         data["resolved_cashbox_id"] = str(obj.cashbox_id) if obj.cashbox_id else None
         data["resolved_cashbox_name"] = self.get_cashbox_name(obj)
         data["payment_breakdown"] = obj.calc_payment_breakdown() or []
+        data.update(obj.returns_summary())
         # cashier_breakdown уже посчитан SerializerMethodField в super() —
         # второй вызов здесь дал бы лишний запрос на каждую смену.
 

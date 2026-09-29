@@ -2650,6 +2650,31 @@ class SalePayment(models.Model):
         return super().save(*args, **kwargs)
 
 
+def sale_refund_split(sale, refund_method, amount):
+    """
+    (наличными, безналом) для суммы денег, выданной по возврату.
+    Явный способ возврата (refund_method, кроме original/same) — вся сумма туда;
+    иначе — в пропорции исходной оплаты без долговой части и взаимозачёта.
+    """
+    amount = _money(Decimal(str(amount or 0)))
+    zero = Decimal("0.00")
+    if amount <= 0:
+        return zero, zero
+    rm = str(refund_method or "").strip().lower()
+    if rm and rm not in ("original", "same"):
+        return (amount, zero) if rm == Sale.PaymentMethod.CASH else (zero, amount)
+    skip = (Sale.PaymentMethod.DEBT, Sale.PaymentMethod.OFFSET)
+    lines = [(p.method, p.amount or zero) for p in sale.payments.all() if (p.amount or zero) > 0 and p.method not in skip]
+    paid = sum((a for _, a in lines), zero)
+    if paid > 0:
+        cash = _money(amount * sum((a for m, a in lines if m == Sale.PaymentMethod.CASH), zero) / paid)
+        return cash, amount - cash
+    # Строк оплат нет (старые чеки): по способу оплаты чека; долг возвращают из предоплаты наличными.
+    if sale.payment_method in (Sale.PaymentMethod.CASH, Sale.PaymentMethod.DEBT, None, ""):
+        return amount, zero
+    return zero, amount
+
+
 class SaleReturn(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     sale = models.ForeignKey(
@@ -2689,6 +2714,15 @@ class SaleReturn(models.Model):
     returned_items = models.JSONField(null=True, blank=True, verbose_name="Возвращённые позиции")
     reason = models.CharField(max_length=255, blank=True, default="", db_default="", verbose_name="Причина")
     refund_method = models.CharField(max_length=16, blank=True, default="", verbose_name="Способ возврата денег")
+    # 11: сколько денег фактически отдали по возврату — наличными и безналом
+    # (по способу возврата refund_method, а не по исходной оплате). Возврат по чеку
+    # в долг может не выдавать денег вовсе — тогда обе суммы 0.
+    refund_cash = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Возвращено наличными"
+    )
+    refund_noncash = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Возвращено безналом"
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата возврата")
 
     class Meta:
