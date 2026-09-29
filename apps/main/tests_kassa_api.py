@@ -574,3 +574,39 @@ class PromotionVsManualDiscountTests(KassaBase):
         data = self.api.get(f"/api/main/pos/carts/{cart.id}/").data
         row = data["items"][0]
         self.assertEqual((row["discount_source"], row["manual_discount_ignored"]), ("promotion", True))
+
+
+class ReturnLinesTests(KassaBase):
+    """BE2-01: строки возврата с ценой, скидкой, причиной и сменой."""
+
+    def test_partial_return_lines_and_shift_filter(self):
+        r = self.quick(items=[{"product": str(self.product.id), "qty": "2", "price": "100.00", "discount": "20.00"}],
+                       shift=str(self.shift.id))
+        self.assertEqual(r.status_code, 201, r.data)
+        sale = Sale.objects.get(id=r.data["id"])
+        item = sale.items.get()
+        r = self.api.post(f"/api/main/pos/sales/{sale.id}/return/",
+                          {"items": [{"sale_item_id": str(item.id), "quantity": 1}], "reason": "не подошёл",
+                           "refund_method": "cash"}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+
+        rows = self.api.get(f"/api/main/pos/returns/?shift={self.shift.id}").data
+        self.assertEqual(len(rows), 1)
+        ret = rows[0]
+        self.assertEqual(ret["shift"], str(self.shift.id))
+        self.assertEqual((ret["total"], ret["refund_method"]), ("90.00", "cash"))
+        line = ret["items"][0]
+        self.assertEqual(
+            (line["product"], line["qty"], line["price"], line["discount"], line["total"], line["reason"], line["restock"]),
+            (str(self.product.id), "1.000", "100.00", "10.00", "90.00", "не подошёл", True),
+        )
+        other = CashShift.objects.create(company=self.company, cashbox=self.cashbox, cashier=self.cashier,
+                                         status=CashShift.Status.OPEN)
+        self.assertEqual(self.api.get(f"/api/main/pos/returns/?shift={other.id}").data, [])
+
+    def test_defect_return_is_not_restocked(self):
+        sale_id = self.quick(shift=str(self.shift.id)).data["id"]
+        r = self.api.post(f"/api/main/pos/sales/{sale_id}/return/", {"is_defect": True}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        line = self.api.get("/api/main/pos/returns/").data[0]["items"][0]
+        self.assertEqual((line["reason"], line["restock"], line["total"]), ("defect", False, "200.00"))

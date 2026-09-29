@@ -2663,6 +2663,7 @@ class SaleReturn(models.Model):
     )
     returned_items = models.JSONField(null=True, blank=True, verbose_name="Возвращённые позиции")
     reason = models.CharField(max_length=255, blank=True, default="", db_default="", verbose_name="Причина")
+    refund_method = models.CharField(max_length=16, blank=True, default="", verbose_name="Способ возврата денег")
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата возврата")
 
     class Meta:

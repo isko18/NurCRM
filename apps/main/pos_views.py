@@ -3523,6 +3523,32 @@ def _broadcast_return_realtime(sale: Sale, created_flows, shift=None):
         logging.getLogger("crm.pos.return").warning("WebSocket return notification error: %s", exc)
 
 
+def _return_line(item, qty, discount, *, reason, restock) -> dict:
+    """Строка возврата (BE2-01). amount — старое имя total, оставлено для совместимости."""
+    price = money(item.unit_price or Decimal("0.00"))
+    total = money(price * qty - discount)
+    return {
+        "sale_item": str(item.id),
+        "product": str(item.product_id) if item.product_id else None,
+        "variant": str(item.variant_id) if item.variant_id else None,
+        "name": item.name_snapshot,
+        "qty": str(qty3(qty)),
+        "price": str(price),
+        "discount": str(money(discount)),
+        "total": str(total),
+        "amount": str(total),
+        "reason": reason,
+        "restock": bool(restock and item.product_id),
+    }
+
+
+def _effective_refund_method(sale, refund_method) -> str:
+    """Чем вернули деньги: явный способ кассы, иначе способ оплаты чека."""
+    if refund_method and refund_method != "original":
+        return str(refund_method)[:16]
+    return str(sale.payment_method or "cash")[:16]
+
+
 def _execute_sale_return(
     sale: Sale,
     partial_items: Optional[List[tuple]],
@@ -3541,18 +3567,16 @@ def _execute_sale_return(
     idempotency_key = payload.get("idempotency_key")
     # Чем деньги фактически отдали: "cash" | "original" (по умолчанию) | способ безнала.
     refund_method = payload.get("refund_method")
+    line_reason = "defect" if is_defect else (str(payload.get("reason") or "")[:255] or None)
 
     returned_lines = []
     if not partial_items:
         returned_money = sale.total or Decimal("0.00")
         for item in sale.items.all():
-            returned_lines.append({
-                "sale_item": str(item.id),
-                "product": str(item.product_id) if item.product_id else None,
-                "name": item.name_snapshot,
-                "qty": str(qty3(Decimal(str(item.quantity or 0)))),
-                "amount": str(money((item.unit_price or Decimal("0.00")) * (item.quantity or 0) - (item.line_discount or 0))),
-            })
+            returned_lines.append(_return_line(
+                item, qty3(Decimal(str(item.quantity or 0))), money(item.line_discount or 0),
+                reason=line_reason, restock=not is_defect,
+            ))
         if is_agent_sale:
             for item in sale.items.select_related("product", "sale_package"):
                 rq = qty3(Decimal(str(item.quantity or 0)))
@@ -3600,13 +3624,7 @@ def _execute_sale_return(
             item_disc = money(old_disc * (rq / old_q)) if old_q > 0 else Decimal("0.00")
             item_returned_money = money((unit_price * rq) - item_disc)
             total_returned_money += item_returned_money
-            returned_lines.append({
-                "sale_item": str(item.id),
-                "product": str(item.product_id) if item.product_id else None,
-                "name": item.name_snapshot,
-                "qty": str(rq),
-                "amount": str(item_returned_money),
-            })
+            returned_lines.append(_return_line(item, rq, item_disc, reason=line_reason, restock=not is_defect))
 
             if is_agent_sale:
                 if rq != rq.to_integral_value():
@@ -3793,6 +3811,7 @@ def _execute_sale_return(
             "items_payload": items_payload_safe,
             "returned_items": returned_lines,
             "reason": str(payload.get("reason") or "")[:255],
+            "refund_method": _effective_refund_method(sale, refund_method),
         }
     )
 

@@ -719,6 +719,24 @@ class ClientPayDebtAPIView(APIView):
 # Возвраты
 # ======================================================================
 
+def _return_item(line: dict, ret) -> dict:
+    """Строка возврата; у возвратов до BE2-01 цены и скидки в строке нет — отдаём null."""
+    total = line.get("total") or line.get("amount")
+    return {
+        "sale_item": line.get("sale_item"),
+        "product": line.get("product"),
+        "variant": line.get("variant"),
+        "name": line.get("name"),
+        "qty": line.get("qty"),
+        "price": line.get("price"),
+        "discount": line.get("discount"),
+        "total": total,
+        "amount": total,
+        "reason": line.get("reason", "defect" if ret.is_defect else (ret.reason or None)),
+        "restock": line.get("restock", not ret.is_defect),
+    }
+
+
 class SaleReturnListAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     GET /api/main/pos/returns/?date_from=2026-09-01&date_to=2026-09-28&shift=…&sale=…
@@ -757,12 +775,11 @@ class SaleReturnListAPIView(CompanyBranchRestrictedMixin, APIView):
                 "sale": str(r.sale_id),
                 "sale_number": r.sale.doc_number,
                 "amount": str(money(r.returned_amount or ZERO)),
+                "total": str(money(r.returned_amount or ZERO)),
+                "refund_method": r.refund_method or r.sale.payment_method,
                 "is_full": r.is_full,
                 "is_defect": r.is_defect,
-                "items": [
-                    {"product": i.get("product"), "name": i.get("name"), "qty": i.get("qty"), "amount": i.get("amount")}
-                    for i in items
-                ],
+                "items": [_return_item(i, r) for i in items],
                 "reason": r.reason,
                 "cashier": str(r.user_id) if r.user_id else None,
                 "shift": str(r.shift_id) if r.shift_id else None,
