@@ -2392,7 +2392,7 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
                 max_dp = request.user.company.max_discount_percent
                 if max_dp is not None and not is_admin:
                     if order_disc_percent is not None and Decimal(str(order_disc_percent)) > max_dp:
-                        return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=400)
+                        return Response(_discount_limit_error(max_dp), status=400)
                     if order_disc_total is not None and getattr(cart, "total_price", 0) > 0: # Approximation before recalc or skip
                         pass # Validated on recalc or here if subtotal available, but CartStart creates cart, maybe no subtotal yet.
                         # Actually CartStart sets discount on empty cart, so total is 0. Skip total check here.
@@ -2440,11 +2440,22 @@ def _order_discount_over_limit(cart, order_discount_total, max_dp) -> bool:
 
 
 def _discount_limit_error(max_dp) -> dict:
+    """Единый ответ 400 на скидку сверх лимита кассира: касса узнаёт его по code."""
     pct = format(Decimal(str(max_dp)).normalize(), "f")
     return {
-        "detail": f"Скидка больше {pct}%, нужно разрешение владельца",
+        "detail": f"Скидка больше разрешённой ({pct}%), нужно разрешение владельца",
+        "code": "discount_limit",
         "max_discount_percent": str(max_dp),
     }
+
+
+def _line_discount_over_limit(unit_price, quantity, line_discount, max_dp) -> bool:
+    """Скидка на строку больше max_dp% от суммы строки (цена × количество)."""
+    if max_dp is None:
+        return False
+    base = Decimal(str(unit_price or 0)) * Decimal(str(quantity or 0))
+    limit = money(max(base, Decimal("0.00")) * Decimal(str(max_dp)) / Decimal("100"))
+    return Decimal(str(line_discount or 0)) > limit
 
 
 class CartDetailAPIView(MarketCashierOnlyMixin, generics.RetrieveAPIView):
@@ -2468,7 +2479,7 @@ class CartDetailAPIView(MarketCashierOnlyMixin, generics.RetrieveAPIView):
         max_dp = request.user.company.max_discount_percent
         if max_dp is not None and not is_admin:
             if order_disc_percent is not None and Decimal(str(order_disc_percent)) > max_dp:
-                return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=400)
+                return Response(_discount_limit_error(max_dp), status=400)
             if order_disc_total is not None and _order_discount_over_limit(cart, order_disc_total, max_dp):
                 return Response(_discount_limit_error(max_dp), status=400)
                     
@@ -2596,6 +2607,11 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
             else:
                 base_price = _q2(default_unit_price_for_package(product, pkg))
         disc_total = _line_discount_from_request(base_price, qty, line_discount, discount_percent)
+
+        is_admin = getattr(request.user, "role", None) in ["owner", "admin"]
+        max_dp = request.user.company.max_discount_percent
+        if not is_admin and _line_discount_over_limit(base_price, qty, disc_total, max_dp):
+            return Response(_discount_limit_error(max_dp), status=status.HTTP_400_BAD_REQUEST)
 
         # Цена продажи не ниже закупочной, кроме случая со скидкой (со скидкой можно ниже)
         if disc_total <= 0:
@@ -4679,9 +4695,8 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             )
             max_dp = request.user.company.max_discount_percent
             if max_dp is not None and not is_admin:
-                limit = (current_price * current_qty) * (max_dp / Decimal("100.0"))
-                if new_discount > limit:
-                    return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=status.HTTP_400_BAD_REQUEST)
+                if _line_discount_over_limit(current_price, current_qty, new_discount, max_dp):
+                    return Response(_discount_limit_error(max_dp), status=status.HTTP_400_BAD_REQUEST)
             item.line_discount = new_discount
 
         update_fields = []
@@ -5543,9 +5558,8 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             )
             max_dp = request.user.company.max_discount_percent
             if max_dp is not None and not is_admin:
-                limit = (current_price * current_qty) * (max_dp / Decimal("100.0"))
-                if new_discount > limit:
-                    return Response({"detail": f"Максимальная скидка — {max_dp}%", "max_discount_percent": str(max_dp)}, status=status.HTTP_400_BAD_REQUEST)
+                if _line_discount_over_limit(current_price, current_qty, new_discount, max_dp):
+                    return Response(_discount_limit_error(max_dp), status=status.HTTP_400_BAD_REQUEST)
             item.line_discount = new_discount
 
         update_fields = []

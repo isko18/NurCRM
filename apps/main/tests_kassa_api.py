@@ -148,6 +148,7 @@ class QuickCheckoutTests(KassaBase):
             HTTP_IDEMPOTENCY_KEY="k1",
         )
         self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.data["code"], "discount_limit")
         self.assertIn("нужно разрешение владельца", r.data["detail"])
         self.assertFalse(Sale.objects.exists())
 
@@ -176,9 +177,80 @@ class CartDiscountLimitTests(KassaBase):
         api.force_authenticate(self.cashier)
         r = api.patch(f"/api/main/pos/carts/{cart.id}/", {"order_discount_total": "30.00"}, format="json")
         self.assertEqual(r.status_code, 400)
-        self.assertEqual(r.data["detail"], "Скидка больше 10%, нужно разрешение владельца")
+        self.assertEqual(r.data["detail"], "Скидка больше разрешённой (10%), нужно разрешение владельца")
+        self.assertEqual(r.data["code"], "discount_limit")
         r = api.patch(f"/api/main/pos/carts/{cart.id}/", {"order_discount_total": "20.00"}, format="json")
         self.assertEqual(r.status_code, 200, r.data)
+
+    def _cashier_cart(self, limit="10"):
+        self.company.max_discount_percent = Decimal(limit)
+        self.company.save()
+        cart = Cart.objects.create(company=self.company, user=self.cashier, shift=self.shift, status=Cart.Status.ACTIVE)
+        api = APIClient()
+        api.force_authenticate(self.cashier)
+        return cart, api
+
+    def assertDiscountLimit(self, r):
+        self.assertEqual(r.status_code, 400, r.data)
+        self.assertEqual(r.data["code"], "discount_limit")
+        self.assertEqual(Decimal(r.data["max_discount_percent"]), Decimal("10"))
+
+    def test_order_discount_percent_over_limit(self):
+        cart, api = self._cashier_cart()
+        r = api.patch(f"/api/main/pos/carts/{cart.id}/", {"order_discount_percent": "50"}, format="json")
+        self.assertDiscountLimit(r)
+
+    def test_add_item_with_discount_over_limit_is_rejected(self):
+        cart, api = self._cashier_cart()
+        url = f"/api/main/pos/sales/{cart.id}/add-item/"
+        r = api.post(url, {"product_id": str(self.product.id), "quantity": "2", "discount_total": "50.00"}, format="json")
+        self.assertDiscountLimit(r)
+        self.assertFalse(CartItem.objects.filter(cart=cart).exists())
+        r = api.post(url, {"product_id": str(self.product.id), "quantity": "1", "discount_percent": "50"}, format="json")
+        self.assertDiscountLimit(r)
+        r = api.post(url, {"product_id": str(self.product.id), "quantity": "2", "discount_total": "20.00"}, format="json")
+        self.assertIn(r.status_code, (200, 201), r.data)
+
+    def test_item_patch_discount_over_limit(self):
+        cart, api = self._cashier_cart()
+        item = CartItem(company=self.company, cart=cart, product=self.product, quantity=Decimal("1"),
+                        unit_price=Decimal("100.00"))
+        item.save(skip_full_clean=True)
+        url = f"/api/main/pos/carts/{cart.id}/items/{item.id}/"
+        self.assertDiscountLimit(api.patch(url, {"discount_total": "50.00"}, format="json"))
+        self.assertDiscountLimit(api.patch(url, {"discount_percent": "50"}, format="json"))
+        item.refresh_from_db()
+        self.assertEqual(item.line_discount, Decimal("0.00"))
+        r = api.patch(url, {"discount_total": "10.00"}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+
+    def test_checkout_line_discount_over_limit(self):
+        cart, api = self._cashier_cart()
+        shift = CashShift.objects.create(
+            company=self.company, cashbox=self.cashbox, cashier=self.cashier, status=CashShift.Status.OPEN
+        )
+        r = api.post(
+            "/api/main/pos/checkout/",
+            {
+                "shift": str(shift.id),
+                "items": [{"product": str(self.product.id), "qty": "1", "discount": "50.00"}],
+                "payment": {"method": "cash", "received": "100"},
+            },
+            format="json",
+            HTTP_IDEMPOTENCY_KEY="k-line",
+        )
+        self.assertDiscountLimit(r)
+        self.assertFalse(Sale.objects.exists())
+
+    def test_owner_is_not_limited(self):
+        cart, _ = self._cashier_cart()
+        cart.user = self.owner
+        cart.save()
+        api = APIClient()
+        api.force_authenticate(self.owner)
+        r = api.post(f"/api/main/pos/sales/{cart.id}/add-item/",
+                     {"product_id": str(self.product.id), "quantity": "1", "discount_total": "50.00"}, format="json")
+        self.assertIn(r.status_code, (200, 201), r.data)
 
 
 class CheckoutMixedSplitTests(KassaBase):
