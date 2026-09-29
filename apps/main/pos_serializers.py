@@ -117,6 +117,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
     stock = serializers.SerializerMethodField()
     promotion_rules = serializers.SerializerMethodField()
     line_total = serializers.SerializerMethodField()
+    manual_discount_ignored = serializers.SerializerMethodField()
     display_name = serializers.SerializerMethodField()
     primary_image_url = serializers.SerializerMethodField(read_only=True)
     # Полный массив images[] в POS не нужен: на строке корзины показывается одна
@@ -141,6 +142,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "is_weight", "is_adult",
             "stock", "promotion_rules",
             "quantity", "unit_price", "line_discount", "line_total",
+            "manual_discount", "discount_source", "promotion_id", "manual_discount_ignored",
             "price_manually_edited",
             "sale_package",
             "variant", "variant_size", "variant_color",
@@ -152,6 +154,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "id", "kind", "product_name", "barcode",
             "variant", "variant_size", "variant_color", "performer",
             "stock", "promotion_rules", "line_total",
+            "manual_discount", "discount_source", "promotion_id", "manual_discount_ignored",
             "price_manually_edited",
             "display_name", "primary_image_url",
             "sale_package",
@@ -165,6 +168,10 @@ class SaleItemSerializer(serializers.ModelSerializer):
         return get_attr(get_attr(obj, "product", None), "name", None) or (
             get_attr(obj, "custom_name", "") or ""
         )
+
+    def get_manual_discount_ignored(self, obj):
+        """Ручная скидка кассира не применена, потому что сработала акция (BE2-06)."""
+        return obj.discount_source == "promotion" and (obj.manual_discount or 0) > 0
 
     def get_line_total(self, obj):
         base = Decimal(str(obj.unit_price or 0)) * Decimal(str(obj.quantity or 0))
@@ -845,6 +852,7 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
     product_name = serializers.SerializerMethodField()
     kind = serializers.CharField(source="product.kind", read_only=True, default="product")
     line_total = serializers.SerializerMethodField()
+    manual_discount_ignored = serializers.SerializerMethodField()
     item_id = serializers.UUIDField(source="id", read_only=True)
     line_id = serializers.UUIDField(source="id", read_only=True)
     sale_item_id = serializers.UUIDField(source="id", read_only=True)
@@ -871,6 +879,10 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
             "barcode_snapshot",
             "unit_price",
             "line_discount",
+            "manual_discount",
+            "discount_source",
+            "promotion_id",
+            "manual_discount_ignored",
             "quantity",
             "line_total",
             "price_manually_edited",
@@ -881,6 +893,10 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
 
     def get_product_name(self, obj):
         return get_attr(get_attr(obj, "product", None), "name", None) or obj.name_snapshot
+
+    def get_manual_discount_ignored(self, obj):
+        """Ручная скидка кассира не применена, потому что сработала акция (BE2-06)."""
+        return obj.discount_source == "promotion" and (obj.manual_discount or 0) > 0
 
     def get_line_total(self, obj):
         base = (obj.unit_price or Decimal("0")) * Decimal(obj.quantity or 0)

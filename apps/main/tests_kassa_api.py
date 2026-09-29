@@ -273,6 +273,25 @@ class CheckoutMixedSplitTests(KassaBase):
 
 
 class DrawerInflowTests(KassaBase):
+    def test_inflow_and_outflow_move_expected_cash_905_915_905(self):
+        """BE2-05: внесение 10 → expected_cash 905 → 915, изъятие 10 → снова 905."""
+        self.shift.opening_cash = Decimal("905.00")
+        self.shift.save()
+
+        def expected():
+            r = self.api.get(f"/api/construction/shifts/{self.shift.id}/")
+            self.assertEqual(r.status_code, 200, r.data)
+            return Decimal(str(r.data["expected_cash"]))
+
+        self.assertEqual(expected(), Decimal("905.00"))
+        for kind, typ, want in (("shift_drawer_inflow", "income", "915.00"), ("shift_drawer_outflow", "expense", "905.00")):
+            r = self.api.post("/api/construction/cashflows/", {
+                "cashbox": str(self.cashbox.id), "shift": str(self.shift.id), "type": typ, "name": kind,
+                "amount": "10.00", "source_kind": kind, "source_id": kind, "payment_method": "cash",
+            }, format="json")
+            self.assertEqual(r.status_code, 201, r.data)
+            self.assertEqual(expected(), Decimal(want))
+
     def test_inflow_counts_in_expected_cash_and_is_deduplicated(self):
         body = {
             "cashbox": str(self.cashbox.id), "shift": str(self.shift.id), "type": "income", "name": "Внесение",
@@ -486,3 +505,72 @@ class ReviewFixesTests(KassaBase):
         r = SaleReturn.objects.get()
         self.assertEqual(r.shift_id, self.shift.id)
         self.assertEqual(r.returned_items[0]["qty"], "2.000")
+
+
+class PromotionVsManualDiscountTests(KassaBase):
+    """BE2-06/07: акция и ручная скидка кассира на одной строке."""
+
+    def setUp(self):
+        super().setUp()
+        from apps.main.models import ProductPromotionTier
+
+        self.promo = Product.objects.create(
+            company=self.company, name="Адыгене 1л", price=Decimal("50.00"), quantity=Decimal("50"), stock=True
+        )
+        self.tier = ProductPromotionTier.objects.create(
+            product=self.promo, min_amount=Decimal("32.00"), discount_percent=Decimal("15")
+        )
+
+    def _checkout(self, price, discount):
+        return self.quick(items=[{"product": str(self.promo.id), "qty": "1", "price": price, "discount": discount}],
+                          payment={"method": "cash", "received": "100.00"})
+
+    def test_manual_discount_applies_when_promotion_does_not_match(self):
+        r = self._checkout("20.00", "5.00")  # 20 < 32 — акция не подошла
+        self.assertEqual(r.status_code, 201, r.data)
+        self.assertEqual(r.data["total"], "15.00")
+        line = r.data["items"][0]
+        self.assertEqual((line["discount"], line["discount_source"], line["total"]), ("5.00", "manual", "15.00"))
+        self.assertFalse(line["manual_discount_ignored"])
+
+    def test_promotion_wins_and_ignored_manual_discount_is_reported(self):
+        r = self._checkout("50.00", "5.00")  # 50 ≥ 32 — акция −15 %
+        self.assertEqual(r.status_code, 201, r.data)
+        self.assertEqual(r.data["total"], "42.50")
+        line = r.data["items"][0]
+        self.assertEqual((line["discount"], line["discount_source"]), ("7.50", "promotion"))
+        self.assertEqual(line["promotion_id"], str(self.tier.id))
+        self.assertTrue(line["manual_discount_ignored"])
+        item = Sale.objects.get(id=r.data["id"]).items.get()
+        self.assertEqual((item.discount_source, item.manual_discount), ("promotion", Decimal("5.00")))
+
+    def test_manual_discount_survives_quantity_change_in_cart(self):
+        cart = Cart.objects.create(company=self.company, user=self.owner, shift=self.shift, status=Cart.Status.ACTIVE)
+        item = CartItem(company=self.company, cart=cart, product=self.promo, quantity=Decimal("1"),
+                        unit_price=Decimal("20.00"), line_discount=Decimal("5.00"), manual_discount=Decimal("5.00"))
+        item.save(skip_full_clean=True)
+        cart.recalc()
+        item.refresh_from_db()
+        self.assertEqual((item.line_discount, item.discount_source), (Decimal("5.00"), "manual"))
+
+        CartItem.objects.filter(pk=item.pk).update(quantity=Decimal("2"))  # 40 ≥ 32 — акция
+        cart.recalc()
+        item.refresh_from_db()
+        self.assertEqual((item.line_discount, item.discount_source), (Decimal("6.00"), "promotion"))
+
+        CartItem.objects.filter(pk=item.pk).update(quantity=Decimal("1"))  # снова ниже порога
+        cart.recalc()
+        item.refresh_from_db()
+        self.assertEqual((item.line_discount, item.discount_source), (Decimal("5.00"), "manual"))
+
+    def test_cart_response_shows_discount_source(self):
+        cart = Cart.objects.create(company=self.company, user=self.owner, shift=self.shift, status=Cart.Status.ACTIVE)
+        r = self.api.post(f"/api/main/pos/sales/{cart.id}/add-item/",
+                          {"product_id": str(self.promo.id), "quantity": "1", "discount_total": "5.00"}, format="json")
+        self.assertIn(r.status_code, (200, 201), r.data)
+        line = CartItem.objects.get(cart=cart)
+        self.assertEqual((line.line_discount, line.discount_source, line.manual_discount),
+                         (Decimal("7.50"), "promotion", Decimal("5.00")))
+        data = self.api.get(f"/api/main/pos/carts/{cart.id}/").data
+        row = data["items"][0]
+        self.assertEqual((row["discount_source"], row["manual_discount_ignored"]), ("promotion", True))

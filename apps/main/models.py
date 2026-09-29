@@ -1693,25 +1693,29 @@ def cart_line_base(item, amount_step: Decimal) -> Decimal:
 
 
 def _cart_item_promotion_line_discount(product, unit_price: Decimal, quantity: Decimal) -> Decimal:
+    return _cart_item_promotion(product, unit_price, quantity)[0]
+
+
+def _cart_item_promotion(product, unit_price: Decimal, quantity: Decimal):
     """
-    Скидка по акции (Product.stock + ProductPromotionTier) для строки корзины.
+    (скидка по акции, сработавшая ступень | None) для строки корзины (Product.stock + ProductPromotionTier).
     Порог min_amount сравнивается с суммой строки unit_price × quantity.
     Выбирается ступень с наибольшим min_amount, для которого сумма строки всё ещё ≥ min_amount.
     promo_quantity ограничивает количество учётных единиц, на которые начисляется процент скидки.
 
-    В Cart.recalc() по строкам с непустыми ступенями line_discount перезаписывается этим значением
-    (в т.ч. в 0, если порог больше не выполняется — см. смену количества).
+    Если ступень не подошла, Cart.recalc() возвращает строке ручную скидку кассира (manual_discount).
     """
+    zero = (Decimal("0.00"), None)
     if product is None or not getattr(product, "stock", False):
-        return Decimal("0.00")
+        return zero
     tiers = list(product.promotion_tiers.all())
     if not tiers:
-        return Decimal("0.00")
+        return zero
     unit_price = Decimal(str(unit_price or 0))
     quantity = Decimal(str(quantity or 0))
     gross = _money(unit_price * quantity)
     if gross <= 0:
-        return Decimal("0.00")
+        return zero
     tiers.sort(key=lambda t: (-(t.min_amount or Decimal("0")), t.position, str(t.id)))
     tier = None
     for t in tiers:
@@ -1719,10 +1723,10 @@ def _cart_item_promotion_line_discount(product, unit_price: Decimal, quantity: D
             tier = t
             break
     if tier is None:
-        return Decimal("0.00")
+        return zero
     dp = tier.discount_percent or Decimal("0")
     if dp <= 0:
-        return Decimal("0.00")
+        return zero
     pq = tier.promo_quantity
     if pq is not None:
         cap = Decimal(int(pq))
@@ -1730,7 +1734,7 @@ def _cart_item_promotion_line_discount(product, unit_price: Decimal, quantity: D
     else:
         q_eff = quantity
     base = unit_price * q_eff
-    return _money(base * dp / Decimal("100"))
+    return _money(base * dp / Decimal("100")), tier
 
 
 # ==========================
@@ -1892,31 +1896,36 @@ class Cart(models.Model):
         return super().save(*args, **kwargs)
 
     def recalc(self):
-        # Автоскидка по ступеням акции (Product.stock + promotion_tiers) → line_discount
+        # Скидка строки (BE2-06): подошла ступень акции (Product.stock + promotion_tiers) —
+        # действует акция, ручная скидка кассира не складывается; не подошла — ручная
+        # скидка (manual_discount). Ручная скидка хранится отдельно и не теряется.
         items = list(
             self.items.select_related("product").prefetch_related("product__promotion_tiers")
         )
         for item in items:
-            if not item.product_id:
-                continue
-            p = item.product
-            if not getattr(p, "stock", False):
-                continue
-            tiers = list(p.promotion_tiers.all())
-            if not tiers:
-                continue
-            promo_d = _cart_item_promotion_line_discount(
-                p,
-                Decimal(str(item.unit_price or 0)),
-                Decimal(str(item.quantity or 0)),
-            )
             cur = _money(Decimal(str(item.line_discount or 0)))
-            # Только из правил акции (при qty ниже порога min_amount → 0), иначе max(cur,0)
-            # оставляет «залипшую» скидку после 3 шт → 1 шт.
-            new_d = _money(promo_d)
-            if new_d != cur:
-                CartItem.objects.filter(pk=item.pk).update(line_discount=new_d)
-                item.line_discount = new_d
+            p = item.product
+            tiers = list(p.promotion_tiers.all()) if (p is not None and getattr(p, "stock", False)) else []
+            if tiers:
+                promo_d, tier = _cart_item_promotion(
+                    p,
+                    Decimal(str(item.unit_price or 0)),
+                    Decimal(str(item.quantity or 0)),
+                )
+                if promo_d > 0:
+                    new_d, source, promo_id = _money(promo_d), CartItem.DiscountSource.PROMOTION, tier.id
+                else:
+                    new_d = _money(Decimal(str(item.manual_discount or 0)))
+                    source, promo_id = CartItem.DiscountSource.MANUAL, None
+            else:
+                new_d, source, promo_id = cur, CartItem.DiscountSource.MANUAL, None
+            if new_d <= 0:
+                source = CartItem.DiscountSource.NONE
+            if (new_d, source, promo_id) != (cur, item.discount_source, item.promotion_id):
+                CartItem.objects.filter(pk=item.pk).update(
+                    line_discount=new_d, discount_source=source, promotion_id=promo_id
+                )
+                item.line_discount, item.discount_source, item.promotion_id = new_d, source, promo_id
 
         # Подытог считается по цене продажи (unit_price), которую видит кассир.
         # Отклонение unit_price от каталожной product.price — это не скидка,
@@ -1970,7 +1979,15 @@ class Cart(models.Model):
         self.save(update_fields=["subtotal", "discount_total", "tax_total", "total", "updated_at"])
 
 
+class DiscountSource(models.TextChoices):
+    NONE = "none", "Нет"
+    MANUAL = "manual", "Ручная"
+    PROMOTION = "promotion", "Акция"
+
+
 class CartItem(models.Model):
+    DiscountSource = DiscountSource
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="cart_items")
     branch = models.ForeignKey(Branch, on_delete=models.CASCADE, related_name="crm_cart_items", null=True, blank=True, db_index=True)
@@ -1982,6 +1999,15 @@ class CartItem(models.Model):
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     # Скидка на строку (хранится отдельно от цены — можно менять цену и скидку независимо)
     line_discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    # BE2-06/07: скидка кассира хранится отдельно от итоговой line_discount,
+    # источник итоговой скидки строки — акция, ручная или нет.
+    manual_discount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Ручная скидка кассира"
+    )
+    discount_source = models.CharField(
+        max_length=16, choices=DiscountSource.choices, default=DiscountSource.NONE, verbose_name="Источник скидки"
+    )
+    promotion_id = models.UUIDField(null=True, blank=True, verbose_name="Ступень акции")
     price_manually_edited = models.BooleanField(
         default=False,
         verbose_name="Цена изменена вручную",
@@ -2030,6 +2056,12 @@ class CartItem(models.Model):
                 name="uniq_cartitem_cart_product_piece_pkg",
             ),
         ]
+
+    def manual_discount_base(self) -> Decimal:
+        """Текущая ручная скидка строки: у строк до BE2-06 она лежала только в line_discount."""
+        if self.discount_source == DiscountSource.PROMOTION or self.manual_discount:
+            return Decimal(str(self.manual_discount or 0))
+        return Decimal(str(self.line_discount or 0))
 
     def clean(self):
         if self.cart_id and self.company_id and self.cart.company_id != self.company_id:
@@ -2673,6 +2705,13 @@ class SaleItem(models.Model):
     quantity = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("1.000"))
     # Скидка на строку (сумма). Храним отдельно от unit_price, как и в CartItem.
     line_discount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    manual_discount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Ручная скидка кассира"
+    )
+    discount_source = models.CharField(
+        max_length=16, choices=DiscountSource.choices, default=DiscountSource.NONE, verbose_name="Источник скидки"
+    )
+    promotion_id = models.UUIDField(null=True, blank=True, verbose_name="Ступень акции")
     price_manually_edited = models.BooleanField(
         default=False,
         verbose_name="Цена изменена вручную",

@@ -2659,12 +2659,13 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
             if unit_price is not None:
                 item.unit_price = base_price
             if line_discount is not None or discount_percent is not None:
-                item.line_discount = (Decimal(str(item.line_discount or 0)) + disc_total)
+                item.manual_discount = item.manual_discount_base() + disc_total
+                item.line_discount = item.manual_discount
             update_f = ["quantity"]
             if unit_price is not None:
                 update_f.append("unit_price")
             if line_discount is not None or discount_percent is not None:
-                update_f.append("line_discount")
+                update_f += ["line_discount", "manual_discount"]
             item.save(update_fields=update_f, skip_full_clean=True)
         else:
             item = CartItem(
@@ -2677,6 +2678,7 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
                 quantity=qty3(qty),
                 unit_price=base_price,
                 line_discount=disc_total,
+                manual_discount=disc_total,
             )
             item.save(skip_full_clean=True)
 
@@ -4698,6 +4700,7 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
                 if _line_discount_over_limit(current_price, current_qty, new_discount, max_dp):
                     return Response(_discount_limit_error(max_dp), status=status.HTTP_400_BAD_REQUEST)
             item.line_discount = new_discount
+            item.manual_discount = new_discount
 
         update_fields = []
         if qty is not None:
@@ -4706,7 +4709,7 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             update_fields.append("unit_price")
             update_fields.append("price_manually_edited")
         if line_discount is not None or discount_percent is not None:
-            update_fields.append("line_discount")
+            update_fields += ["line_discount", "manual_discount"]
         if "performer" in data:
             from apps.main.kassa_views import resolve_performers
 
@@ -5180,7 +5183,8 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
             if unit_price is not None:
                 item.unit_price = base_price
             if line_discount is not None or discount_percent is not None:
-                item.line_discount = (Decimal(str(getattr(item, "line_discount", 0) or 0)) + disc_total)
+                item.manual_discount = item.manual_discount_base() + disc_total
+                item.line_discount = item.manual_discount
             update_f = ["quantity"]
             if unit_price is not None:
                 update_f.append("unit_price")
@@ -5197,6 +5201,7 @@ class AgentSaleAddItemAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMix
                 quantity=qty3(qty),
                 unit_price=base_price,
                 line_discount=disc_total,
+                manual_discount=disc_total,
             )
             item.save(skip_full_clean=True)
 
@@ -5561,6 +5566,7 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
                 if _line_discount_over_limit(current_price, current_qty, new_discount, max_dp):
                     return Response(_discount_limit_error(max_dp), status=status.HTTP_400_BAD_REQUEST)
             item.line_discount = new_discount
+            item.manual_discount = new_discount
 
         update_fields = []
         if qty is not None:
@@ -5569,7 +5575,7 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
             update_fields.append("unit_price")
             update_fields.append("price_manually_edited")
         if line_discount is not None or discount_percent is not None:
-            update_fields.append("line_discount")
+            update_fields += ["line_discount", "manual_discount"]
         if update_fields:
             item.save(update_fields=update_fields, skip_full_clean=True)
         cart.recalc()

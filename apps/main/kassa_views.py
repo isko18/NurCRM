@@ -131,6 +131,27 @@ def _quick_result(sale: Sale) -> dict:
         "change": str(money(sale.change or ZERO)),
         "shift": str(sale.shift_id) if sale.shift_id else None,
         "client": str(sale.client_id) if sale.client_id else None,
+        "items": [_quick_item(it) for it in sale.items.all().order_by("id")],
+    }
+
+
+def _quick_item(it) -> dict:
+    """Расшифровка цены строки (BE2-07): касса сверяет итог со своим."""
+    base = money((it.unit_price or ZERO) * (it.quantity or ZERO))
+    discount = money(it.line_discount or ZERO)
+    return {
+        "id": str(it.id),
+        "product": str(it.product_id) if it.product_id else None,
+        "variant": str(it.variant_id) if it.variant_id else None,
+        "name": it.name_snapshot,
+        "qty": str(it.quantity),
+        "price": str(money(it.unit_price or ZERO)),
+        "discount": str(discount),
+        "discount_source": it.discount_source,
+        "promotion_id": str(it.promotion_id) if it.promotion_id else None,
+        "manual_discount": str(money(it.manual_discount or ZERO)),
+        "manual_discount_ignored": it.discount_source == "promotion" and (it.manual_discount or ZERO) > 0,
+        "total": str(money(base - discount)),
     }
 
 
@@ -290,6 +311,7 @@ class PosQuickCheckoutAPIView(APIView):
                     unit_price=price,
                     quantity=qty,
                     line_discount=discount,
+                    manual_discount=discount,
                     performer=performer,
                 ).save(skip_full_clean=True)
                 continue
@@ -338,6 +360,7 @@ class PosQuickCheckoutAPIView(APIView):
                 quantity=qty,
                 unit_price=price,
                 line_discount=discount,
+                manual_discount=discount,
                 price_manually_edited=price != default_price,
             ).save(skip_full_clean=True)
         cart.recalc()
