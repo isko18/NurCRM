@@ -2401,6 +2401,21 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         amount = attrs.get("amount", getattr(instance, "amount", None))
         prepayment = attrs.get("prepayment", getattr(instance, "prepayment", None))
         kind = attrs.get("kind", getattr(instance, "kind", None))
+
+        # Срок — либо в днях, либо в месяцах. XOR смотрим по телу запроса, а не по сделке:
+        # сделку, созданную при продаже в долг, касса дополняет графиком, и там уже может
+        # стоять debt_days=30 по умолчанию. Прислали только один вид срока — второй сбрасываем.
+        sent_days = attrs.get("debt_days") is not None
+        sent_months = attrs.get("debt_months") is not None
+        if sent_days and sent_months:
+            raise serializers.ValidationError(
+                {"debt_months": "Нельзя одновременно указывать debt_days и debt_months."}
+            )
+        if sent_months:
+            attrs["debt_days"] = None
+        elif sent_days:
+            attrs["debt_months"] = None
+
         debt_days = attrs.get("debt_days", getattr(instance, "debt_days", None))
         debt_months = attrs.get("debt_months", getattr(instance, "debt_months", None))
 

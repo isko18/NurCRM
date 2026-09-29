@@ -852,3 +852,44 @@ class AbcAnalyticsTests(KassaBase):
 
         r = self.api.get("/api/main/analytics/market/", {"tab": "abc", "by": "shelf"})
         self.assertEqual(r.status_code, 400)
+
+
+class DebtV2MonthsTests(KassaBase):
+    """08-debt-v2-months-xor: срок в месяцах к сделке, созданной продажей в долг."""
+
+    def _url(self):
+        return f"/api/main/clients/{self.client_obj.id}/deals/"
+
+    def _body(self, **extra):
+        from datetime import date, timedelta
+
+        return {"title": "Рассрочка", "kind": "debt", "amount": "4000.00", "prepayment": "0.00", "schedule_version": "v2",
+                "first_due_date": (date.today() + timedelta(days=30)).isoformat(), **extra}
+
+    def test_months_on_deal_created_by_debt_sale(self):
+        sale = Sale.objects.create(company=self.company, user=self.owner, client=self.client_obj, cashbox=self.cashbox,
+                                   shift=self.shift, status=Sale.Status.DEBT, total=Decimal("4000.00"))
+        # так продажа в долг создаёт сделку, когда срок в чеке не передан
+        ClientDeal.objects.create(company=self.company, client=self.client_obj, sale=sale, kind=ClientDeal.Kind.DEBT,
+                                  title=f"Продажа в долг №{sale.id}",
+                                  amount=Decimal("4000.00"), debt_days=30, schedule_version="v2")
+        r = self.api.post(self._url(), self._body(sale_id=str(sale.id), debt_months=4, interval_months=1),
+                          format="json")
+        self.assertIn(r.status_code, (200, 201), r.data)
+        deal = ClientDeal.objects.get(sale=sale)
+        self.assertEqual((deal.debt_months, deal.debt_days), (4, None))
+        self.assertEqual(deal.installments.count(), 4)
+
+    def test_new_deal_by_months_and_by_days(self):
+        r = self.api.post(self._url(), self._body(debt_months=4, interval_months=1), format="json")
+        self.assertIn(r.status_code, (200, 201), r.data)
+        self.assertEqual(ClientDeal.objects.get(pk=r.data["id"]).installments.count(), 4)
+
+        r = self.api.post(self._url(), self._body(debt_days=10, interval_days=2), format="json")
+        self.assertIn(r.status_code, (200, 201), r.data)
+        self.assertEqual(ClientDeal.objects.get(pk=r.data["id"]).debt_months, None)
+
+    def test_both_in_body_is_still_400(self):
+        r = self.api.post(self._url(), self._body(debt_days=10, debt_months=4), format="json")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("debt_months", r.data)
