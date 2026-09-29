@@ -1,4 +1,6 @@
 from django.urls import path
+
+from apps.main.mass_incoming_views import ProductMassIncomingAPIView
 from .views import *
 from .pos_views import *
 from .kassa_stage3 import (
@@ -82,6 +84,7 @@ urlpatterns = [
     path('products/scale-export/', WeightProductsScaleExportAPIView.as_view(), name='product-scale-export'),
     path('products/create-by-barcode/', ProductCreateByBarcodeAPIView.as_view(), name='product-create-by-barcode'),
     path('products/create-manual/', ProductCreateManualAPIView.as_view(), name='product-create-manual'),
+    path('products/mass-incoming/', ProductMassIncomingAPIView.as_view(), name='product-mass-incoming'),
     path('products/bulk-update/', ProductBulkUpdateAPIView.as_view(), name='product-bulk-update'),
     path('products/<uuid:pk>/', ProductRetrieveUpdateDestroyAPIView.as_view(), name='product-detail'),
     path('products/<uuid:pk>/purchase-batches/', ProductPurchaseBatchListAPIView.as_view(), name='product-purchase-batches'),

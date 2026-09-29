@@ -1005,3 +1005,83 @@ class ShiftReturnsReportingTests(KassaBase):
             (data["returns_count"], data["returns_total"], data["returns_cash"], data["returns_noncash"]),
             (1, "200.00", "0.00", "0.00"),
         )
+
+class MassIncomingBatchTests(KassaBase):
+    """mass-incoming-batch: «Провести приход» одним запросом, всё или ничего."""
+
+    URL = "/api/main/products/mass-incoming/"
+
+    def setUp(self):
+        super().setUp()
+        from apps.main.models import GlobalBrand, GlobalProduct
+
+        self.product.quantity = Decimal("5")
+        self.product.save()
+        self.other = Product.objects.create(company=self.company, name="Молоко", price=Decimal("100.00"),
+                                            quantity=Decimal("1"))
+        GlobalProduct.objects.create(name="Кофе глобальный", barcode="4601234567890",
+                                     brand=GlobalBrand.objects.create(name="Nescafe"))
+
+    def _post(self, items):
+        return self.api.post(self.URL, {"comment": "Массовое сканирование", "items": items}, format="json")
+
+    def test_adds_to_current_stock_and_updates_price(self):
+        Product.objects.filter(pk=self.product.pk).update(quantity=Decimal("3"))  # между сканом и приходом продали 2
+        r = self._post([{"product_id": str(self.product.id), "quantity": "10"},
+                        {"product_id": str(self.other.id), "quantity": "1", "price": "120"}])
+        self.assertEqual(r.status_code, 200, r.data)
+        self.product.refresh_from_db()
+        self.other.refresh_from_db()
+        self.assertEqual(self.product.quantity, Decimal("13"))
+        self.assertEqual((self.other.quantity, self.other.price), (Decimal("2"), Decimal("120.00")))
+        self.assertEqual(r.data["items"][0], {"product_id": str(self.product.id), "quantity": "13.000"})
+
+    def test_creates_from_global_and_manually(self):
+        r = self._post([
+            {"barcode": "4601234567890", "name": "Кофе 90г", "price": "300", "quantity": "5", "from_global": True},
+            {"barcode": "4601234567891", "name": "Скотч", "price": "120", "quantity": "2", "from_global": False},
+        ])
+        self.assertEqual(r.status_code, 201, r.data)
+        self.assertEqual([c["barcode"] for c in r.data["created"]], ["4601234567890", "4601234567891"])
+        coffee = Product.objects.get(company=self.company, barcode="4601234567890")
+        self.assertEqual((coffee.name, coffee.price, coffee.quantity, coffee.brand.name),
+                         ("Кофе 90г", Decimal("300.00"), Decimal("5"), "Nescafe"))
+        self.assertEqual(Product.objects.get(company=self.company, barcode="4601234567891").quantity, Decimal("2"))
+
+    def assertNothingChanged(self, count_before):
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.quantity, Decimal("5"))
+        self.assertEqual(Product.objects.filter(company=self.company).count(), count_before)
+
+    def test_all_or_nothing(self):
+        from apps.users.models import Company as CompanyModel
+
+        foreign_owner = User.objects.create_user(email=f"f{uuid.uuid4().hex[:6]}@t.kg", password="x", role="owner")
+        foreign = Product.objects.create(
+            company=CompanyModel.objects.create(name="Чужая", owner=foreign_owner, subscription_plan=self.plan),
+            name="Чужой", price=Decimal("1"), quantity=Decimal("1"),
+        )
+        before = Product.objects.filter(company=self.company).count()
+        cases = [
+            ([{"product_id": str(self.product.id), "quantity": "10"},
+              {"barcode": "4601234567890", "name": "Кофе", "price": "300", "quantity": "5", "from_global": True},
+              {"product_id": str(foreign.id), "quantity": "1"}], 404),
+            ([{"product_id": str(self.product.id), "quantity": "10"},
+              {"barcode": "0000000000000", "name": "Нет в базе", "price": "1", "quantity": "1", "from_global": True}],
+             400),
+            ([{"product_id": str(self.product.id), "quantity": "10"},
+              {"barcode": self.other.barcode or "dup", "name": "Дубль", "price": "1", "quantity": "1",
+               "from_global": False}], None),
+            ([{"product_id": str(self.product.id), "quantity": "-1"}], 400),
+            ([{"barcode": "123", "name": "Без цены", "quantity": "1", "from_global": False}], 400),
+        ]
+        Product.objects.filter(pk=self.other.pk).update(barcode="dup")
+        for items, want in cases:
+            r = self._post(items)
+            self.assertEqual(r.status_code, want or 409, r.data)
+            self.assertIn("detail", r.data)
+            self.assertNothingChanged(before)
+
+    def test_bad_body(self):
+        self.assertEqual(self._post([]).status_code, 400)
+        self.assertEqual(self.api.post(self.URL, {}, format="json").status_code, 400)
