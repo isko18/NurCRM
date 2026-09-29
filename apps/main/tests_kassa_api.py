@@ -893,3 +893,60 @@ class DebtV2MonthsTests(KassaBase):
         r = self.api.post(self._url(), self._body(debt_days=10, debt_months=4), format="json")
         self.assertEqual(r.status_code, 400)
         self.assertIn("debt_months", r.data)
+
+class SaleDealLinkageTests(KassaBase):
+    """09-sale-deal-linkage: продажа в долг следует за погашением своей сделки."""
+
+    def _debt_sale(self):
+        with self.captureOnCommitCallbacks(execute=True):
+            r = self.quick(client=str(self.client_obj.id), shift=str(self.shift.id), payment={"method": "debt"})
+        self.assertEqual(r.status_code, 201, r.data)
+        sale = Sale.objects.get(id=r.data["id"])
+        self.assertEqual(sale.status, Sale.Status.DEBT)
+        return sale, ClientDeal.objects.get(sale=sale)
+
+    def _pay(self, deal, inst):
+        url = f"/api/main/clients/{self.client_obj.id}/deals/{deal.id}/pay/"
+        inst.refresh_from_db()
+        with self.captureOnCommitCallbacks(execute=True):
+            r = self.api.post(url, {"installment_id": str(inst.id), "amount": str(inst.amount - inst.paid_amount),
+                                    "idempotency_key": str(uuid.uuid4()), "payment_method": "cash",
+                                    "cashbox_id": str(self.cashbox.id), "shift_id": str(self.shift.id)},
+                              format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+
+    def test_full_repayment_marks_sale_paid_and_refund_reverts(self):
+        sale, deal = self._debt_sale()
+        listed = self.api.get("/api/main/pos/sales/").data["results"][0]
+        self.assertEqual((listed["deal_id"], listed["debt_amount"]), (str(deal.id), Decimal("200.00")))
+
+        installments = list(deal.installments.order_by("number"))
+        self._pay(deal, installments[0])  # частично — продажа остаётся в долге, остаток виден
+        sale.refresh_from_db()
+        self.assertEqual(sale.status, Sale.Status.DEBT)
+        left = Decimal("200.00") - installments[0].amount
+        listed = self.api.get("/api/main/pos/sales/").data["results"][0]
+        self.assertEqual(listed["debt_amount"], left)
+        detail = self.api.get(f"/api/main/pos/sales/{sale.id}/").data
+        self.assertEqual((detail["deal_id"], Decimal(detail["remaining_debt"])), (str(deal.id), left))
+
+        for inst in installments[1:]:
+            self._pay(deal, inst)
+        sale.refresh_from_db()
+        self.assertEqual(sale.status, Sale.Status.PAID)
+        self.assertEqual(sale.payment_method, Sale.PaymentMethod.DEBT)
+        self.assertEqual(self.api.get("/api/main/pos/sales/").data["results"][0]["debt_amount"], Decimal("0.00"))
+
+        url = f"/api/main/clients/{self.client_obj.id}/deals/{deal.id}/refund/"
+        with self.captureOnCommitCallbacks(execute=True):
+            r = self.api.post(url, {"amount": "1.00", "idempotency_key": str(uuid.uuid4())}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        sale.refresh_from_db()
+        self.assertEqual(sale.status, Sale.Status.DEBT)
+
+    def test_deal_without_sale_is_ignored(self):
+        from apps.main.models import sync_sale_status_from_deal
+
+        deal = ClientDeal.objects.create(company=self.company, client=self.client_obj, title="Без продажи",
+                                         kind=ClientDeal.Kind.DEBT, amount=Decimal("100.00"), debt_months=1)
+        sync_sale_status_from_deal(deal.id)  # не падает и ничего не трогает

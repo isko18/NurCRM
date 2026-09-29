@@ -3,6 +3,7 @@ from rest_framework import serializers
 
 from apps.construction.models import Cashbox, CashShift
 from .models import (
+    ClientDeal,
     Product,
     Cart,
     CartItem,
@@ -743,6 +744,27 @@ def _sale_payment_split(sale):
     return str(money(cash)), str(money(card))
 
 
+def _linked_debt_deal(sale):
+    """Сделка-долг, созданная из этой продажи (09). Берёт prefetch deals, если он есть."""
+    for deal in sale.deals.all():
+        if deal.kind == ClientDeal.Kind.DEBT:
+            return deal
+    return None
+
+
+def _sale_debt_amount(sale):
+    """Сколько ещё должны по продаже: по остатку сделки, если она есть; погашенная — 0."""
+    is_debt = sale.status == Sale.Status.DEBT or sale.payment_method == Sale.PaymentMethod.DEBT
+    if not is_debt or sale.status == Sale.Status.PAID:
+        return money(Decimal("0.00"))
+    deal = _linked_debt_deal(sale)
+    if deal is not None:
+        remaining = deal.remaining_debt
+    else:
+        remaining = (sale.total or Decimal("0.00")) - (sale.cash_received or Decimal("0.00"))
+    return money(remaining if remaining > Decimal("0.00") else Decimal("0.00"))
+
+
 class SaleListSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField()
     consultant_display = serializers.SerializerMethodField(read_only=True)
@@ -756,6 +778,7 @@ class SaleListSerializer(serializers.ModelSerializer):
     branch = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox_name = serializers.SerializerMethodField(read_only=True)
     debt_amount = serializers.SerializerMethodField(read_only=True)
+    deal_id = serializers.SerializerMethodField(read_only=True)
     number = serializers.IntegerField(source="doc_number", read_only=True)
     cash_amount = serializers.SerializerMethodField(read_only=True)
     card_amount = serializers.SerializerMethodField(read_only=True)
@@ -790,6 +813,7 @@ class SaleListSerializer(serializers.ModelSerializer):
             "first_item_name",
             "matched_item_name",
             "debt_amount",
+            "deal_id",
             "cash_amount",
             "card_amount",
         )
@@ -836,14 +860,11 @@ class SaleListSerializer(serializers.ModelSerializer):
         return cb.name or "Касса компании"
 
     def get_debt_amount(self, obj):
-        is_debt = (
-            obj.status == Sale.Status.DEBT
-            or obj.payment_method == Sale.PaymentMethod.DEBT
-        )
-        if not is_debt:
-            return money(Decimal("0.00"))
-        remaining = (obj.total or Decimal("0.00")) - (obj.cash_received or Decimal("0.00"))
-        return money(remaining if remaining > Decimal("0.00") else Decimal("0.00"))
+        return _sale_debt_amount(obj)
+
+    def get_deal_id(self, obj):
+        deal = _linked_debt_deal(obj)
+        return str(deal.id) if deal else None
 
 
 class SaleItemReadSerializer(serializers.ModelSerializer):

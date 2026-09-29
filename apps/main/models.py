@@ -3924,6 +3924,27 @@ class ClientDeal(models.Model):
             self.rebuild_installments(custom_installments=custom_installments)
 
 
+def sync_sale_status_from_deal(deal_id) -> None:
+    """
+    09-sale-deal-linkage: статус продажи в долг следует за остатком её сделки.
+    Остаток 0 — продажа «paid» (способ оплаты остаётся debt: деньги пришли погашением,
+    а не в чеке); снова появился остаток (возврат платежа) — обратно «debt».
+    Частичное погашение статус не меняет: до полного погашения продажа — «debt».
+    Продажи, оплаченные иначе, отменённые и с возвратом не трогаем.
+    """
+    deal = ClientDeal.objects.select_related("sale").filter(pk=deal_id).first()
+    if deal is None or deal.sale_id is None or deal.kind != ClientDeal.Kind.DEBT:
+        return
+    sale = deal.sale
+    if sale.payment_method != Sale.PaymentMethod.DEBT:
+        return
+    if sale.status not in (Sale.Status.DEBT, Sale.Status.PAID):
+        return
+    target = Sale.Status.PAID if deal.remaining_debt <= 0 else Sale.Status.DEBT
+    if sale.status != target:
+        Sale.objects.filter(pk=sale.pk).update(status=target)
+
+
 class DealInstallment(models.Model):
     # ✅ теперь тоже UUID (как ты хочешь “всё на uuid”)
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

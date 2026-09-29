@@ -350,3 +350,16 @@ def product_deletion_tombstone(sender, instance: Product, **kwargs):
 def promotion_tier_touches_product(sender, instance: ProductPromotionTier, **kwargs):
     """Изменили акцию — товар должен прийти кассе при следующей быстрой синхронизации."""
     Product.objects.filter(pk=instance.product_id).update()
+
+
+# --- 09: статус продажи в долг следует за погашением её сделки ---
+
+from apps.main.models import DealPayment, sync_sale_status_from_deal  # noqa: E402
+
+
+@receiver(post_save, sender=DealPayment)
+@receiver(post_delete, sender=DealPayment)
+def deal_payment_syncs_sale_status(sender, instance: DealPayment, **kwargs):
+    """После оплаты или возврата платежа по сделке — пересчитать статус связанной продажи."""
+    deal_id = instance.deal_id
+    transaction.on_commit(lambda: sync_sale_status_from_deal(deal_id))
