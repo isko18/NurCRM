@@ -6732,3 +6732,373 @@ class MarketCustomerDisplaySettings(models.Model):
 
     def __str__(self):
         return f"CustomerDisplaySettings ({self.company_id})"
+
+
+# ======================================================================
+# Showcase Visual Editor Models (SC-01 - SC-11)
+# ======================================================================
+
+def default_showcase_theme():
+    return {
+        "background": "#FFFFFF",
+        "text": "#111827",
+        "accent": "#F5CD15",
+        "header_bg": "#111827",
+        "header_text": "#FFFFFF",
+        "footer_bg": "#F3F4F6",
+        "card_bg": "#FFFFFF",
+        "price": "#B45309",
+        "font": "Inter",
+        "radius": 12,
+        "mode": "light",
+        "preset": None,
+    }
+
+
+def default_showcase_layout():
+    return {
+        "sections": ["banners", "promos", "categories", "featured", "all_products"],
+        "columns": {"desktop": 4, "mobile": 2},
+        "default_sort": "new",
+        "pinned_products": [],
+        "hidden_products": [],
+        "hidden_categories": [],
+        "category_order": [],
+        "product_order": [],
+    }
+
+
+def default_showcase_cards():
+    return {
+        "template": "standard",
+        "show": {
+            "photo": True,
+            "old_price": True,
+            "stock": "low_only",
+            "unit": True,
+            "discount_badge": True,
+            "add_button": True,
+        },
+        "photo_ratio": "1:1",
+        "shadow": True,
+        "border": False,
+    }
+
+
+def default_showcase_carousel():
+    return {
+        "autoplay": True,
+        "interval_s": 5,
+    }
+
+
+def default_showcase_brand():
+    return {
+        "logo": None,
+        "title": "",
+        "slogan": "",
+        "favicon": None,
+    }
+
+
+def default_showcase_footer():
+    return {
+        "phone": "",
+        "address": "",
+        "hours": "",
+        "socials": {
+            "instagram": "",
+            "whatsapp": "",
+        },
+    }
+
+
+def get_default_showcase_design():
+    return {
+        "theme": default_showcase_theme(),
+        "layout": default_showcase_layout(),
+        "cards": default_showcase_cards(),
+        "carousel": default_showcase_carousel(),
+        "brand": default_showcase_brand(),
+        "footer": default_showcase_footer(),
+    }
+
+
+def showcase_media_upload_to(instance, filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "webp"
+    return f"showcase_media/{instance.company_id}/{uuid.uuid4().hex}.{ext}"
+
+
+class ShowcaseDesign(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="showcase_design",
+        verbose_name="Компания",
+    )
+    draft = models.JSONField("Черновик", default=get_default_showcase_design)
+    published = models.JSONField("Опубликованный дизайн", default=get_default_showcase_design)
+    version = models.PositiveIntegerField("Версия", default=1)
+    published_at = models.DateTimeField("Дата публикации", null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Дизайн витрины"
+        verbose_name_plural = "Дизайны витрин"
+
+    def __str__(self):
+        return f"ShowcaseDesign({self.company_id}, v{self.version})"
+
+
+class ShowcaseDesignVersion(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="showcase_design_versions",
+        verbose_name="Компания",
+    )
+    version = models.PositiveIntegerField("Номер версии")
+    snapshot = models.JSONField("Снимок настроек")
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Автор публикации",
+    )
+    published_at = models.DateTimeField("Дата публикации", default=timezone.now)
+
+    class Meta:
+        verbose_name = "Версия дизайна витрины"
+        verbose_name_plural = "Версии дизайна витрин"
+        unique_together = ("company", "version")
+        ordering = ["-version"]
+
+    def __str__(self):
+        return f"ShowcaseDesignVersion({self.company_id}, v{self.version})"
+
+
+class ShowcaseMedia(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="showcase_media",
+        verbose_name="Компания",
+    )
+    file = models.FileField(upload_to=showcase_media_upload_to, verbose_name="Оригинал/Файл")
+    urls = models.JSONField("URLs по размерам", default=dict)
+    width = models.PositiveIntegerField("Ширина", default=0)
+    height = models.PositiveIntegerField("Высота", default=0)
+    content_type = models.CharField("Тип контента", max_length=64, default="image/webp")
+    idempotency_key = models.CharField(max_length=128, null=True, blank=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Медиафайл витрины"
+        verbose_name_plural = "Медиафайлы витрины"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"ShowcaseMedia({self.id})"
+
+
+class ShowcaseBanner(models.Model):
+    class Place(models.TextChoices):
+        HERO = "hero", "Сверху-карусель (Hero)"
+        INLINE = "inline", "Между рядами (Inline)"
+        SIDEBAR = "sidebar", "Сбоку (Sidebar)"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="showcase_banners",
+        verbose_name="Компания",
+    )
+    title = models.CharField("Заголовок", max_length=255, blank=True, default="")
+    subtitle = models.CharField("Подпись", max_length=255, blank=True, default="")
+    image = models.ForeignKey(
+        ShowcaseMedia,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Изображение (десктоп)",
+    )
+    image_mobile = models.ForeignKey(
+        ShowcaseMedia,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Изображение (мобильное)",
+    )
+    link = models.JSONField("Куда ведёт", default=dict)
+    place = models.CharField(
+        "Место",
+        max_length=32,
+        choices=Place.choices,
+        default=Place.HERO,
+    )
+    starts_at = models.DateTimeField("Начало показа", null=True, blank=True)
+    ends_at = models.DateTimeField("Конец показа", null=True, blank=True)
+    active = models.BooleanField("Активен", default=True)
+    position = models.PositiveIntegerField("Порядок", default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Рекламный баннер витрины"
+        verbose_name_plural = "Рекламные баннеры витрины"
+        ordering = ["position", "created_at"]
+
+    def __str__(self):
+        return f"ShowcaseBanner({self.title or self.id})"
+
+
+class ShowcasePromoBlock(models.Model):
+    class Style(models.TextChoices):
+        CAROUSEL = "carousel", "Лента (Carousel)"
+        GRID = "grid", "Сетка (Grid)"
+        HERO_PRODUCT = "hero_product", "Один большой товар (Hero Product)"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="showcase_promo_blocks",
+        verbose_name="Компания",
+    )
+    title = models.CharField("Заголовок", max_length=255)
+    source = models.JSONField("Источник", default=dict)
+    style = models.CharField(
+        "Вид блока",
+        max_length=32,
+        choices=Style.choices,
+        default=Style.CAROUSEL,
+    )
+    show_timer = models.BooleanField("Таймер до конца акции", default=True)
+    max_items = models.PositiveIntegerField("Максимум товаров", default=12)
+    position = models.PositiveIntegerField("Порядок", default=0)
+    active = models.BooleanField("Активен", default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Промо-блок витрины"
+        verbose_name_plural = "Промо-блоки витрины"
+        ordering = ["position", "created_at"]
+
+    def __str__(self):
+        return f"ShowcasePromoBlock({self.title})"
+
+
+class ShowcaseOrder(models.Model):
+    class Status(models.TextChoices):
+        NEW = "new", "Новый"
+        ACCEPTED = "accepted", "Принят"
+        READY = "ready", "Готов"
+        DONE = "done", "Выполнен"
+        CANCELED = "canceled", "Отменён"
+
+    class DeliveryType(models.TextChoices):
+        PICKUP = "pickup", "Самовывоз"
+        DELIVERY = "delivery", "Доставка"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="showcase_orders",
+        verbose_name="Компания",
+    )
+    number = models.PositiveIntegerField("Номер заказа")
+    status = models.CharField(
+        "Статус",
+        max_length=32,
+        choices=Status.choices,
+        default=Status.NEW,
+    )
+    customer_name = models.CharField("Имя клиента", max_length=128)
+    customer_phone = models.CharField("Телефон клиента", max_length=64)
+    delivery_type = models.CharField(
+        "Тип доставки",
+        max_length=32,
+        choices=DeliveryType.choices,
+        default=DeliveryType.PICKUP,
+    )
+    delivery_address = models.CharField("Адрес доставки", max_length=255, blank=True, default="")
+    comment = models.TextField("Комментарий", blank=True, default="")
+    total = models.DecimalField("Итоговая сумма", max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    idempotency_key = models.CharField(max_length=128, null=True, blank=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Заказ с витрины"
+        verbose_name_plural = "Заказы с витрины"
+        unique_together = ("company", "number")
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"ShowcaseOrder #{self.number} ({self.customer_name})"
+
+
+class ShowcaseOrderItem(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    order = models.ForeignKey(
+        ShowcaseOrder,
+        on_delete=models.CASCADE,
+        related_name="items",
+        verbose_name="Заказ",
+    )
+    product = models.ForeignKey(
+        "Product",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Товар",
+    )
+    product_name = models.CharField("Название товара", max_length=255)
+    qty = models.DecimalField("Количество", max_digits=12, decimal_places=3, default=Decimal("1.000"))
+    price = models.DecimalField("Цена за единицу", max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    discount = models.DecimalField("Скидка", max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    total = models.DecimalField("Сумма позиции", max_digits=14, decimal_places=2, default=Decimal("0.00"))
+
+    class Meta:
+        verbose_name = "Позиция заказа с витрины"
+        verbose_name_plural = "Позиции заказа с витрины"
+
+    def __str__(self):
+        return f"{self.product_name} x {self.qty}"
+
+
+class ShowcaseStats(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="showcase_stats",
+        verbose_name="Компания",
+    )
+    date = models.DateField("Дата", db_index=True)
+    views = models.PositiveIntegerField("Просмотры витрины", default=0)
+    add_to_cart = models.PositiveIntegerField("Добавлений в корзину", default=0)
+    product_views = models.JSONField("Просмотры товаров", default=dict)
+    banner_clicks = models.JSONField("Клики по баннерам", default=dict)
+
+    class Meta:
+        verbose_name = "Статистика витрины"
+        verbose_name_plural = "Статистика витрины"
+        unique_together = ("company", "date")
+        ordering = ["-date"]
+
+    def __str__(self):
+        return f"ShowcaseStats({self.company_id}, {self.date})"
+

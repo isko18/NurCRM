@@ -25,6 +25,7 @@ EVENTS = (
     "stock.low",
     "company.updated",
     "appointment.created",
+    "order.created",
 )
 
 

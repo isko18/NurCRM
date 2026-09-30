@@ -1015,6 +1015,8 @@ def company_feature_codes(company):
     if plan is not None:
         codes.extend(plan.features.order_by("name").values_list("name", flat=True))
     codes.extend(a["code"] for a in company_addons_payload(company) if a["active"])
+    if getattr(company, "can_view_showcase", False):
+        codes.append("showcase_editor")
     return list(dict.fromkeys(c for c in codes if c))
 
 
@@ -1032,6 +1034,9 @@ def company_features_detail(company, *, plan_until=None):
     for a in company_addons_payload(company):
         if a["active"]:
             out[a["code"]] = a["until"]
+    if getattr(company, "can_view_showcase", False):
+        if "showcase_editor" not in out:
+            out["showcase_editor"] = plan_until
     return [{"code": code, "until": until} for code, until in out.items()]
 
 

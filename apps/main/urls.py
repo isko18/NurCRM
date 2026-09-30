@@ -28,6 +28,30 @@ from .analytics_market import *
 from .analytics_dashboard import *
 from .document import SaleReceiptAPIView, SaleInvoiceAPIView
 from apps.main.showcase.views_public import PublicCompanyProductDetailAPIView, PublicCompanyAPIView, PublicCompanyShowcaseAPIView
+from apps.main.showcase.views_design import (
+    ShowcaseDesignAPIView,
+    ShowcaseDraftUpdateAPIView,
+    ShowcaseDraftProductOrderAPIView,
+    ShowcasePreviewLinkAPIView,
+    ShowcasePublishAPIView,
+    ShowcaseDiscardAPIView,
+    ShowcaseVersionsListAPIView,
+    ShowcaseVersionRestoreAPIView,
+    ShowcaseMediaListCreateAPIView,
+    ShowcaseMediaDetailAPIView,
+    ShowcaseBannerListCreateAPIView,
+    ShowcaseBannerDetailAPIView,
+    ShowcaseBannerReorderAPIView,
+    ShowcasePromoBlockListCreateAPIView,
+    ShowcasePromoBlockDetailAPIView,
+    ShowcasePromoBlockReorderAPIView,
+    ShowcaseOrderListAPIView,
+    ShowcaseOrderDetailAPIView,
+    ShowcaseStatsAPIView,
+    PublicCompanyShowcaseDesignAPIView,
+    PublicCompanyShowcaseOrderCreateAPIView,
+    PublicCompanyShowcaseTrackAPIView,
+)
 from apps.main.inventory_views import (
     ProductInventorySessionListCreateAPIView,
     ProductInventorySessionRetrieveAPIView,
@@ -420,8 +444,38 @@ urlpatterns = [
     path("public/companies/<slug:slug>/", PublicCompanyAPIView.as_view()),
     path("public/companies/<slug:slug>/showcase/", PublicCompanyShowcaseAPIView.as_view()),
     path("public/companies/<slug:slug>/showcase/<uuid:product_id>/", PublicCompanyProductDetailAPIView.as_view()),
+    path("public/companies/<slug:slug>/showcase/design/", PublicCompanyShowcaseDesignAPIView.as_view(), name="public-company-showcase-design"),
+    path("public/companies/<slug:slug>/orders/", PublicCompanyShowcaseOrderCreateAPIView.as_view(), name="public-company-showcase-orders"),
+    path("public/companies/<slug:slug>/showcase/track/", PublicCompanyShowcaseTrackAPIView.as_view(), name="public-company-showcase-track"),
     
     path("public/knowledge-base/", PublicKnowledgeBaseCourseListCreateAPIView.as_view()),
     path("public/knowledge-base/<uuid:course_id>/", PublicKnowledgeBaseCourseRetrieveAPIView.as_view()),
 
+    # ==========================
+    # Showcase Visual Editor & Management (SC-01 - SC-11)
+    # ==========================
+    path("showcase/design/", ShowcaseDesignAPIView.as_view(), name="showcase-design"),
+    path("showcase/design/draft/", ShowcaseDraftUpdateAPIView.as_view(), name="showcase-design-draft"),
+    path("showcase/design/draft/product-order/", ShowcaseDraftProductOrderAPIView.as_view(), name="showcase-design-product-order"),
+    path("showcase/design/preview-link/", ShowcasePreviewLinkAPIView.as_view(), name="showcase-design-preview-link"),
+    path("showcase/design/publish/", ShowcasePublishAPIView.as_view(), name="showcase-design-publish"),
+    path("showcase/design/discard/", ShowcaseDiscardAPIView.as_view(), name="showcase-design-discard"),
+    path("showcase/design/versions/", ShowcaseVersionsListAPIView.as_view(), name="showcase-design-versions"),
+    path("showcase/design/versions/<int:version>/restore/", ShowcaseVersionRestoreAPIView.as_view(), name="showcase-design-restore"),
+
+    path("showcase/media/", ShowcaseMediaListCreateAPIView.as_view(), name="showcase-media-list-create"),
+    path("showcase/media/<uuid:pk>/", ShowcaseMediaDetailAPIView.as_view(), name="showcase-media-detail"),
+
+    path("showcase/banners/", ShowcaseBannerListCreateAPIView.as_view(), name="showcase-banners-list-create"),
+    path("showcase/banners/reorder/", ShowcaseBannerReorderAPIView.as_view(), name="showcase-banners-reorder"),
+    path("showcase/banners/<uuid:pk>/", ShowcaseBannerDetailAPIView.as_view(), name="showcase-banners-detail"),
+
+    path("showcase/promo-blocks/", ShowcasePromoBlockListCreateAPIView.as_view(), name="showcase-promo-blocks-list-create"),
+    path("showcase/promo-blocks/reorder/", ShowcasePromoBlockReorderAPIView.as_view(), name="showcase-promo-blocks-reorder"),
+    path("showcase/promo-blocks/<uuid:pk>/", ShowcasePromoBlockDetailAPIView.as_view(), name="showcase-promo-blocks-detail"),
+
+    path("showcase/orders/", ShowcaseOrderListAPIView.as_view(), name="showcase-orders-list"),
+    path("showcase/orders/<uuid:pk>/", ShowcaseOrderDetailAPIView.as_view(), name="showcase-orders-detail"),
+
+    path("showcase/stats/", ShowcaseStatsAPIView.as_view(), name="showcase-stats"),
 ]

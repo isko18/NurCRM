@@ -17,6 +17,9 @@ from .models import (
     ProductImage, ProductCharacteristics, ProductPackage,
     # POS
     Cart, CartItem, CartItemDeletionLog, MobileScannerToken, Sale, SaleItem, MarketCustomerDisplaySettings,
+    # Showcase Visual Editor
+    ShowcaseDesign, ShowcaseDesignVersion, ShowcaseMedia, ShowcaseBanner, ShowcasePromoBlock,
+    ShowcaseOrder, ShowcaseOrderItem, ShowcaseStats,
     # Others
     Review, Notification, Integration, Analytics, Event,
     # Warehouse
@@ -735,3 +738,63 @@ class MarketCustomerDisplaySettingsAdmin(admin.ModelAdmin):
     list_filter = ("enabled", "theme", "updated_at")
     search_fields = ("company__name", "welcome_text")
     readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(ShowcaseDesign)
+class ShowcaseDesignAdmin(admin.ModelAdmin):
+    list_display = ("company", "version", "published_at", "updated_at")
+    search_fields = ("company__name", "company__slug")
+    readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(ShowcaseDesignVersion)
+class ShowcaseDesignVersionAdmin(admin.ModelAdmin):
+    list_display = ("company", "version", "author", "published_at")
+    list_filter = ("published_at",)
+    search_fields = ("company__name", "company__slug")
+    readonly_fields = ("published_at",)
+
+
+@admin.register(ShowcaseMedia)
+class ShowcaseMediaAdmin(admin.ModelAdmin):
+    list_display = ("id", "company", "width", "height", "content_type", "created_at")
+    list_filter = ("content_type", "created_at")
+    search_fields = ("company__name",)
+    readonly_fields = ("created_at",)
+
+
+@admin.register(ShowcaseBanner)
+class ShowcaseBannerAdmin(admin.ModelAdmin):
+    list_display = ("title", "company", "place", "active", "position", "starts_at", "ends_at")
+    list_filter = ("place", "active", "company")
+    search_fields = ("title", "subtitle", "company__name")
+
+
+@admin.register(ShowcasePromoBlock)
+class ShowcasePromoBlockAdmin(admin.ModelAdmin):
+    list_display = ("title", "company", "style", "active", "position")
+    list_filter = ("style", "active", "company")
+    search_fields = ("title", "company__name")
+
+
+class ShowcaseOrderItemInline(admin.TabularInline):
+    model = ShowcaseOrderItem
+    extra = 0
+    readonly_fields = ("product", "product_name", "qty", "price", "discount", "total")
+
+
+@admin.register(ShowcaseOrder)
+class ShowcaseOrderAdmin(admin.ModelAdmin):
+    list_display = ("number", "company", "status", "customer_name", "customer_phone", "total", "created_at")
+    list_filter = ("status", "delivery_type", "created_at")
+    search_fields = ("number", "customer_name", "customer_phone", "company__name")
+    inlines = [ShowcaseOrderItemInline]
+    readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(ShowcaseStats)
+class ShowcaseStatsAdmin(admin.ModelAdmin):
+    list_display = ("company", "date", "views", "add_to_cart")
+    list_filter = ("date", "company")
+    search_fields = ("company__name",)
+

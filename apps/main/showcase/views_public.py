@@ -147,6 +147,44 @@ class PublicCompanyShowcaseAPIView(generics.ListAPIView):
         if branch_id:
             qs = qs.filter(Q(branch_id=branch_id) | Q(branch__isnull=True))
 
+        design = getattr(company, "showcase_design", None)
+        if design and design.published:
+            layout = design.published.get("layout") or {}
+            hidden_products = [str(x) for x in layout.get("hidden_products", []) if x]
+            if hidden_products:
+                qs = qs.exclude(id__in=hidden_products)
+            hidden_categories = [str(x) for x in layout.get("hidden_categories", []) if x]
+            if hidden_categories:
+                qs = qs.exclude(category_id__in=hidden_categories)
+
+            # Если явная сортировка в запросе не передана, применяем настройки витрины
+            if not self.request.query_params.get("ordering"):
+                ordering_clauses = []
+                pinned_products = [str(x) for x in layout.get("pinned_products", []) if x]
+                if pinned_products:
+                    ordering_clauses.append(
+                        Case(
+                            When(id__in=pinned_products, then=Value(0)),
+                            default=Value(1),
+                        )
+                    )
+
+                default_sort = layout.get("default_sort", "new")
+                if default_sort == "price_asc":
+                    ordering_clauses.append(F("final_price").asc(nulls_last=True))
+                elif default_sort == "price_desc":
+                    ordering_clauses.append(F("final_price").desc(nulls_last=True))
+                elif default_sort == "manual":
+                    product_order = [str(x) for x in layout.get("product_order", []) if x]
+                    if product_order:
+                        cases = [When(id=pid, then=Value(i)) for i, pid in enumerate(product_order)]
+                        ordering_clauses.append(
+                            Case(*cases, default=Value(len(product_order) + 100))
+                        )
+
+                ordering_clauses.extend([F("created_at").desc(), F("id").asc()])
+                qs = qs.order_by(*ordering_clauses)
+
         return qs
 
 
@@ -165,9 +203,20 @@ class PublicCompanyProductDetailAPIView(generics.RetrieveAPIView):
 
     def get_queryset(self):
         company = self.get_company()
-        return (
+        qs = (
             Product.objects
             .filter(company=company)  # ✅ без status фильтра
             .select_related("brand", "category")
             .prefetch_related("images", "packages", "characteristics")
         )
+        design = getattr(company, "showcase_design", None)
+        if design and design.published:
+            layout = design.published.get("layout") or {}
+            hidden_products = [str(x) for x in layout.get("hidden_products", []) if x]
+            if hidden_products:
+                qs = qs.exclude(id__in=hidden_products)
+            hidden_categories = [str(x) for x in layout.get("hidden_categories", []) if x]
+            if hidden_categories:
+                qs = qs.exclude(category_id__in=hidden_categories)
+        return qs
+
