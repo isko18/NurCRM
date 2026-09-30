@@ -51,7 +51,7 @@ class SlugConflict(APIException):
 from apps.users.models import (
     User, Company, Roles, Industry, SubscriptionPlan,
     Feature, Sector, CustomRole, Branch, BranchMembership, KyrgyzstanRegion,
-    SCALE_BARCODE_LAYOUT_PLU,
+    SCALE_BARCODE_LAYOUT_PLU, UserUiPreferences,
 )
 
 
@@ -1265,3 +1265,34 @@ class CompanySubscriptionSerializer(serializers.ModelSerializer):
 
         instance.save()
         return instance
+
+
+class UserUiPreferencesSerializer(serializers.ModelSerializer):
+    sidebar_auto_close = serializers.BooleanField(
+        required=False,
+        error_messages={"invalid": "Must be a valid boolean."}
+    )
+    cashier_desktop_download = serializers.BooleanField(
+        required=False,
+        error_messages={"invalid": "Must be a valid boolean."}
+    )
+    theme_mode = serializers.ChoiceField(
+        choices=["light", "dark"],
+        required=False,
+        error_messages={"invalid_choice": "Допустимы light или dark"}
+    )
+    theme_dark_palette = serializers.ChoiceField(
+        choices=["soft", "classic"],
+        required=False,
+        error_messages={"invalid_choice": "Допустимы soft или classic"}
+    )
+
+    class Meta:
+        model = UserUiPreferences
+        fields = (
+            "sidebar_auto_close",
+            "cashier_desktop_download",
+            "theme_mode",
+            "theme_dark_palette",
+        )
+

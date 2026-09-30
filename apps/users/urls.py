@@ -28,6 +28,7 @@ from .views import (
     #таски лист для админа и апдейт на подписку
     CompanyListAPIView,
     CompanySubscriptionAdminAPIView,
+    UserUiPreferencesAPIView,
 )
 
 from apps.integrations.views import (
@@ -55,6 +56,7 @@ urlpatterns = [
     
 
     # ⚙️ Настройки
+    path('ui-preferences/', UserUiPreferencesAPIView.as_view(), name='user-ui-preferences'),
     path('settings/change-password/', ChangePasswordView.as_view(), name='change-password'),
     path('settings/company/', CompanyUpdateAPIView.as_view(), name='company-update'),
     path('company/check-slug/', CompanyCheckSlugAPIView.as_view(), name='company-check-slug'),

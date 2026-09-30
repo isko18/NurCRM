@@ -861,7 +861,7 @@ class ScaleDeviceAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
     autocomplete_fields = ("company", "branch")
 
 
-from apps.users.models import CompanyAddon  # noqa: E402
+from apps.users.models import CompanyAddon, UserUiPreferences  # noqa: E402
 
 
 @admin.register(CompanyAddon)
@@ -870,3 +870,13 @@ class CompanyAddonAdmin(admin.ModelAdmin):
     list_filter = ("active", "code")
     search_fields = ("company__name", "code")
     raw_id_fields = ("company",)
+
+
+@admin.register(UserUiPreferences)
+class UserUiPreferencesAdmin(admin.ModelAdmin):
+    list_display = ("user", "sidebar_auto_close", "cashier_desktop_download", "theme_mode", "theme_dark_palette", "updated_at")
+    list_filter = ("sidebar_auto_close", "cashier_desktop_download", "theme_mode", "theme_dark_palette")
+    search_fields = ("user__email", "user__first_name", "user__last_name")
+    raw_id_fields = ("user",)
+    readonly_fields = ("created_at", "updated_at")
+

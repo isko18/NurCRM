@@ -29,6 +29,7 @@ from .models import (
     KyrgyzstanRegion,
     Roles,
     PlatformAdminAuditLog,
+    UserUiPreferences,
 )
 from .serializers import (
     UserSerializer,
@@ -52,6 +53,7 @@ from .serializers import (
     normalize_slug,
     slug_format_error,
     slug_taken_by_other,
+    UserUiPreferencesSerializer,
 )
 from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin, IsCompanyOwnerOrAdminOrSupervisor, IsPlatformAdmin
 
@@ -808,3 +810,35 @@ class CompanySubscriptionAdminAPIView(generics.RetrieveUpdateAPIView):
         if not (user.is_superuser or getattr(user, "role", None) == "admin" or getattr(user, "owned_company_id", None)):
             raise PermissionDenied("У вас нет прав изменять подписку компании.")
         serializer.save()
+
+
+class UserUiPreferencesAPIView(APIView):
+    """
+    GET /users/ui-preferences/ — прочитать персональные настройки текущего пользователя
+    PATCH /users/ui-preferences/ — частично обновить (сам себе)
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        prefs = UserUiPreferences.objects.filter(user=request.user).first()
+        if not prefs:
+            prefs, _ = UserUiPreferences.objects.get_or_create(user=request.user)
+
+        serializer = UserUiPreferencesSerializer(prefs)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def patch(self, request, *args, **kwargs):
+        prefs = UserUiPreferences.objects.filter(user=request.user).first()
+        if not prefs:
+            prefs, _ = UserUiPreferences.objects.get_or_create(user=request.user)
+
+        serializer = UserUiPreferencesSerializer(prefs, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def put(self, request, *args, **kwargs):
+        return self.patch(request, *args, **kwargs)
+

@@ -970,3 +970,55 @@ class CompanyAddon(models.Model):
 
     def __str__(self):
         return f"{self.company_id}: {self.code}"
+
+
+class UserUiPreferences(models.Model):
+    """
+    Персональные настройки интерфейса пользователя (сайдбар, тема, кнопка кассы).
+    Одна запись на пользователя (singleton per-user).
+    """
+    class ThemeMode(models.TextChoices):
+        LIGHT = "light", "light"
+        DARK = "dark", "dark"
+
+    class ThemeDarkPalette(models.TextChoices):
+        SOFT = "soft", "soft"
+        CLASSIC = "classic", "classic"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        "users.User",
+        on_delete=models.CASCADE,
+        related_name="ui_preferences",
+        verbose_name="Пользователь",
+        db_index=True,
+    )
+    sidebar_auto_close = models.BooleanField(
+        default=False,
+        verbose_name="Автозакрытие сайдбара",
+    )
+    cashier_desktop_download = models.BooleanField(
+        default=True,
+        verbose_name="Кнопка кассы скачивает desktop",
+    )
+    theme_mode = models.CharField(
+        max_length=16,
+        choices=ThemeMode.choices,
+        default=ThemeMode.LIGHT,
+        verbose_name="Тема интерфейса",
+    )
+    theme_dark_palette = models.CharField(
+        max_length=16,
+        choices=ThemeDarkPalette.choices,
+        default=ThemeDarkPalette.SOFT,
+        verbose_name="Стиль тёмной темы",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Обновлено")
+
+    class Meta:
+        verbose_name = "Пользовательские настройки интерфейса"
+        verbose_name_plural = "Пользовательские настройки интерфейса"
+
+    def __str__(self):
+        return f"UiPreferences ({self.user_id})"
