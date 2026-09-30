@@ -16,7 +16,7 @@ from .models import (
     # Extra product models
     ProductImage, ProductCharacteristics, ProductPackage,
     # POS
-    Cart, CartItem, CartItemDeletionLog, MobileScannerToken, Sale, SaleItem,
+    Cart, CartItem, CartItemDeletionLog, MobileScannerToken, Sale, SaleItem, MarketCustomerDisplaySettings,
     # Others
     Review, Notification, Integration, Analytics, Event,
     # Warehouse
@@ -727,3 +727,11 @@ class AgentSaleAllocationAdmin(admin.ModelAdmin):
     list_filter = ("company", "agent", "product")
     search_fields = ("agent__email", "product__name", "sale__id")
     list_select_related = ("company", "agent", "subreal", "sale", "sale_item", "product")
+
+
+@admin.register(MarketCustomerDisplaySettings)
+class MarketCustomerDisplaySettingsAdmin(admin.ModelAdmin):
+    list_display = ("company", "enabled", "theme", "welcome_text", "updated_at", "updated_by")
+    list_filter = ("enabled", "theme", "updated_at")
+    search_fields = ("company__name", "welcome_text")
+    readonly_fields = ("created_at", "updated_at")

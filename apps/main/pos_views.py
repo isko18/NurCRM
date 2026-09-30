@@ -72,6 +72,7 @@ from apps.main.models import (
     DealInstallment,
     Debt,
     PosPrinterSetting,
+    MarketCustomerDisplaySettings,
 )
 from apps.main.models import ManufactureSubreal, AgentSaleAllocation, ReturnFromAgent
 from apps.main.models import cart_line_base, scale_amount_step
@@ -4611,6 +4612,55 @@ class VerifyDeleteCodeAPIView(CompanyBranchRestrictedMixin, APIView):
             return Response({"valid": True}, status=status.HTTP_200_OK)
             
         return Response({"valid": False}, status=status.HTTP_200_OK)
+
+
+class MarketCustomerDisplaySettingsAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    GET /main/pos/customer-display-settings/
+    PATCH /main/pos/customer-display-settings/
+
+    Настройки второго экрана покупателя (per-company singleton).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            return Response({"detail": "Компания не найдена"}, status=status.HTTP_400_BAD_REQUEST)
+
+        from apps.main.serializers import MarketCustomerDisplaySettingsSerializer
+
+        settings_obj = MarketCustomerDisplaySettings.objects.filter(company=company).first()
+        if not settings_obj:
+            settings_obj, _ = MarketCustomerDisplaySettings.objects.get_or_create(company=company)
+
+        serializer = MarketCustomerDisplaySettingsSerializer(settings_obj)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def patch(self, request, *args, **kwargs):
+        company = self._company()
+        if not company:
+            return Response({"detail": "Компания не найдена"}, status=status.HTTP_400_BAD_REQUEST)
+
+        is_admin = getattr(request.user, "role", None) in ["owner", "admin"] or getattr(request.user, "is_superuser", False)
+        if not is_admin:
+            return Response({"detail": "Недостаточно прав"}, status=status.HTTP_403_FORBIDDEN)
+
+        from apps.main.serializers import MarketCustomerDisplaySettingsSerializer
+
+        settings_obj = MarketCustomerDisplaySettings.objects.filter(company=company).first()
+        if not settings_obj:
+            settings_obj, _ = MarketCustomerDisplaySettings.objects.get_or_create(company=company)
+
+        serializer = MarketCustomerDisplaySettingsSerializer(settings_obj, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer.save(updated_by=request.user)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def put(self, request, *args, **kwargs):
+        return self.patch(request, *args, **kwargs)
 
 
 def _is_cart_deletion_authorized(request, company=None) -> bool:

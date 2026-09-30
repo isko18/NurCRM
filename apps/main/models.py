@@ -6675,3 +6675,60 @@ class ProductDeletion(models.Model):
 
     class Meta:
         indexes = [models.Index(fields=["company", "deleted_at"], name="main_proddel_company_idx")]
+
+
+class MarketCustomerDisplaySettings(models.Model):
+    """
+    POS: настройки второго экрана покупателя (per-company singleton).
+    Показывает приветствие, промо-слайды и тему на дисплее покупателя.
+    """
+    class Theme(models.TextChoices):
+        DARK = "dark", "dark"
+        LIGHT = "light", "light"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="customer_display_settings",
+        verbose_name="Компания",
+        db_index=True,
+    )
+    enabled = models.BooleanField(
+        default=False,
+        verbose_name="Показывать ли функцию второго экрана",
+    )
+    welcome_text = models.CharField(
+        max_length=200,
+        blank=True,
+        default="",
+        verbose_name="Текст приветствия",
+    )
+    theme = models.CharField(
+        max_length=16,
+        choices=Theme.choices,
+        default=Theme.DARK,
+        verbose_name="Тема экрана",
+    )
+    slides = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name="Промо-слайды",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Обновлено")
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Кто последний менял",
+    )
+
+    class Meta:
+        verbose_name = "Настройка экрана покупателя"
+        verbose_name_plural = "Настройки экранов покупателей"
+
+    def __str__(self):
+        return f"CustomerDisplaySettings ({self.company_id})"

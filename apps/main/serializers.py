@@ -32,6 +32,7 @@ from apps.main.models import (
     ProductionRecord,
     SupplierPurchase,
     PosPrinterSetting,
+    MarketCustomerDisplaySettings,
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -4401,3 +4402,57 @@ class PosPrinterSettingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelS
             "updated_at",
         )
         read_only_fields = ("id", "company", "created_at", "updated_at")
+
+
+class MarketCustomerDisplaySettingsSerializer(serializers.ModelSerializer):
+    enabled = serializers.BooleanField(
+        required=False,
+        error_messages={"invalid": "Must be a valid boolean."}
+    )
+    theme = serializers.ChoiceField(
+        choices=["dark", "light"],
+        required=False,
+        error_messages={"invalid_choice": "Допустимы dark или light"}
+    )
+    welcome_text = serializers.CharField(
+        max_length=200,
+        allow_blank=True,
+        allow_null=True,
+        required=False,
+        error_messages={"max_length": "Слишком длинный текст"}
+    )
+    slides = serializers.JSONField(required=False)
+
+    class Meta:
+        model = MarketCustomerDisplaySettings
+        fields = ("enabled", "welcome_text", "theme", "slides")
+
+    def validate_welcome_text(self, value):
+        if value is None:
+            return ""
+        return value
+
+    def validate_slides(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Каждый слайд должен содержать imageUrl")
+        clean_slides = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise serializers.ValidationError("Каждый слайд должен содержать imageUrl")
+            img = item.get("imageUrl")
+            if not isinstance(img, str) or not img.strip():
+                raise serializers.ValidationError("Каждый слайд должен содержать imageUrl")
+            clean_item = dict(item)
+            clean_item["imageUrl"] = img.strip()
+            if "caption" in clean_item and clean_item["caption"] is not None:
+                clean_item["caption"] = str(clean_item["caption"])
+            clean_slides.append(clean_item)
+        return clean_slides
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if ret.get("slides") is None:
+            ret["slides"] = []
+        if ret.get("welcome_text") is None:
+            ret["welcome_text"] = ""
+        return ret
