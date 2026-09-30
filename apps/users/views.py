@@ -743,6 +743,17 @@ class BranchDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
         user = self.request.user
         if not (user.is_superuser or getattr(user, "role", None) in ("owner", "admin")):
             raise PermissionDenied("Недостаточно прав для удаления филиала.")
+
+        from apps.main.models import BranchTransfer, Product
+        has_transfers = BranchTransfer.objects.filter(
+            Q(from_branch=instance) | Q(to_branch=instance)
+        ).exists()
+        has_stock = Product.objects.filter(branch=instance, quantity__gt=0).exists()
+        if has_transfers or has_stock:
+            raise ValidationError({
+                "detail": "Нельзя удалить филиал, у которого есть перемещения или ненулевые остатки товаров."
+            })
+
         try:
             instance.delete()
         except ProgrammingError as e:

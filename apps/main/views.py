@@ -481,6 +481,37 @@ class CompanyBranchRestrictedMixin:
             branch_id = req.GET.get("branch")
 
         if branch_id:
+            if str(branch_id).strip().lower() == "main":
+                is_owner = (
+                    getattr(user, "is_superuser", False)
+                    or bool(getattr(user, "owned_company", None))
+                    or getattr(user, "is_admin", False)
+                    or getattr(user, "role", None) in ("owner", "admin", "OWNER", "ADMIN", "Владелец", "Администратор")
+                )
+                if not is_owner:
+                    allowed_branches = set()
+                    branch_ids = getattr(user, "branch_ids", None)
+                    if isinstance(branch_ids, (list, tuple)):
+                        allowed_branches.update(str(x) for x in branch_ids)
+                    if hasattr(user, "branch_memberships"):
+                        allowed_branches.update(
+                            str(x) for x in user.branch_memberships.values_list("branch_id", flat=True)
+                        )
+                    if hasattr(user, "branches"):
+                        allowed_branches.update(
+                            str(x) for x in user.branches.values_list("id", flat=True)
+                        )
+                    if getattr(user, "branch_id", None):
+                        allowed_branches.add(str(user.branch_id))
+
+                    if allowed_branches:
+                        raise PermissionDenied("У вас нет доступа к главному складу.")
+
+                setattr(req, "branch", None)
+                setattr(req, "_cached_auto_branch", None)
+                setattr(req, "_branch_main", True)
+                return None
+
             try:
                 UUID(str(branch_id))
             except (ValueError, TypeError, AttributeError):
@@ -797,10 +828,15 @@ def _filter_products_company_only(view, qs):
 
     branch = view._auto_branch()
     req = view._request()
-    branch_param = req.query_params.get("branch") if (req and hasattr(req, "query_params")) else None
+    qp = getattr(req, "query_params", None)
+    if qp is None and req and hasattr(req, "GET"):
+        qp = req.GET
+    branch_param = qp.get("branch") if qp else None
 
     if branch_param:
-        if branch is not None:
+        if str(branch_param).strip().lower() == "main":
+            qs = qs.filter(branch__isnull=True)
+        elif branch is not None:
             if view._include_global():
                 qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
             else:
@@ -1021,10 +1057,17 @@ def _cashflows_by_product_map(products):
     return {pid: serialize_auto_cashflows(items) for pid, items in grouped.items()}
 
 
+class ProductListPageNumberPagination(PageNumberPagination):
+    page_size = 100
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
 class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = ProductSerializer
+    pagination_class = ProductListPageNumberPagination
     filter_backends = [ProductBarcodeAwareSearchFilter, filters.OrderingFilter]
-    search_fields = ["name", "barcode", "alternate_barcodes__barcode", "alternate_barcodes__name"]
+    search_fields = ["name", "barcode", "article", "alternate_barcodes__barcode", "alternate_barcodes__name"]
     ordering_fields = ["created_at", "updated_at", "price"]
     # По умолчанию — по монотонному seq: детерминированный порядок «сначала новые»
     # без переупорядочивания строк с одинаковым created_at (fallback ниже — тоже -seq).

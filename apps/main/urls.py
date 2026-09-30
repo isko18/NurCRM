@@ -58,6 +58,11 @@ from apps.main.inventory_views import (
     ProductInventorySessionApplyAPIView,
     ProductInventorySessionCancelAPIView,
 )
+from apps.main.branch_transfers_views import (
+    BranchTransferListCreateAPIView,
+    BranchTransferDetailAPIView,
+    BranchTransferCancelAPIView,
+)
 from apps.main.production_salary_views import (
     ProductionRateListAPIView,
     ProductionRateDetailAPIView,
@@ -289,6 +294,9 @@ urlpatterns = [
     path("products/<uuid:pk>/variants/<uuid:vid>/", ProductVariantDetailAPIView.as_view(), name="product-variant-detail"),
     path("products/<uuid:pk>/stocks/", ProductStocksAPIView.as_view(), name="product-stocks"),
     path("stock-transfers/", StockTransferListCreateAPIView.as_view(), name="stock-transfers"),
+    path("branch-transfers/", BranchTransferListCreateAPIView.as_view(), name="branch-transfers-list-create"),
+    path("branch-transfers/<uuid:pk>/", BranchTransferDetailAPIView.as_view(), name="branch-transfers-detail"),
+    path("branch-transfers/<uuid:pk>/cancel/", BranchTransferCancelAPIView.as_view(), name="branch-transfers-cancel"),
     path("appointments/", AppointmentListCreateAPIView.as_view(), name="market-appointments"),
     path("appointments/<uuid:pk>/", AppointmentDetailAPIView.as_view(), name="market-appointment-detail"),
     path("appointments/<uuid:pk>/to-sale/", AppointmentToSaleAPIView.as_view(), name="market-appointment-to-sale"),

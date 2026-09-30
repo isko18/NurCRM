@@ -403,9 +403,9 @@ class CashShift(models.Model):
         )
 
         Sale = self.sales.model
-        # Продажи смены — оплаченные и частично возвращённые: у последних total и строки
-        # оплат уже уменьшены на возврат, остаток — это продажа (11-shift-returns-reporting).
-        sold_statuses = [Sale.Status.PAID, Sale.Status.PARTIALLY_RETURNED]
+        # Продажи смены — оплаченные, частично возвращённые и продажи в долг (Rule 2.2)
+        sold_statuses = [Sale.Status.PAID, Sale.Status.PARTIALLY_RETURNED, Sale.Status.DEBT]
+        revenue_statuses = [Sale.Status.PAID, Sale.Status.PARTIALLY_RETURNED]
         sales_qs = Sale.objects.filter(shift_id=self.id, status__in=sold_statuses)
 
         from apps.main.models import SaleItem, Product, SalePayment
@@ -414,7 +414,7 @@ class CashShift(models.Model):
         service_sales = (
             SaleItem.objects.filter(
                 sale__shift_id=self.id,
-                sale__status__in=sold_statuses,
+                sale__status__in=revenue_statuses,
                 product__kind=Product.Kind.SERVICE,
             ).aggregate(
                 total=Sum(
@@ -434,7 +434,7 @@ class CashShift(models.Model):
 
         pay_agg = SalePayment.objects.filter(
             sale__shift_id=self.id,
-            sale__status__in=sold_statuses,
+            sale__status__in=revenue_statuses,
         ).aggregate(
             cash_sum=Sum(
                 "amount",
@@ -446,7 +446,7 @@ class CashShift(models.Model):
             ),
         )
 
-        legacy_qs = sales_qs.annotate(pay_cnt=Count("payments")).filter(pay_cnt=0)
+        legacy_qs = Sale.objects.filter(shift_id=self.id, status__in=revenue_statuses).annotate(pay_cnt=Count("payments")).filter(pay_cnt=0)
         legacy_agg = legacy_qs.aggregate(
             cash_sum=Sum(
                 Case(
@@ -503,8 +503,48 @@ class CashShift(models.Model):
             or z
         )
 
+        # Предоплата наличными по продажам в долг (AN-01, AN-02)
+        debt_prepayments_cash = (
+            SalePayment.objects.filter(
+                sale__shift_id=self.id,
+                sale__status=Sale.Status.DEBT,
+                method=Sale.PaymentMethod.CASH,
+            ).aggregate(s=Sum("amount"))["s"]
+            or z
+        )
+        debt_prepayments_legacy = (
+            Sale.objects.filter(
+                shift_id=self.id,
+                status=Sale.Status.DEBT,
+            )
+            .annotate(pay_cnt=Count("payments"))
+            .filter(pay_cnt=0)
+            .aggregate(
+                s=Sum(
+                    Case(
+                        When(cash_amount__gt=0, then="cash_amount"),
+                        When(cash_received__gt=0, then="cash_received"),
+                        default=Value(0),
+                        output_field=DecimalField(max_digits=12, decimal_places=2),
+                    )
+                )
+            )["s"]
+            or z
+        )
+        debt_prepayments_cash += debt_prepayments_legacy
+
+        # Оплата долга наличными в рамках смены (AN-02)
+        debt_payments_cash = (
+            flows.filter(
+                type=CashFlow.Type.INCOME,
+                source_kind=CashFlow.SourceKind.DEBT_REPAYMENT,
+                affects_shift_drawer=True,
+            ).aggregate(s=Sum("amount"))["s"]
+            or z
+        )
+
         drawer_expected_cash = (
-            (self.opening_cash or z) + drawer_cash_in + drawer_legacy_cash + non_sale_income - expense_total
+            (self.opening_cash or z) + drawer_cash_in + drawer_legacy_cash + debt_prepayments_cash + non_sale_income - expense_total
         )
         expected_cash = drawer_expected_cash
 
@@ -528,16 +568,18 @@ class CashShift(models.Model):
         )
 
         totals = {
-            "income_total": income_total,
+            "income_total": income_total + debt_prepayments_cash,
             "expense_total": expense_total,
             "sales_count": sales_count,
             "sales_total": sales_total,
-            "cash_sales_total": cash_sales_total,
+            "cash_sales_total": cash_sales_total + debt_prepayments_cash,
             "noncash_sales_total": noncash_sales_total,
             "expected_cash": expected_cash,
             "drawer_expected_cash": drawer_expected_cash,
             "ledger_expected_cash": drawer_expected_cash,
             "non_drawer_expenses_total": non_drawer_expenses_total,
+            "debt_prepayments_cash": debt_prepayments_cash,
+            "debt_payments_cash": debt_payments_cash,
         }
 
         # Приводим деньги к 2 знакам. Произведение numeric(12,2) * numeric(…,3)

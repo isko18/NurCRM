@@ -36,6 +36,8 @@ def checkout_cart(
     payment_method=None,
     cash_received=None,
     payments=None,
+    cash_amount=None,
+    card_amount=None,
     client=None,
     consultant=None,
     consultant_commission_enabled: bool = False,
@@ -152,6 +154,7 @@ def checkout_cart(
                 branch=branch,
                 sale=sale,
                 product=p,
+                is_custom=bool(p is None),
                 name_snapshot=name_snap,
                 barcode_snapshot=barcode_snap,
                 unit_price=it.unit_price,
@@ -239,22 +242,23 @@ def checkout_cart(
         sale.save(update_fields=["client"])
 
     if payments:
-        sale.mark_paid(payments=payments, cash_received=cash_received)
+        sale.mark_paid(payments=payments, cash_received=cash_received, cash_amount=cash_amount, card_amount=card_amount)
     elif payment_method is not None:
-        sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
+        sale.mark_paid(payment_method=payment_method, cash_received=cash_received, cash_amount=cash_amount, card_amount=card_amount)
 
     # Автоматическое создание долговой сделки (ClientDeal) при продаже в долг
     debt_amt = Decimal("0.00")
     if sale.payment_method == Sale.PaymentMethod.DEBT:
-        debt_amt = sale.total or Decimal("0.00")
+        debt_amt = sale.debt_initial or (sale.total - sale.paid_now)
     elif payments:
         debt_amt = sum(
             (Decimal(str(p.get("amount") or 0)) for p in payments if p.get("method") == Sale.PaymentMethod.DEBT),
             Decimal("0.00"),
         )
     if sale.client_id and debt_amt > Decimal("0.00"):
-        from apps.main.models import ClientDeal
+        from apps.main.models import ClientDeal, DealInstallment
         from datetime import timedelta
+        prepay_val = sale.paid_now or getattr(sale, "cash_received", Decimal("0.00")) or Decimal("0.00")
         if not ClientDeal.objects.filter(sale=sale).exists():
             unlinked_deal = (
                 ClientDeal.objects.filter(
@@ -270,24 +274,32 @@ def checkout_cart(
             if unlinked_deal and (abs((unlinked_deal.amount or Decimal("0.00")) - debt_amt) <= Decimal("0.01") or unlinked_deal.amount == Decimal("0.00")):
                 unlinked_deal.sale = sale
                 if not unlinked_deal.amount or unlinked_deal.amount == Decimal("0.00"):
-                    unlinked_deal.amount = debt_amt
-                prepay_val = getattr(sale, "cash_received", Decimal("0.00")) or Decimal("0.00")
-                if unlinked_deal and prepay_val > Decimal("0.00") and unlinked_deal.prepayment == Decimal("0.00"):
+                    unlinked_deal.amount = sale.total
+                if prepay_val > Decimal("0.00") and unlinked_deal.prepayment == Decimal("0.00"):
                     unlinked_deal.prepayment = prepay_val
                 unlinked_deal.save(update_fields=["sale", "amount", "prepayment", "updated_at"])
+                deal_obj = unlinked_deal
             else:
-                prepay_val = getattr(sale, "cash_received", Decimal("0.00")) or Decimal("0.00")
-                ClientDeal.objects.create(
+                deal_obj = ClientDeal.objects.create(
                     company=sale.company,
                     branch=sale.branch,
                     client=sale.client,
                     sale=sale,
-                    title=f"Продажа в долг №{sale.id}",
+                    title=f"Продажа в долг №{sale.doc_number or sale.id}",
                     kind=ClientDeal.Kind.DEBT,
-                    amount=debt_amt,
+                    amount=sale.total,
                     prepayment=prepay_val,
                     debt_days=30,
                 )
+            if not DealInstallment.objects.filter(deal=deal_obj).exists():
+                rem_inst = max(Decimal("0.00"), sale.total - prepay_val)
+                if rem_inst > 0:
+                    DealInstallment.objects.create(
+                        deal=deal_obj,
+                        amount=rem_inst,
+                        due_date=timezone.localdate() + timedelta(days=30),
+                        paid_amount=Decimal("0.00"),
+                    )
 
     try:
         from apps.main.cache_utils import invalidate_cache_pattern

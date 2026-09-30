@@ -600,25 +600,30 @@ def _pg_advisory_xact_lock_company(company_id):
         cur.execute("SELECT pg_advisory_xact_lock(%s::bigint);", [key])
 
 
-def assert_barcode_unique_in_company(company_id, barcode, *, exclude_product_id=None):
-    """Перекрёстная уникальность штрихкода в рамках компании.
+def assert_barcode_unique_in_company(company_id, barcode, *, exclude_product_id=None, branch_id=None):
+    """Перекрёстная уникальность штрихкода в рамках компании и филиала/склада.
 
-    Значение не должно принадлежать ДРУГОМУ товару ни как основной `Product.barcode`,
-    ни как дополнительный `ProductAlternateBarcode.barcode`. Одним DB-constraint это не
-    покрыть (разные таблицы), поэтому проверяем в save() — так закрыты все пути записи
-    (ручное создание, импорт из Excel, POS, админка).
+    Значение не должно принадлежать ДРУГОМУ товару того же филиала (или главного склада)
+    ни как основной `Product.barcode`, ни как дополнительный `ProductAlternateBarcode.barcode`.
     """
     bc = (barcode or "").strip()
     if not bc or not company_id:
         return
     prod_qs = Product.objects.filter(company_id=company_id, barcode=bc)
     alt_qs = ProductAlternateBarcode.objects.filter(company_id=company_id, barcode=bc)
+    if branch_id:
+        prod_qs = prod_qs.filter(branch_id=branch_id)
+        alt_qs = alt_qs.filter(product__branch_id=branch_id)
+    else:
+        prod_qs = prod_qs.filter(branch__isnull=True)
+        alt_qs = alt_qs.filter(product__branch__isnull=True)
+
     if exclude_product_id:
         prod_qs = prod_qs.exclude(pk=exclude_product_id)
         alt_qs = alt_qs.exclude(product_id=exclude_product_id)
     if prod_qs.exists() or alt_qs.exists():
         raise ValidationError(
-            {"barcode": f"Штрихкод «{bc}» уже используется другим товаром в этой компании."}
+            {"barcode": f"Штрихкод «{bc}» уже используется другим товаром в этом филиале/складе."}
         )
 
 
@@ -647,6 +652,7 @@ class Product(models.Model):
         PENDING = "pending", "Ожидание"
         ACCEPTED = "accepted", "Принят"
         REJECTED = "rejected", "Отказ"
+        ARCHIVED = "archived", "В архиве"
     
     class Kind(models.TextChoices):
         PRODUCT = "product", "Товар"
@@ -927,17 +933,24 @@ class Product(models.Model):
             models.Index(fields=["company", "plu"]),
             # Оптимизация для сканирования по штрих-коду
             models.Index(fields=["company", "barcode"], name="idx_product_company_barcode"),
+            models.Index(fields=["company", "branch", "barcode"], name="idx_prod_co_br_barcode"),
             # Курсорная/стабильная пагинация «сначала новые» внутри компании.
             models.Index(fields=["company", "seq"], name="idx_product_company_seq"),
             models.Index(fields=["company", "date"], name="idx_product_company_date"),
             models.Index(fields=["company", "client"], name="idx_product_company_client"),
         ]
         constraints = [
-            # ✅ штрихкод уникален в рамках компании, только если задан и не пустой
+            # ✅ штрихкод уникален в рамках главного склада компании
             models.UniqueConstraint(
                 fields=("company", "barcode"),
-                condition=Q(barcode__isnull=False) & ~Q(barcode=""),
-                name="uq_company_barcode_not_empty",
+                condition=Q(barcode__isnull=False) & ~Q(barcode="") & Q(branch__isnull=True),
+                name="uq_company_main_barcode_not_empty",
+            ),
+            # ✅ штрихкод уникален в рамках конкретного филиала компании
+            models.UniqueConstraint(
+                fields=("company", "branch", "barcode"),
+                condition=Q(barcode__isnull=False) & ~Q(barcode="") & Q(branch__isnull=False),
+                name="uq_company_branch_barcode_not_empty",
             ),
             # код товара уникален в рамках компании, если указан и не пустой
             models.UniqueConstraint(
@@ -961,6 +974,24 @@ class Product(models.Model):
 
     def __str__(self):
         return self.name
+
+    def delete(self, *args, **kwargs):
+        # AN-10 / Rule 2.4: Товар не удаляется физически, если на него есть продажи, возвраты или движения:
+        # переводится в archived, исторические строки сохраняют product_id.
+        has_history = self.sale_items.exists()
+        if not has_history:
+            ret_rel = getattr(self, "return_items", None)
+            if ret_rel and ret_rel.exists():
+                has_history = True
+        if not has_history:
+            sm_rel = getattr(self, "stock_movements", None)
+            if sm_rel and sm_rel.exists():
+                has_history = True
+        if has_history:
+            self.status = self.Status.ARCHIVED
+            self.save(update_fields=["status"])
+            return 1, {self._meta.label: 1}
+        return super().delete(*args, **kwargs)
 
     # ---------- Postgres advisory lock ----------
     def _pg_lock_company(self):
@@ -1085,7 +1116,7 @@ class Product(models.Model):
             # редактирование легаси-товаров с уже существующей коллизией.
             if self.barcode and self.barcode != old_barcode:
                 assert_barcode_unique_in_company(
-                    self.company_id, self.barcode, exclude_product_id=self.pk
+                    self.company_id, self.barcode, exclude_product_id=self.pk, branch_id=self.branch_id
                 )
             super().save(*args, **kwargs)
             
@@ -1264,10 +1295,14 @@ class ProductAlternateBarcode(models.Model):
             ).values_list("company_id", flat=True).first()
         with transaction.atomic():
             _pg_advisory_xact_lock_company(self.company_id)
-            # Перекрёстная уникальность: доп. ШК не должен совпасть с основным/доп.
-            # кодом ДРУГОГО товара (свой товар исключаем).
+            product_branch_id = None
+            if self.product_id:
+                p = getattr(self, "product", None)
+                product_branch_id = getattr(p, "branch_id", None) or Product.objects.filter(
+                    pk=self.product_id
+                ).values_list("branch_id", flat=True).first()
             assert_barcode_unique_in_company(
-                self.company_id, self.barcode, exclude_product_id=self.product_id
+                self.company_id, self.barcode, exclude_product_id=self.product_id, branch_id=product_branch_id
             )
             super().save(*args, **kwargs)
         from django.core.cache import cache
@@ -2311,6 +2346,33 @@ class Sale(models.Model):
     payment_method = models.CharField(max_length=16, choices=PaymentMethod.choices, default=PaymentMethod.CASH)
     cash_received = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
 
+    # AN-01: Продажа в долг и детализация оплат
+    paid_now = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"), db_default=Decimal("0.00"),
+        verbose_name="Внесено сразу",
+    )
+    cash_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"), db_default=Decimal("0.00"),
+        verbose_name="Наличными",
+    )
+    card_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"), db_default=Decimal("0.00"),
+        verbose_name="Безналичными / картой",
+    )
+    debt_initial = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"), db_default=Decimal("0.00"),
+        verbose_name="Долг при оформлении",
+    )
+    debt_remaining = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal("0.00"), db_default=Decimal("0.00"),
+        verbose_name="Остаток долга",
+    )
+
+    @property
+    def debt_amount(self) -> Decimal:
+        return self.debt_remaining or Decimal("0.00")
+
+
     created_at = models.DateTimeField(auto_now_add=True)
     paid_at = models.DateTimeField(null=True, blank=True)
     # BE2-10: продажа сделана кассой без связи и дослана позже; created_at/paid_at — фактическое время
@@ -2457,7 +2519,7 @@ class Sale(models.Model):
         rows = list(self.payments.all()) if hasattr(self, "payments") else []
         if rows:
             return rows
-        if self.status == self.Status.PAID and self.payment_method != self.PaymentMethod.DEBT:
+        if self.status in (self.Status.PAID, self.Status.PARTIALLY_RETURNED) and self.payment_method != self.PaymentMethod.DEBT:
             return [
                 SalePayment(
                     sale=self,
@@ -2466,6 +2528,17 @@ class Sale(models.Model):
                     amount=self.total or Decimal("0.00"),
                 )
             ]
+        if self.status == self.Status.DEBT or self.payment_method == self.PaymentMethod.DEBT:
+            lines = []
+            c_val = self.cash_amount if self.cash_amount > 0 else (self.cash_received or Decimal("0.00"))
+            if c_val > 0:
+                lines.append(SalePayment(sale=self, company_id=self.company_id, method=self.PaymentMethod.CASH, amount=c_val))
+            if (self.card_amount or Decimal("0.00")) > 0:
+                lines.append(SalePayment(sale=self, company_id=self.company_id, method=self.PaymentMethod.TRANSFER, amount=self.card_amount))
+            d_val = self.debt_initial if self.debt_initial > 0 else max(Decimal("0.00"), (self.total or Decimal("0.00")) - sum(l.amount for l in lines))
+            if d_val > 0:
+                lines.append(SalePayment(sale=self, company_id=self.company_id, method=self.PaymentMethod.DEBT, amount=d_val))
+            return lines
         return []
 
     def _emit_paid_event(self):
@@ -2495,6 +2568,8 @@ class Sale(models.Model):
         cash_received=None,
         *,
         payments=None,
+        cash_amount=None,
+        card_amount=None,
         skip_ekassa_schedule=False,
     ):
         if not self.doc_number and self.pk:
@@ -2502,9 +2577,10 @@ class Sale(models.Model):
 
             ensure_sale_doc_number(self)
 
+        sale_total = (self.total or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)
+
         if payments:
             total_paid = sum((p.get("amount") or Decimal("0.00") for p in payments), Decimal("0.00"))
-            sale_total = (self.total or Decimal("0.00")).quantize(_Q2, rounding=ROUND_HALF_UP)
             if total_paid.quantize(_Q2, rounding=ROUND_HALF_UP) != sale_total:
                 raise ValueError(
                     f"Сумма оплат ({total_paid}) не совпадает с суммой продажи ({sale_total})."
@@ -2519,6 +2595,21 @@ class Sale(models.Model):
                 (p["amount"] for p in payments if p["method"] == self.PaymentMethod.CASH),
                 Decimal("0.00"),
             )
+            card_portion = sum(
+                (p["amount"] for p in payments if p["method"] not in (self.PaymentMethod.CASH, self.PaymentMethod.DEBT)),
+                Decimal("0.00"),
+            )
+            debt_portion = sum(
+                (p["amount"] for p in payments if p["method"] == self.PaymentMethod.DEBT),
+                Decimal("0.00"),
+            )
+
+            self.cash_amount = cash_portion
+            self.card_amount = card_portion
+            self.paid_now = cash_portion + card_portion
+            self.debt_initial = debt_portion
+            self.debt_remaining = debt_portion
+
             if cash_portion > 0:
                 if cash_received is not None:
                     self.cash_received = cash_received
@@ -2529,9 +2620,17 @@ class Sale(models.Model):
             else:
                 self.cash_received = Decimal("0.00")
 
-            self.status = self.Status.PAID
-            self.paid_at = timezone.now()
-            self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
+            if debt_portion > 0:
+                self.status = self.Status.DEBT
+                self.paid_at = None
+            else:
+                self.status = self.Status.PAID
+                self.paid_at = timezone.now()
+
+            self.save(update_fields=[
+                "status", "paid_at", "payment_method", "cash_received",
+                "paid_now", "cash_amount", "card_amount", "debt_initial", "debt_remaining"
+            ])
 
             self.payments.all().delete()
             SalePayment.objects.bulk_create(
@@ -2551,34 +2650,75 @@ class Sale(models.Model):
             if self.payment_method == self.PaymentMethod.DEBT:
                 self.status = self.Status.DEBT
                 self.paid_at = None
-                if cash_received is not None:
-                    self.cash_received = cash_received
-                self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
+                c_amt = cash_amount if cash_amount is not None else (cash_received or Decimal("0.00"))
+                k_amt = card_amount or Decimal("0.00")
+                self.cash_amount = c_amt
+                self.card_amount = k_amt
+                self.cash_received = c_amt
+                self.paid_now = c_amt + k_amt
+                self.debt_initial = max(Decimal("0.00"), sale_total - self.paid_now)
+                self.debt_remaining = self.debt_initial
+                self.save(update_fields=[
+                    "status", "paid_at", "payment_method", "cash_received",
+                    "paid_now", "cash_amount", "card_amount", "debt_initial", "debt_remaining"
+                ])
+
+                self.payments.all().delete()
+                lines = []
+                if c_amt > 0:
+                    lines.append(SalePayment(sale=self, company_id=self.company_id, method=self.PaymentMethod.CASH, amount=c_amt))
+                if k_amt > 0:
+                    lines.append(SalePayment(sale=self, company_id=self.company_id, method=self.PaymentMethod.TRANSFER, amount=k_amt))
+                if self.debt_initial > 0:
+                    lines.append(SalePayment(sale=self, company_id=self.company_id, method=self.PaymentMethod.DEBT, amount=self.debt_initial))
+                if lines:
+                    SalePayment.objects.bulk_create(lines)
                 return
 
-            if cash_received is not None:
-                if self.payment_method == self.PaymentMethod.CASH:
+            self.paid_now = sale_total
+            if self.payment_method == self.PaymentMethod.CASH:
+                self.cash_amount = sale_total
+                self.card_amount = Decimal("0.00")
+                if cash_received is not None:
                     self.cash_received = cash_received
                 else:
-                    self.cash_received = Decimal("0.00")
-            elif self.payment_method != self.PaymentMethod.CASH:
+                    self.cash_received = sale_total
+            else:
+                self.cash_amount = Decimal("0.00")
+                self.card_amount = sale_total
                 self.cash_received = Decimal("0.00")
 
+            self.debt_initial = Decimal("0.00")
+            self.debt_remaining = Decimal("0.00")
             self.status = self.Status.PAID
             self.paid_at = timezone.now()
-            self.save(update_fields=["status", "paid_at", "payment_method", "cash_received"])
+            self.save(update_fields=[
+                "status", "paid_at", "payment_method", "cash_received",
+                "paid_now", "cash_amount", "card_amount", "debt_initial", "debt_remaining"
+            ])
 
             self.payments.all().delete()
             SalePayment.objects.create(
                 sale=self,
                 company_id=self.company_id,
                 method=self.payment_method,
-                amount=self.total or Decimal("0.00"),
+                amount=sale_total,
             )
         else:
+            self.paid_now = sale_total
+            if self.payment_method == self.PaymentMethod.CASH:
+                self.cash_amount = sale_total
+                self.card_amount = Decimal("0.00")
+            else:
+                self.cash_amount = Decimal("0.00")
+                self.card_amount = sale_total
+            self.debt_initial = Decimal("0.00")
+            self.debt_remaining = Decimal("0.00")
             self.status = self.Status.PAID
             self.paid_at = timezone.now()
-            self.save(update_fields=["status", "paid_at"])
+            self.save(update_fields=[
+                "status", "paid_at", "paid_now", "cash_amount", "card_amount", "debt_initial", "debt_remaining"
+            ])
 
         self._emit_paid_event()
 
@@ -2776,6 +2916,11 @@ class SaleItem(models.Model):
         default=False,
         verbose_name="Цена изменена вручную",
     )
+    is_custom = models.BooleanField(
+        default=False,
+        verbose_name="Доп. услуга / произвольная позиция",
+        help_text="Флаг для позиций без привязки к товару из каталога (AN-10).",
+    )
 
     sale_package = models.ForeignKey(
         "main.ProductPackage",
@@ -2840,14 +2985,19 @@ class SaleItem(models.Model):
         if self.quantity is None or Decimal(str(self.quantity)) <= 0:
             raise ValidationError({"quantity": "Количество должно быть > 0."})
 
-        if not self.product_id and not (self.name_snapshot or "").strip():
-            raise ValidationError({"name_snapshot": "Укажите название позиции (если товар не выбран)."})
+        if not self.product_id:
+            self.is_custom = True
+            if not (self.name_snapshot or "").strip():
+                raise ValidationError({"name_snapshot": "Укажите название позиции (если товар не выбран)."})
 
         # себестоимость не может быть отрицательной
         if self.purchase_price_snapshot is not None and Decimal(str(self.purchase_price_snapshot)) < 0:
             raise ValidationError({"purchase_price_snapshot": "Себестоимость не может быть отрицательной."})
 
     def save(self, *args, **kwargs):
+        if not self.product_id:
+            self.is_custom = True
+
         if self.sale_id:
             self.company_id = self.sale.company_id
             self.branch_id = self.sale.branch_id
@@ -2877,6 +3027,7 @@ class SaleItem(models.Model):
                     else:
                         self.purchase_price_snapshot = _money(pp)
             else:
+                self.is_custom = True
                 # если товар не выбран — себестоимость неизвестна
                 if self.purchase_price_snapshot is None:
                     self.purchase_price_snapshot = Decimal("0.00")
@@ -2897,6 +3048,14 @@ class SaleItem(models.Model):
         base = Decimal(self.unit_price or 0) * Decimal(self.quantity or 0)
         disc = Decimal(getattr(self, "line_discount", None) or 0)
         return (base - disc).quantize(Decimal("0.01"))
+
+    @property
+    def amount(self) -> Decimal:
+        return self.line_total
+
+    @property
+    def cost_price(self) -> Decimal:
+        return self.purchase_price_snapshot or Decimal("0.00")
 
     @property
     def line_cogs(self) -> Decimal:
@@ -6500,6 +6659,136 @@ class MarketStockTransferItem(models.Model):
     product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="+")
     variant = models.ForeignKey(ProductVariant, on_delete=models.PROTECT, null=True, blank=True, related_name="+")
     quantity = models.DecimalField(max_digits=12, decimal_places=3)
+
+
+class BranchTransfer(models.Model):
+    """
+    Перемещение товаров между складами / филиалами с накладной (ТОРГ-13).
+    Склад-источник или склад-получатель null означает главный склад компании.
+    """
+    class Status(models.TextChoices):
+        COMPLETED = "completed", "Проведено"
+        CANCELLED = "cancelled", "Отменено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="branch_transfers",
+        verbose_name="Компания",
+    )
+    number = models.CharField("Номер накладной", max_length=32)
+    status = models.CharField(
+        "Статус",
+        max_length=16,
+        choices=Status.choices,
+        default=Status.COMPLETED,
+        db_index=True,
+    )
+    date = models.DateField("Дата документа", db_index=True)
+    from_branch = models.ForeignKey(
+        Branch,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="transfers_outgoing",
+        verbose_name="Склад-отправитель",
+    )
+    to_branch = models.ForeignKey(
+        Branch,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="transfers_incoming",
+        verbose_name="Склад-получатель",
+    )
+    comment = models.CharField("Комментарий", max_length=500, blank=True, default="")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Создал",
+    )
+    created_at = models.DateTimeField("Создано", auto_now_add=True, db_index=True)
+    cancelled_at = models.DateTimeField("Отменено в", null=True, blank=True)
+    cancelled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        verbose_name="Отменил",
+    )
+    cancel_reason = models.CharField("Причина отмены", max_length=500, blank=True, default="")
+    total_quantity = models.DecimalField("Всего количество", max_digits=14, decimal_places=3, default=Decimal("0"))
+    total_amount = models.DecimalField("Общая сумма", max_digits=14, decimal_places=2, default=Decimal("0"))
+    idempotency_key = models.CharField(max_length=128, null=True, blank=True, db_index=True)
+
+    class Meta:
+        verbose_name = "Перемещение между филиалами"
+        verbose_name_plural = "Перемещения между филиалами"
+        ordering = ["-date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["company", "number"], name="uniq_transfer_number"),
+            models.UniqueConstraint(
+                fields=["company", "idempotency_key"],
+                condition=models.Q(idempotency_key__isnull=False) & ~models.Q(idempotency_key=""),
+                name="uniq_transfer_company_idempotency_key",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "-date", "-created_at"]),
+            models.Index(fields=["company", "from_branch"]),
+            models.Index(fields=["company", "to_branch"]),
+            models.Index(fields=["company", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.number} ({self.get_status_display()})"
+
+
+class BranchTransferItem(models.Model):
+    """
+    Позиция накладной перемещения ТОРГ-13 (снимок данных товара на момент проведения).
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    transfer = models.ForeignKey(
+        BranchTransfer,
+        related_name="items",
+        on_delete=models.CASCADE,
+        verbose_name="Перемещение",
+    )
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.PROTECT,
+        related_name="transfer_items_as_source",
+        verbose_name="Товар-источник",
+    )
+    dest_product = models.ForeignKey(
+        Product,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="transfer_items_as_dest",
+        verbose_name="Товар-получатель",
+    )
+    name = models.CharField("Название товара", max_length=255)
+    article = models.CharField("Артикул", max_length=64, blank=True, default="")
+    barcode = models.CharField("Штрихкод", max_length=64, blank=True, default="")
+    unit = models.CharField("Единица измерения", max_length=32, blank=True, default="шт")
+    quantity = models.DecimalField("Количество", max_digits=14, decimal_places=3)
+    price = models.DecimalField("Учётная цена", max_digits=14, decimal_places=2)
+    amount = models.DecimalField("Сумма", max_digits=14, decimal_places=2)
+
+    class Meta:
+        verbose_name = "Позиция перемещения"
+        verbose_name_plural = "Позиции перемещения"
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return f"{self.name} x {self.quantity}"
 
 
 class MarketAppointment(models.Model):

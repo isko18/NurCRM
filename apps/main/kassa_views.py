@@ -124,6 +124,9 @@ class QuickCheckoutSerializer(serializers.Serializer):
     offline_created_at = serializers.DateTimeField(required=False, allow_null=True)
 
     def validate(self, attrs):
+        items = attrs.get("items")
+        if not items:
+            raise serializers.ValidationError({"code": "empty_sale", "detail": "В чеке нет позиций"})
         if attrs.get("offline"):
             at = attrs.get("offline_created_at")
             if at is None:
@@ -148,6 +151,12 @@ def _quick_result(sale: Sale) -> dict:
         "payment_method": sale.payment_method,
         "cash_received": str(money(sale.cash_received or ZERO)),
         "change": str(money(sale.change or ZERO)),
+        "paid_now": str(money(getattr(sale, "paid_now", ZERO) or ZERO)),
+        "cash_amount": str(money(getattr(sale, "cash_amount", ZERO) or ZERO)),
+        "card_amount": str(money(getattr(sale, "card_amount", ZERO) or ZERO)),
+        "debt_initial": str(money(getattr(sale, "debt_initial", ZERO) or ZERO)),
+        "debt_remaining": str(money(getattr(sale, "debt_remaining", ZERO) or ZERO)),
+        "debt_amount": str(money(getattr(sale, "debt_remaining", ZERO) or ZERO)),
         "shift": str(sale.shift_id) if sale.shift_id else None,
         "client": str(sale.client_id) if sale.client_id else None,
         "items": [_quick_item(it) for it in sale.items.all().order_by("id")],
@@ -161,15 +170,19 @@ def _quick_item(it) -> dict:
     return {
         "id": str(it.id),
         "product": str(it.product_id) if it.product_id else None,
+        "is_custom": getattr(it, "is_custom", False) or (it.product_id is None),
         "variant": str(it.variant_id) if it.variant_id else None,
         "name": it.name_snapshot,
         "qty": str(it.quantity),
+        "quantity": str(it.quantity),
         "price": str(money(it.unit_price or ZERO)),
         "discount": str(discount),
         "discount_source": it.discount_source,
         "promotion_id": str(it.promotion_id) if it.promotion_id else None,
         "manual_discount": str(money(it.manual_discount or ZERO)),
         "manual_discount_ignored": it.discount_source == "promotion" and (it.manual_discount or ZERO) > 0,
+        "amount": str(money(base - discount)),
+        "cost_price": str(money(getattr(it, "purchase_price_snapshot", ZERO) or ZERO)),
         "total": str(money(base - discount)),
     }
 
@@ -472,6 +485,13 @@ class PosQuickCheckoutAPIView(APIView):
         elif pay["method"] == Sale.PaymentMethod.CASH:
             cart.recalc()
             out["cash_received"] = pay["received"] if pay.get("received") is not None else cart.total
+        elif pay["method"] == Sale.PaymentMethod.DEBT:
+            out["cash_amount"] = pay.get("cash_amount")
+            out["card_amount"] = pay.get("card_amount")
+            if pay.get("received") is not None:
+                out["cash_received"] = pay["received"]
+            if out.get("cash_amount") is None and out.get("cash_received") is not None:
+                out["cash_amount"] = out["cash_received"]
         elif pay.get("received") is not None:
             # для долга received — предоплата наличными
             out["cash_received"] = pay["received"]
@@ -778,15 +798,29 @@ class ClientPayDebtAPIView(APIView):
 # ======================================================================
 
 def _return_item(line: dict, ret) -> dict:
-    """Строка возврата; у возвратов до BE2-01 цены и скидки в строке нет — отдаём null."""
-    total = line.get("total") or line.get("amount")
+    """Строка возврата (AN-08)."""
+    total = line.get("amount") or line.get("total")
+    qty = line.get("quantity") or line.get("qty")
+    price = line.get("price")
+    if price is None and total is not None and qty:
+        try:
+            qd = Decimal(str(qty))
+            if qd > 0:
+                price = str((Decimal(str(total)) / qd).quantize(Decimal("0.01")))
+        except Exception:
+            price = None
+    prod_id = line.get("product") or line.get("product_id")
     return {
+        "return_item_id": line.get("return_item_id") or line.get("id"),
+        "return_id": str(ret.id),
         "sale_item": line.get("sale_item"),
-        "product": line.get("product"),
+        "product": prod_id,
+        "product_id": prod_id,
         "variant": line.get("variant"),
         "name": line.get("name"),
-        "qty": line.get("qty"),
-        "price": line.get("price"),
+        "qty": qty,
+        "quantity": qty,
+        "price": price,
         "discount": line.get("discount"),
         "total": total,
         "amount": total,
@@ -798,6 +832,7 @@ def _return_item(line: dict, ret) -> dict:
 class SaleReturnListAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     GET /api/main/pos/returns/?date_from=2026-09-01&date_to=2026-09-28&shift=…&sale=…
+    AN-08: каждый возврат содержит items с позициями, original_sale_id, employee_id, customer_id, warehouse_id.
     """
 
     permission_classes = [permissions.IsAuthenticated]
@@ -806,7 +841,11 @@ class SaleReturnListAPIView(CompanyBranchRestrictedMixin, APIView):
         from django.utils.dateparse import parse_date
 
         company = _company(request)
-        qs = SaleReturn.objects.filter(company=company).select_related("sale", "user")
+        qs = (
+            SaleReturn.objects.filter(company=company)
+            .select_related("sale", "user", "sale__client")
+            .prefetch_related("sale__items__product")
+        )
         branch = self._auto_branch()
         if branch is not None:
             qs = qs.filter(sale__branch=branch)
@@ -828,13 +867,34 @@ class SaleReturnListAPIView(CompanyBranchRestrictedMixin, APIView):
         out = []
         for r in qs:
             items = r.returned_items or []
+            if not items and r.sale:
+                # AN-08: для старых возвратов позиции восстанавливаются из исходной продажи
+                items = [
+                    {
+                        "return_item_id": str(it.id),
+                        "sale_item": str(it.id),
+                        "product": str(it.product_id) if it.product_id else None,
+                        "product_id": str(it.product_id) if it.product_id else None,
+                        "name": it.name_snapshot or (it.product.name if it.product else "Товар"),
+                        "quantity": str(it.quantity),
+                        "qty": str(it.quantity),
+                        "price": str(it.unit_price),
+                        "amount": str(it.amount),
+                        "total": str(it.amount),
+                    }
+                    for it in r.sale.items.all()
+                ]
             out.append({
                 "id": str(r.id),
+                "original_sale_id": str(r.sale_id),
                 "sale": str(r.sale_id),
-                "sale_number": r.sale.doc_number,
+                "sale_number": r.sale.doc_number if r.sale else None,
+                "warehouse_id": str(r.sale.branch_id) if (r.sale and r.sale.branch_id) else None,
+                "employee_id": str(r.user_id) if r.user_id else None,
+                "customer_id": str(r.sale.client_id) if (r.sale and r.sale.client_id) else None,
                 "amount": str(money(r.returned_amount or ZERO)),
                 "total": str(money(r.returned_amount or ZERO)),
-                "refund_method": r.refund_method or r.sale.payment_method,
+                "refund_method": r.refund_method or (r.sale.payment_method if r.sale else None),
                 "is_full": r.is_full,
                 "is_defect": r.is_defect,
                 "items": [_return_item(i, r) for i in items],
@@ -844,3 +904,71 @@ class SaleReturnListAPIView(CompanyBranchRestrictedMixin, APIView):
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             })
         return Response(out)
+
+
+class ClientDirectDebtAPIView(CompanyBranchRestrictedMixin, APIView):
+    """
+    POST /api/main/clients/{id}/debts/
+    { "amount": "7000.00", "comment": "...", "due_date": "2026-10-30" }
+    AN-03: создание прямого документа «долг» клиента без оформления фиктивной продажи.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, client_id, *args, **kwargs):
+        from apps.main.models import Client, ClientDeal, DealInstallment
+        from django.utils.dateparse import parse_date
+
+        company = _company(request)
+        branch = self._auto_branch()
+
+        client_qs = Client.objects.filter(company=company)
+        client = get_object_or_404(client_qs, id=client_id)
+
+        raw_amount = request.data.get("amount")
+        if raw_amount is None:
+            raise ValidationError({"amount": "Укажите сумму долга."})
+        try:
+            amount = money(Decimal(str(raw_amount)))
+            if amount <= 0:
+                raise ValidationError({"amount": "Сумма долга должна быть больше 0."})
+        except Exception:
+            raise ValidationError({"amount": "Некорректная сумма долга."})
+
+        comment = (request.data.get("comment") or "").strip()
+        due_date_raw = request.data.get("due_date")
+        due_date = parse_date(due_date_raw) if due_date_raw else timezone.localdate()
+
+        with transaction.atomic():
+            deal = ClientDeal.objects.create(
+                company=company,
+                branch=branch or client.branch,
+                client=client,
+                kind=ClientDeal.Kind.DEBT,
+                amount=amount,
+                prepayment=Decimal("0.00"),
+                note=comment,
+                title=comment or f"Прямой долг: {amount}",
+            )
+            DealInstallment.objects.create(
+                company=company,
+                branch=branch or client.branch,
+                deal=deal,
+                order=1,
+                amount=amount,
+                due_date=due_date,
+            )
+
+        return Response(
+            {
+                "id": str(deal.id),
+                "client": str(client.id),
+                "client_name": client.name,
+                "amount": str(amount),
+                "prepayment": "0.00",
+                "debt_remaining": str(amount),
+                "comment": comment,
+                "due_date": due_date.isoformat() if due_date else None,
+                "created_at": deal.created_at.isoformat(),
+            },
+            status=status.HTTP_201_CREATED,
+        )

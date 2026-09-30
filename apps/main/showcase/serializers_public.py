@@ -53,6 +53,7 @@ class PublicProductSerializer(serializers.ModelSerializer):
             "description",
             "unit",
             "is_weight",
+            "quantity",
             "stock",
             "is_new",
             "country",

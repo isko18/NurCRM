@@ -2775,6 +2775,8 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
             consultant_obj = ser.validated_data.get("consultant_obj")
             consultant_comm_enabled = ser.validated_data.get("consultant_commission_enabled", False)
             consultant_comm_pct = ser.validated_data.get("consultant_commission_percent")
+            cash_amount = ser.validated_data.get("cash_amount")
+            card_amount = ser.validated_data.get("card_amount")
 
             try:
                 sale = checkout_cart(
@@ -2783,6 +2785,8 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                     payments=payments,
                     payment_method=None if payments else payment_method,
                     cash_received=cash_received,
+                    cash_amount=cash_amount,
+                    card_amount=card_amount,
                     client=client_obj,
                     consultant=consultant_obj,
                     consultant_commission_enabled=consultant_comm_enabled,
@@ -2824,6 +2828,12 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                 "payment_method": sale.payment_method,
                 "cash_received": fmt_money(sale.cash_received),
                 "change": fmt_money(sale.change),
+                "paid_now": fmt_money(sale.paid_now),
+                "cash_amount": fmt_money(sale.cash_amount),
+                "card_amount": fmt_money(sale.card_amount),
+                "debt_initial": fmt_money(sale.debt_initial),
+                "debt_remaining": fmt_money(sale.debt_remaining),
+                "debt_amount": fmt_money(sale.debt_remaining),
                 "payments": _serialize_sale_payments(sale),
                 "shift_id": str(sale.shift_id) if sale.shift_id else None,
                 "cashbox_id": str(sale.cashbox_id) if sale.cashbox_id else None,
@@ -2848,16 +2858,17 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                             shift=sale.shift,
                             type=CashFlow.Type.INCOME,
                             amount=p_amt,
-                            source_kind=CashFlow.SourceKind.POS_SALE,
+                            source_kind=CashFlow.SourceKind.POS_SALE if p_method != Sale.PaymentMethod.DEBT else CashFlow.SourceKind.POS_PREPAYMENT,
                             source_id=str(sale.id),
                             name=f"Продажа ({p_title})",
                             source_business_operation_id="Продажа",
+                            affects_shift_drawer=(p_method == Sale.PaymentMethod.CASH),
                         )
                         if cf:
                             auto_flows.append(cf)
             elif sale.payment_method == Sale.PaymentMethod.DEBT:
-                prepay_amt = sale.cash_received or Decimal("0.00")
-                if prepay_amt > 0:
+                cash_prepay = sale.cash_amount if sale.cash_amount > 0 else (sale.cash_received or Decimal("0.00"))
+                if cash_prepay > 0:
                     cf = create_auto_cashflow(
                         company=sale.company,
                         branch=sale.branch,
@@ -2866,11 +2877,30 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                         user=request.user,
                         shift=sale.shift,
                         type=CashFlow.Type.INCOME,
-                        amount=prepay_amt,
+                        amount=cash_prepay,
                         source_kind=CashFlow.SourceKind.POS_PREPAYMENT,
                         source_id=str(sale.id),
                         name="Предоплата (долг)",
                         source_business_operation_id="Продажа",
+                        affects_shift_drawer=True,
+                    )
+                    if cf:
+                        auto_flows.append(cf)
+                if (sale.card_amount or Decimal("0.00")) > 0:
+                    cf = create_auto_cashflow(
+                        company=sale.company,
+                        branch=sale.branch,
+                        cashbox=sale.cashbox,
+                        cashbox_id=cashbox_id,
+                        user=request.user,
+                        shift=sale.shift,
+                        type=CashFlow.Type.INCOME,
+                        amount=sale.card_amount,
+                        source_kind=CashFlow.SourceKind.POS_PREPAYMENT,
+                        source_id=str(sale.id),
+                        name="Предоплата (долг - безнал)",
+                        source_business_operation_id="Продажа",
+                        affects_shift_drawer=False,
                     )
                     if cf:
                         auto_flows.append(cf)

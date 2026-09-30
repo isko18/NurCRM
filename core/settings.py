@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 from pathlib import Path
 from datetime import timedelta
 import os
+from corsheaders.defaults import default_headers
 import sys
 from typing import List
 
@@ -173,17 +174,25 @@ ASGI_APPLICATION = "core.asgi.application"
 #         'NAME': BASE_DIR / 'db.sqlite3',
 #     }
 # }
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': os.environ.get('DB_NAME', 'nurcrm2'),
-        'USER': os.environ.get('DB_USER', 'nuruser'),
-        'PASSWORD': os.environ.get('DB_PASSWORD', 'nurpass2025'),
-        'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
-        'PORT': os.environ.get('DB_PORT', '6432'),
-        'CONN_MAX_AGE': 0,
+if os.environ.get('USE_SQLITE') == '1':
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'test_db.sqlite3',
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.environ.get('DB_NAME', 'nurcrm2'),
+            'USER': os.environ.get('DB_USER', 'nuruser'),
+            'PASSWORD': os.environ.get('DB_PASSWORD', 'nurpass2025'),
+            'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
+            'PORT': os.environ.get('DB_PORT', '6432'),
+            'CONN_MAX_AGE': 0,
+        }
+    }
 
 
 
@@ -426,6 +435,7 @@ CACHE_TIMEOUT_ANALYTICS = 600  # 10 минут - для аналитики аг�
 
 
 CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_HEADERS = True
 CORS_ORIGIN_ALLOW_ALL = True
 CORS_ALLOW_CREDENTIALS = _get_bool_env('CORS_ALLOW_CREDENTIALS', True)
 
@@ -445,11 +455,27 @@ SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_SAMESITE = os.getenv('CSRF_COOKIE_SAMESITE', 'Lax' if DEBUG else 'None')
 CSRF_COOKIE_SECURE = _get_bool_env('CSRF_COOKIE_SECURE', not DEBUG)
 
-CORS_ALLOW_HEADERS = (
-    'content-disposition', 'accept-encoding',
-    'content-type', 'accept', 'origin', 'Authorization', 'access-control-allow-methods',
-    'Access-Control-Allow-Origin', 'x-csrftoken', 'x-requested-with',
-)
+CORS_ALLOW_ALL_HEADERS = True
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'content-disposition',
+    'accept-encoding',
+    'content-type',
+    'accept',
+    'origin',
+    'authorization',
+    'access-control-allow-methods',
+    'access-control-allow-origin',
+    'x-csrftoken',
+    'x-requested-with',
+    'x-pos-device',
+    'sentry-trace',
+    'baggage',
+    'cache-control',
+    'pragma',
+    'sec-ch-ua',
+    'sec-ch-ua-mobile',
+    'sec-ch-ua-platform',
+]
 
 CORS_ALLOW_METHODS = (
     "DELETE",

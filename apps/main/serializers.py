@@ -118,13 +118,18 @@ def _active_branch(serializer: serializers.Serializer):
     elif hasattr(req, "GET"):
         branch_id = req.GET.get("branch")
 
-    if branch_id and branch_id.strip():
+    if branch_id and str(branch_id).strip():
+        branch_val = str(branch_id).strip()
+        if branch_val.lower() == "main":
+            setattr(req, "branch", None)
+            return None
         try:
+            from django.core.exceptions import ValidationError as DjangoValidationError
             from apps.users.models import Branch  # на случай круговой импорта
-            br = Branch.objects.get(id=branch_id, company_id=company_id)
+            br = Branch.objects.get(id=branch_val, company_id=company_id)
             setattr(req, "branch", br)
             return br
-        except (Branch.DoesNotExist, ValueError):
+        except (Branch.DoesNotExist, ValueError, DjangoValidationError):
             pass
 
     # ----- 3. Глобальный режим по компании -----

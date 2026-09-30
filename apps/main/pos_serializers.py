@@ -547,6 +547,8 @@ class CheckoutSerializer(serializers.Serializer):
         cart = self.context.get("cart")
         if not cart:
             raise serializers.ValidationError("Serializer context должен содержать cart.")
+        if not cart.items.exists():
+            raise serializers.ValidationError({"code": "empty_sale", "detail": "В чеке нет позиций"})
 
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
@@ -628,10 +630,19 @@ class CheckoutSerializer(serializers.Serializer):
             payment_method = attrs.get("payment_method") or Sale.PaymentMethod.CASH
             cash_received = attrs.get("cash_received")
 
-            if payment_method == Sale.PaymentMethod.DEBT and not attrs.get("client_id"):
-                raise serializers.ValidationError({"client_id": "При продаже в долг выбор клиента обязателен."})
-
-            if payment_method == Sale.PaymentMethod.CASH:
+            if payment_method == Sale.PaymentMethod.DEBT:
+                if not attrs.get("client_id"):
+                    raise serializers.ValidationError({"client_id": "При продаже в долг выбор клиента обязателен."})
+                c_amt = attrs.get("cash_amount") if attrs.get("cash_amount") is not None else (cash_received or Decimal("0.00"))
+                k_amt = attrs.get("card_amount") or Decimal("0.00")
+                if c_amt < 0 or k_amt < 0:
+                    raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
+                if c_amt + k_amt > sale_total:
+                    raise serializers.ValidationError({"cash_received": "Внесённая сумма не может быть больше суммы чека."})
+                attrs["cash_amount"] = c_amt
+                attrs["card_amount"] = k_amt
+                attrs["cash_received"] = c_amt
+            elif payment_method == Sale.PaymentMethod.CASH:
                 if cash_received is None:
                     raise serializers.ValidationError({"cash_received": "Укажите сумму, принятую наличными."})
                 if cash_received < 0:
@@ -733,14 +744,21 @@ class CartItemDeletionLogSerializer(serializers.ModelSerializer):
 
 
 def _sale_payment_split(sale):
-    """(cash_amount, card_amount) по строкам оплаты; None, если разбивка неизвестна."""
-    if sale.status == Sale.Status.DEBT:
-        return None, None
+    """(cash_amount, card_amount) по строкам оплаты или полям чека; None, если разбивка неизвестна."""
+    c = getattr(sale, "cash_amount", None)
+    k = getattr(sale, "card_amount", None)
+    if c is not None or k is not None:
+        return str(money(c or Decimal("0.00"))), str(money(k or Decimal("0.00")))
+    if sale.status == Sale.Status.DEBT or sale.payment_method == Sale.PaymentMethod.DEBT:
+        c_amt = sale.cash_received or Decimal("0.00")
+        return str(money(c_amt)), "0.00"
     lines = sale.payment_lines()
     if not lines or any(line.method == Sale.PaymentMethod.MIXED for line in lines):
+        if sale.payment_method == Sale.PaymentMethod.CASH:
+            return str(money(sale.total or Decimal("0.00"))), "0.00"
         return None, None
     cash = sum((line.amount for line in lines if line.method == Sale.PaymentMethod.CASH), Decimal("0.00"))
-    card = sum((line.amount for line in lines if line.method != Sale.PaymentMethod.CASH), Decimal("0.00"))
+    card = sum((line.amount for line in lines if line.method != Sale.PaymentMethod.CASH and line.method != Sale.PaymentMethod.DEBT), Decimal("0.00"))
     return str(money(cash)), str(money(card))
 
 
@@ -753,10 +771,12 @@ def _linked_debt_deal(sale):
 
 
 def _sale_debt_amount(sale):
-    """Сколько ещё должны по продаже: по остатку сделки, если она есть; погашенная — 0."""
+    """Сколько ещё должны по продаже: по остатку сделки или debt_remaining, если есть; погашенная — 0."""
     is_debt = sale.status == Sale.Status.DEBT or sale.payment_method == Sale.PaymentMethod.DEBT
     if not is_debt or sale.status == Sale.Status.PAID:
         return money(Decimal("0.00"))
+    if getattr(sale, "debt_remaining", None) is not None:
+        return money(sale.debt_remaining)
     deal = _linked_debt_deal(sale)
     if deal is not None:
         remaining = deal.remaining_debt
@@ -782,6 +802,9 @@ class SaleListSerializer(serializers.ModelSerializer):
     number = serializers.IntegerField(source="doc_number", read_only=True)
     cash_amount = serializers.SerializerMethodField(read_only=True)
     card_amount = serializers.SerializerMethodField(read_only=True)
+    paid_now = serializers.SerializerMethodField(read_only=True)
+    debt_initial = serializers.SerializerMethodField(read_only=True)
+    debt_remaining = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Sale
@@ -816,7 +839,19 @@ class SaleListSerializer(serializers.ModelSerializer):
             "deal_id",
             "cash_amount",
             "card_amount",
+            "paid_now",
+            "debt_initial",
+            "debt_remaining",
         )
+
+    def get_paid_now(self, obj):
+        return str(money(obj.paid_now or Decimal("0.00")))
+
+    def get_debt_initial(self, obj):
+        return str(money(obj.debt_initial or Decimal("0.00")))
+
+    def get_debt_remaining(self, obj):
+        return str(money(obj.debt_remaining or Decimal("0.00")))
 
     def get_cash_amount(self, obj):
         return _sale_payment_split(obj)[0]
@@ -881,6 +916,12 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
     price_override_reason = serializers.SerializerMethodField()
     returnable_qty = serializers.SerializerMethodField()
 
+    is_custom = serializers.BooleanField(read_only=True)
+    price = serializers.SerializerMethodField(read_only=True)
+    discount = serializers.SerializerMethodField(read_only=True)
+    amount = serializers.SerializerMethodField(read_only=True)
+    cost_price = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = SaleItem
         fields = (
@@ -889,6 +930,11 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
             "line_id",
             "sale_item_id",
             "product",
+            "is_custom",
+            "price",
+            "discount",
+            "amount",
+            "cost_price",
             "variant",
             "variant_size",
             "variant_color",
@@ -911,6 +957,18 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
             "returnable_qty",
         )
         read_only_fields = fields
+
+    def get_price(self, obj):
+        return str(money(obj.unit_price or Decimal("0.00")))
+
+    def get_discount(self, obj):
+        return str(money(obj.line_discount or Decimal("0.00")))
+
+    def get_amount(self, obj):
+        return str(obj.line_total)
+
+    def get_cost_price(self, obj):
+        return str(money(obj.purchase_price_snapshot or Decimal("0.00")))
 
     def get_product_name(self, obj):
         return get_attr(get_attr(obj, "product", None), "name", None) or obj.name_snapshot
@@ -967,6 +1025,10 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     number = serializers.IntegerField(source="doc_number", read_only=True)
     cash_amount = serializers.SerializerMethodField(read_only=True)
     card_amount = serializers.SerializerMethodField(read_only=True)
+    paid_now = serializers.SerializerMethodField(read_only=True)
+    debt_initial = serializers.SerializerMethodField(read_only=True)
+    debt_remaining = serializers.SerializerMethodField(read_only=True)
+    debt_amount = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Sale
@@ -1002,8 +1064,26 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "ekassa_fiscal",
             "cash_amount",
             "card_amount",
+            "paid_now",
+            "debt_initial",
+            "debt_remaining",
+            "debt_amount",
         )
         read_only_fields = fields
+
+    def get_paid_now(self, obj):
+        return str(money(obj.paid_now or Decimal("0.00")))
+
+    def get_debt_initial(self, obj):
+        return str(money(obj.debt_initial or Decimal("0.00")))
+
+    def get_debt_remaining(self, obj):
+        if getattr(obj, "debt_remaining", None) is not None:
+            return str(money(obj.debt_remaining))
+        return self.get_remaining_debt(obj) or "0.00"
+
+    def get_debt_amount(self, obj):
+        return str(_sale_debt_amount(obj))
 
     def get_cash_amount(self, obj):
         return _sale_payment_split(obj)[0]
