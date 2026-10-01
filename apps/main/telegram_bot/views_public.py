@@ -18,7 +18,31 @@ class TelegramWebhookPublicView(APIView):
     permission_classes = [permissions.AllowAny]
     authentication_classes = []  # Без авторизации CRM
 
-    def post(self, request, bot_uuid):
+    def get(self, request, bot_uuid=None):
+        if bot_uuid:
+            settings = TelegramBotSettings.objects.filter(bot_uuid=bot_uuid).first()
+            if not settings:
+                return Response({"detail": "Bot webhook not found"}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {
+                    "ok": True,
+                    "detail": "Telegram webhook endpoint active.",
+                    "bot_username": settings.bot_username,
+                    "mode": settings.mode,
+                },
+                status=status.HTTP_200_OK,
+            )
+        return Response(
+            {
+                "ok": True,
+                "detail": "Telegram webhook service active. Use POST /api/telegram/webhook/{bot_uuid}/ for updates.",
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    def post(self, request, bot_uuid=None):
+        if not bot_uuid:
+            return Response({"detail": "bot_uuid required in path"}, status=status.HTTP_400_BAD_REQUEST)
         settings = (
             TelegramBotSettings.objects.filter(bot_uuid=bot_uuid)
             .only("id", "mode", "secret_token", "bot_uuid")

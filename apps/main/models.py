@@ -2570,6 +2570,8 @@ class Sale(models.Model):
         payments=None,
         cash_amount=None,
         card_amount=None,
+        card_method=None,
+        prepayment_method=None,
         skip_ekassa_schedule=False,
     ):
         if not self.doc_number and self.pk:
@@ -2668,7 +2670,8 @@ class Sale(models.Model):
                 if c_amt > 0:
                     lines.append(SalePayment(sale=self, company_id=self.company_id, method=self.PaymentMethod.CASH, amount=c_amt))
                 if k_amt > 0:
-                    lines.append(SalePayment(sale=self, company_id=self.company_id, method=self.PaymentMethod.TRANSFER, amount=k_amt))
+                    noncash_method = prepayment_method or card_method or self.PaymentMethod.TRANSFER
+                    lines.append(SalePayment(sale=self, company_id=self.company_id, method=noncash_method, amount=k_amt))
                 if self.debt_initial > 0:
                     lines.append(SalePayment(sale=self, company_id=self.company_id, method=self.PaymentMethod.DEBT, amount=self.debt_initial))
                 if lines:
@@ -7324,6 +7327,7 @@ class ShowcaseOrder(models.Model):
     delivery_address = models.CharField("Адрес доставки", max_length=255, blank=True, default="")
     comment = models.TextField("Комментарий", blank=True, default="")
     total = models.DecimalField("Итоговая сумма", max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    source = models.CharField("Источник", max_length=32, default="showcase", blank=True, db_index=True)
     idempotency_key = models.CharField(max_length=128, null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -7390,4 +7394,13 @@ class ShowcaseStats(models.Model):
 
     def __str__(self):
         return f"ShowcaseStats({self.company_id}, {self.date})"
+
+
+from apps.main.telegram_bot.models import (
+    TelegramBotSettings,
+    TelegramInquiry,
+    TelegramCustomerProfile,
+    TelegramProcessedUpdate,
+    TelegramMessageLog,
+)
 

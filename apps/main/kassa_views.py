@@ -98,6 +98,7 @@ class QuickCheckoutPaymentSerializer(serializers.Serializer):
     cash_amount = MoneyField(required=False, allow_null=True)
     card_amount = MoneyField(required=False, allow_null=True)
     card_method = serializers.CharField(required=False, allow_blank=True)
+    prepayment_method = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     payments = serializers.ListField(child=serializers.DictField(), required=False)
 
 
@@ -111,6 +112,7 @@ class QuickCheckoutSerializer(serializers.Serializer):
     )
     bonus_redeemed = MoneyField(required=False, allow_null=True)
     payment = QuickCheckoutPaymentSerializer()
+    prepayment_method = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     consultant_id = serializers.UUIDField(required=False, allow_null=True)
     consultant_commission_enabled = serializers.BooleanField(required=False, default=False)
     consultant_commission_percent = serializers.DecimalField(
@@ -122,6 +124,12 @@ class QuickCheckoutSerializer(serializers.Serializer):
     # BE2-10: продажа, сделанная без связи и досланная позже.
     offline = serializers.BooleanField(required=False, default=False)
     offline_created_at = serializers.DateTimeField(required=False, allow_null=True)
+
+    def to_internal_value(self, data):
+        items = data.get("items")
+        if items is not None and not items:
+            raise serializers.ValidationError({"code": "empty_sale", "detail": "В чеке нет позиций"})
+        return super().to_internal_value(data)
 
     def validate(self, attrs):
         items = attrs.get("items")
@@ -152,6 +160,8 @@ def _quick_result(sale: Sale) -> dict:
         "cash_received": str(money(sale.cash_received or ZERO)),
         "change": str(money(sale.change or ZERO)),
         "paid_now": str(money(getattr(sale, "paid_now", ZERO) or ZERO)),
+        "paid_cash": str(money(getattr(sale, "cash_amount", ZERO) or ZERO)),
+        "paid_card": str(money(getattr(sale, "card_amount", ZERO) or ZERO)),
         "cash_amount": str(money(getattr(sale, "cash_amount", ZERO) or ZERO)),
         "card_amount": str(money(getattr(sale, "card_amount", ZERO) or ZERO)),
         "debt_initial": str(money(getattr(sale, "debt_initial", ZERO) or ZERO)),
@@ -488,6 +498,9 @@ class PosQuickCheckoutAPIView(APIView):
         elif pay["method"] == Sale.PaymentMethod.DEBT:
             out["cash_amount"] = pay.get("cash_amount")
             out["card_amount"] = pay.get("card_amount")
+            prepay_m = pay.get("prepayment_method") or data.get("prepayment_method")
+            if prepay_m:
+                out["prepayment_method"] = prepay_m
             if pay.get("received") is not None:
                 out["cash_received"] = pay["received"]
             if out.get("cash_amount") is None and out.get("cash_received") is not None:
@@ -800,8 +813,30 @@ class ClientPayDebtAPIView(APIView):
 def _return_item(line: dict, ret) -> dict:
     """Строка возврата (AN-08)."""
     total = line.get("amount") or line.get("total")
-    qty = line.get("quantity") or line.get("qty")
+    qty = line.get("quantity") or line.get("qty") or "1"
     price = line.get("price")
+
+    if total is None and price is not None and qty:
+        try:
+            total = str((Decimal(str(price)) * Decimal(str(qty))).quantize(Decimal("0.01")))
+        except Exception:
+            pass
+
+    if total is None and ret and getattr(ret, "returned_amount", None):
+        items_list = getattr(ret, "returned_items", None) or []
+        n = len(items_list)
+        if n == 1:
+            total = str(ret.returned_amount)
+        elif n > 1:
+            try:
+                per_item = (ret.returned_amount / Decimal(n)).quantize(Decimal("0.01"))
+                if line == items_list[-1]:
+                    total = str(ret.returned_amount - (per_item * Decimal(n - 1)))
+                else:
+                    total = str(per_item)
+            except Exception:
+                pass
+
     if price is None and total is not None and qty:
         try:
             qd = Decimal(str(qty))

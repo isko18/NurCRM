@@ -92,6 +92,12 @@ def emit_event(company_id, event: str, data: dict) -> None:
         except Exception:
             logger.exception("webhook emit failed: %s", event)
 
+        try:
+            from apps.main.telegram_bot.services.events_handler import handle_internal_event
+            handle_internal_event(company_id, event, data)
+        except Exception:
+            logger.exception("telegram bot handle_internal_event failed: %s", event)
+
     try:
         transaction.on_commit(_send)
     except Exception:

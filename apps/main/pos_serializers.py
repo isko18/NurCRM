@@ -491,6 +491,25 @@ class CheckoutSerializer(serializers.Serializer):
     # v2 отсрочка (extra-поля для кассы, не ведут к 400)
     schedule_version = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     debt_schedule = serializers.JSONField(required=False, allow_null=True)
+    prepayment_method = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            # AN-01: Поддержка вложенного объекта payment = { method: ..., received: ..., cash_amount: ..., card_amount: ..., prepayment_method: ... }
+            p = data.get("payment")
+            if isinstance(p, dict):
+                data = data.copy()
+                if "method" in p and "payment_method" not in data:
+                    data["payment_method"] = p["method"]
+                if "received" in p and "cash_received" not in data:
+                    data["cash_received"] = p["received"]
+                if "cash_amount" in p and "cash_amount" not in data:
+                    data["cash_amount"] = p["cash_amount"]
+                if "card_amount" in p and "card_amount" not in data:
+                    data["card_amount"] = p["card_amount"]
+                if "prepayment_method" in p and "prepayment_method" not in data:
+                    data["prepayment_method"] = p["prepayment_method"]
+        return super().to_internal_value(data)
 
     def _resolve_cashbox(self, cart: Cart, cashbox_id, branch_id=None, cashbox_role=None):
         from apps.construction.auto_cashflow import resolve_cashbox
@@ -589,6 +608,8 @@ class CheckoutSerializer(serializers.Serializer):
         payments = attrs.get("payments") or []
         cart.recalc()
         sale_total = (cart.total or Decimal("0.00")).quantize(Decimal("0.01"))
+        if sale_total <= Decimal("0.00") and not attrs.get("allow_minus"):
+            raise serializers.ValidationError({"code": "empty_sale", "detail": "Сумма чека должна быть больше нуля."})
         raw = getattr(self, "initial_data", None) or {}
         payment_method_in_request = (
             split_payments is None
@@ -633,25 +654,50 @@ class CheckoutSerializer(serializers.Serializer):
             if payment_method == Sale.PaymentMethod.DEBT:
                 if not attrs.get("client_id"):
                     raise serializers.ValidationError({"client_id": "При продаже в долг выбор клиента обязателен."})
-                c_amt = attrs.get("cash_amount") if attrs.get("cash_amount") is not None else (cash_received or Decimal("0.00"))
-                k_amt = attrs.get("card_amount") or Decimal("0.00")
-                if c_amt < 0 or k_amt < 0:
+                from apps.main.services_debt import normalize_debt_prepayment_method
+
+                total_prepay = attrs.get("prepayment") or attrs.get("prepayment_amount")
+                if total_prepay is None:
+                    if attrs.get("cash_amount") is not None or attrs.get("card_amount") is not None:
+                        total_prepay = (attrs.get("cash_amount") or Decimal("0.00")) + (attrs.get("card_amount") or Decimal("0.00"))
+                    else:
+                        total_prepay = cash_received or Decimal("0.00")
+
+                if total_prepay < Decimal("0.00"):
                     raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
-                if c_amt + k_amt > sale_total:
+                if total_prepay > sale_total:
                     raise serializers.ValidationError({"cash_received": "Внесённая сумма не может быть больше суммы чека."})
-                attrs["cash_amount"] = c_amt
-                attrs["card_amount"] = k_amt
-                attrs["cash_received"] = c_amt
-            elif payment_method == Sale.PaymentMethod.CASH:
-                if cash_received is None:
-                    raise serializers.ValidationError({"cash_received": "Укажите сумму, принятую наличными."})
-                if cash_received < 0:
-                    raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
-            else:
-                if cash_received is None:
+
+                raw_prepay_method = attrs.get("prepayment_method")
+                if total_prepay > Decimal("0.00") and raw_prepay_method is not None:
+                    prepay_method = normalize_debt_prepayment_method(raw_prepay_method)
+                else:
+                    prepay_method = "cash"
+
+                attrs["prepayment_method"] = prepay_method
+
+                if prepay_method == "cash":
+                    attrs["cash_amount"] = total_prepay
+                    attrs["card_amount"] = Decimal("0.00")
+                    attrs["cash_received"] = total_prepay
+                    attrs["card_method"] = None
+                else:
+                    attrs["cash_amount"] = Decimal("0.00")
+                    attrs["card_amount"] = total_prepay
                     attrs["cash_received"] = Decimal("0.00")
-                elif cash_received < 0:
-                    raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
+                    attrs["card_method"] = prepay_method
+            else:
+                attrs["prepayment_method"] = None
+                if payment_method == Sale.PaymentMethod.CASH:
+                    if cash_received is None:
+                        raise serializers.ValidationError({"cash_received": "Укажите сумму, принятую наличными."})
+                    if cash_received < 0:
+                        raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
+                else:
+                    if cash_received is None:
+                        attrs["cash_received"] = Decimal("0.00")
+                    elif cash_received < 0:
+                        raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
 
         # --- касса/смена ---
         if getattr(cart, "shift_id", None):

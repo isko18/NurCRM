@@ -13,6 +13,13 @@ from apps.main.models import Notification, Task
 
 logger = logging.getLogger("crm.webhooks")
 
+from apps.main.telegram_bot.tasks import (
+    process_telegram_update,
+    send_telegram_shift_summary,
+    send_telegram_debt_reminders,
+    send_telegram_notification,
+)
+
 
 @shared_task
 def create_task_notification(task_id):

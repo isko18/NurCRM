@@ -1184,6 +1184,11 @@ def build_shift_report(shift: CashShift) -> dict:
         "opening_cash": q2(shift.opening_cash),
         "sales_count": totals.get("sales_count", 0),
         "sales_total": q2(totals.get("sales_total")),
+        "cash_sales": q2(totals.get("cash_sales_total")),
+        "noncash_sales": q2(totals.get("noncash_sales_total")),
+        "debt_prepayments_cash": q2(totals.get("debt_prepayments_cash")),
+        "debt_prepayments_noncash": q2(totals.get("debt_prepayments_noncash")),
+        "debt_payments_cash": q2(totals.get("debt_payments_cash")),
         "by_payment": {
             **{k: q2(v) for k, v in sorted(by_payment.items())},
             "mixed_cash": q2(mixed_cash),

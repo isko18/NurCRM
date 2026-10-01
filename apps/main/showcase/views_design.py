@@ -830,6 +830,7 @@ class PublicCompanyShowcaseOrderCreateAPIView(APIView):
                 customer_phone=customer_data["phone"],
                 delivery_type=delivery_data.get("type", "pickup"),
                 delivery_address=delivery_data.get("address", ""),
+                source=data.get("source") or "showcase",
                 comment=data.get("comment", ""),
                 total=total_amount,
                 idempotency_key=idempotency_key or None,
@@ -855,6 +856,7 @@ class PublicCompanyShowcaseOrderCreateAPIView(APIView):
             "number": order.number,
             "status": order.status,
             "total": str(order.total),
+            "source": order.source,
             "customer": {
                 "name": order.customer_name,
                 "phone": order.customer_phone,
@@ -888,6 +890,7 @@ class PublicCompanyShowcaseOrderCreateAPIView(APIView):
                 "number": order.number,
                 "status": order.status,
                 "total": str(order.total),
+                "source": order.source,
                 "created_at": order.created_at.isoformat(),
             },
             status=status.HTTP_201_CREATED,
@@ -905,6 +908,10 @@ class ShowcaseOrderListAPIView(generics.ListAPIView):
         status_param = self.request.query_params.get("status")
         if status_param:
             qs = qs.filter(status=status_param)
+
+        source_param = self.request.query_params.get("source")
+        if source_param:
+            qs = qs.filter(source=source_param)
 
         date_from = self.request.query_params.get("date_from")
         if date_from:

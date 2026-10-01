@@ -440,7 +440,7 @@ def create_auto_cashflow(
         drawer_flag = affects_shift_drawer
     elif source_kind in (CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW, CashFlow.SourceKind.SHIFT_DRAWER_INFLOW):
         drawer_flag = True
-    elif source_kind == CashFlow.SourceKind.DEBT_REPAYMENT:
+    elif source_kind in (CashFlow.SourceKind.DEBT_REPAYMENT, CashFlow.SourceKind.POS_PREPAYMENT):
         drawer_flag = (pm_clean == "cash" or pm_clean is None)
     else:
         drawer_flag = False

@@ -36,3 +36,33 @@ def normalize_debt_payment_method(raw: Optional[str]) -> str:
     if val in VALID_DEBT_PAYMENT_METHODS:
         return val
     return DEBT_PAYMENT_FALLBACK
+
+
+# Способы предоплаты при продаже в долг согласно debt-prepayment-method-backend.md
+VALID_DEBT_PREPAYMENT_METHODS = {
+    "cash",
+    "mbank",
+    "optima",
+    "obank",
+    "bakai",
+    "transfer",
+}
+
+
+def normalize_debt_prepayment_method(raw: Optional[str]) -> str:
+    """
+    Нормализует prepayment_method согласно debt-prepayment-method-backend.md:
+    "cash" | "mbank" | "optima" | "obank" | "bakai" | "transfer"
+
+    - Отсутствие / None / "" / "   " -> "cash" (по умолчанию, старые клиенты)
+    - Допустимое значение -> точное значение
+    - Неизвестное значение -> "transfer" (не 400)
+    """
+    if raw is None:
+        return "cash"
+    val = str(raw).strip().lower()
+    if not val:
+        return "cash"
+    if val in VALID_DEBT_PREPAYMENT_METHODS:
+        return val
+    return "transfer"

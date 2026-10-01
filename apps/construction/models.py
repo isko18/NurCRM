@@ -543,6 +543,36 @@ class CashShift(models.Model):
             or z
         )
 
+        # Предоплата безналом по продажам в долг (debt-prepayment-method-backend.md)
+        debt_prepayments_noncash = (
+            SalePayment.objects.filter(
+                sale__shift_id=self.id,
+                sale__status=Sale.Status.DEBT,
+            ).exclude(
+                method__in=[Sale.PaymentMethod.CASH, Sale.PaymentMethod.DEBT, Sale.PaymentMethod.OFFSET]
+            ).aggregate(s=Sum("amount"))["s"]
+            or z
+        )
+        debt_prepayments_legacy_noncash = (
+            Sale.objects.filter(
+                shift_id=self.id,
+                status=Sale.Status.DEBT,
+            )
+            .annotate(pay_cnt=Count("payments"))
+            .filter(pay_cnt=0)
+            .aggregate(
+                s=Sum(
+                    Case(
+                        When(card_amount__gt=0, then="card_amount"),
+                        default=Value(0),
+                        output_field=DecimalField(max_digits=12, decimal_places=2),
+                    )
+                )
+            )["s"]
+            or z
+        )
+        debt_prepayments_noncash += debt_prepayments_legacy_noncash
+
         drawer_expected_cash = (
             (self.opening_cash or z) + drawer_cash_in + drawer_legacy_cash + debt_prepayments_cash + non_sale_income - expense_total
         )
@@ -568,17 +598,18 @@ class CashShift(models.Model):
         )
 
         totals = {
-            "income_total": income_total + debt_prepayments_cash,
+            "income_total": income_total + debt_prepayments_cash + debt_prepayments_noncash,
             "expense_total": expense_total,
             "sales_count": sales_count,
             "sales_total": sales_total,
             "cash_sales_total": cash_sales_total + debt_prepayments_cash,
-            "noncash_sales_total": noncash_sales_total,
+            "noncash_sales_total": noncash_sales_total + debt_prepayments_noncash,
             "expected_cash": expected_cash,
             "drawer_expected_cash": drawer_expected_cash,
             "ledger_expected_cash": drawer_expected_cash,
             "non_drawer_expenses_total": non_drawer_expenses_total,
             "debt_prepayments_cash": debt_prepayments_cash,
+            "debt_prepayments_noncash": debt_prepayments_noncash,
             "debt_payments_cash": debt_payments_cash,
         }
 

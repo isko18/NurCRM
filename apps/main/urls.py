@@ -1,4 +1,4 @@
-from django.urls import path
+from django.urls import path, include
 
 from apps.main.mass_incoming_views import ProductMassIncomingAPIView
 from .views import *
@@ -438,6 +438,15 @@ urlpatterns = [
     
     
     path("analytics/market/", AnalyticsView.as_view(), name="analytics"),
+    path("analytics/reconcile/", AnalyticsReconcileAPIView.as_view(), name="analytics-reconcile"),
+    path("analytics/cashflow/", AnalyticsCashFlowAPIView.as_view(), name="analytics-cashflow"),
+    path("analytics/pnl/", AnalyticsPnLAPIView.as_view(), name="analytics-pnl"),
+    path("analytics/market/reconcile/", AnalyticsReconcileAPIView.as_view(), name="analytics-market-reconcile"),
+    path("analytics/market/cashflow/", AnalyticsCashFlowAPIView.as_view(), name="analytics-market-cashflow"),
+    path("analytics/market/pnl/", AnalyticsPnLAPIView.as_view(), name="analytics-market-pnl"),
+    path("reconcile/", AnalyticsReconcileAPIView.as_view(), name="direct-reconcile"),
+    path("cashflow/", AnalyticsCashFlowAPIView.as_view(), name="direct-cashflow"),
+    path("pnl/", AnalyticsPnLAPIView.as_view(), name="direct-pnl"),
     path(
         "market-sale-employee-pay-profiles/",
         MarketSaleEmployeePayProfileListCreateAPIView.as_view(),
@@ -486,4 +495,10 @@ urlpatterns = [
     path("showcase/orders/<uuid:pk>/", ShowcaseOrderDetailAPIView.as_view(), name="showcase-orders-detail"),
 
     path("showcase/stats/", ShowcaseStatsAPIView.as_view(), name="showcase-stats"),
+
+    # ==========================
+    # Telegram Bot & AI (TZ-BE-2026-06 / Часть 5)
+    # ==========================
+    path("telegram-bot/", include("apps.main.telegram_bot.urls")),
+    path("telegram/", include("apps.main.telegram_bot.urls")),
 ]

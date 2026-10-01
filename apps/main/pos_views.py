@@ -2777,6 +2777,8 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
             consultant_comm_pct = ser.validated_data.get("consultant_commission_percent")
             cash_amount = ser.validated_data.get("cash_amount")
             card_amount = ser.validated_data.get("card_amount")
+            card_method = ser.validated_data.get("card_method")
+            prepayment_method = ser.validated_data.get("prepayment_method")
 
             try:
                 sale = checkout_cart(
@@ -2787,6 +2789,8 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                     cash_received=cash_received,
                     cash_amount=cash_amount,
                     card_amount=card_amount,
+                    card_method=card_method,
+                    prepayment_method=prepayment_method,
                     client=client_obj,
                     consultant=consultant_obj,
                     consultant_commission_enabled=consultant_comm_enabled,
@@ -2829,6 +2833,8 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                 "cash_received": fmt_money(sale.cash_received),
                 "change": fmt_money(sale.change),
                 "paid_now": fmt_money(sale.paid_now),
+                "paid_cash": fmt_money(sale.cash_amount),
+                "paid_card": fmt_money(sale.card_amount),
                 "cash_amount": fmt_money(sale.cash_amount),
                 "card_amount": fmt_money(sale.card_amount),
                 "debt_initial": fmt_money(sale.debt_initial),
@@ -2863,6 +2869,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                             name=f"Продажа ({p_title})",
                             source_business_operation_id="Продажа",
                             affects_shift_drawer=(p_method == Sale.PaymentMethod.CASH),
+                            payment_method=p_method,
                         )
                         if cf:
                             auto_flows.append(cf)
@@ -2883,10 +2890,13 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                         name="Предоплата (долг)",
                         source_business_operation_id="Продажа",
                         affects_shift_drawer=True,
+                        payment_method="cash",
                     )
                     if cf:
                         auto_flows.append(cf)
                 if (sale.card_amount or Decimal("0.00")) > 0:
+                    noncash_m = prepayment_method or card_method or "transfer"
+                    p_title = dict(Sale.PaymentMethod.choices).get(noncash_m, noncash_m)
                     cf = create_auto_cashflow(
                         company=sale.company,
                         branch=sale.branch,
@@ -2898,9 +2908,10 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                         amount=sale.card_amount,
                         source_kind=CashFlow.SourceKind.POS_PREPAYMENT,
                         source_id=str(sale.id),
-                        name="Предоплата (долг - безнал)",
+                        name=f"Предоплата ({p_title})",
                         source_business_operation_id="Продажа",
                         affects_shift_drawer=False,
+                        payment_method=noncash_m,
                     )
                     if cf:
                         auto_flows.append(cf)
@@ -2921,6 +2932,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                         source_id=str(sale.id),
                         name=cf_name,
                         source_business_operation_id="Продажа",
+                        payment_method=sale.payment_method,
                     )
                     if cf:
                         auto_flows.append(cf)
@@ -3580,6 +3592,10 @@ def _effective_refund_method(sale, refund_method) -> str:
     """Чем вернули деньги: явный способ кассы, иначе способ оплаты чека."""
     if refund_method and refund_method != "original":
         return str(refund_method)[:16]
+    if sale.payment_method == Sale.PaymentMethod.DEBT:
+        prepay_line = sale.payments.exclude(method=Sale.PaymentMethod.DEBT).first()
+        if prepay_line and prepay_line.method:
+            return str(prepay_line.method)[:16]
     return str(sale.payment_method or "cash")[:16]
 
 
@@ -3711,7 +3727,7 @@ def _execute_sale_return(
         cashbox = _resolve_return_cashbox(sale, payload)
         actual_shift = _resolve_return_shift(sale, user, cashbox, payload)
 
-        payments = list(sale.payments.filter(amount__gt=0))
+        payments = list(sale.payments.filter(amount__gt=0).exclude(method=Sale.PaymentMethod.DEBT))
         if payments:
             if is_full:
                 for p in payments:
@@ -3735,6 +3751,7 @@ def _execute_sale_return(
                         source_id=str(sale.id),
                         idempotency_key=ik,
                         affects_shift_drawer=affects_drawer,
+                        payment_method=p_m,
                         name=f"Возврат по чеку №{sale.doc_number or sale.id} ({p.get_method_display() if hasattr(p, 'get_method_display') else p_m})",
                         source_business_operation_id="pos_sale_return",
                     )
@@ -3773,6 +3790,7 @@ def _execute_sale_return(
                             source_id=str(sale.id),
                             idempotency_key=ik,
                             affects_shift_drawer=affects_drawer,
+                            payment_method=p_m,
                             name=f"Возврат по чеку №{sale.doc_number or sale.id} ({p.get_method_display() if hasattr(p, 'get_method_display') else p_m})",
                             source_business_operation_id="pos_sale_return",
                         )
@@ -3807,6 +3825,7 @@ def _execute_sale_return(
                 source_id=str(sale.id),
                 idempotency_key=str(idempotency_key) if idempotency_key else None,
                 affects_shift_drawer=affects_drawer,
+                payment_method=p_m,
                 name=f"Возврат по чеку №{sale.doc_number or sale.id}",
                 source_business_operation_id="pos_sale_return",
             )
@@ -4118,7 +4137,7 @@ class MobileScannerIngestAPIView(APIView):
 
 class PosSalesLimitPagination(SupplierReceiptLimitPagination):
     page_size = 100
-    max_page_size = 500
+    max_page_size = 5000
 
     def get_page_size(self, request):
         # Размер страницы можно задать как `limit` (историческое имя),
@@ -4225,7 +4244,7 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
         .all()
     )
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ("status", "user", "consultant")
+    filterset_fields = ("user", "consultant")
     search_fields = ("id",)
     ordering_fields = ("created_at", "total", "status", "doc_number")
     # id — стабильный порядок при равном created_at, иначе страницы пересекаются.
@@ -4245,6 +4264,18 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
         paid_only = self.request.query_params.get("paid")
         if paid_only in ("1", "true", "True"):
             qs = qs.filter(status=Sale.Status.PAID)
+
+        # Поддержка фильтра статуса (одиночного или нескольких через запятую)
+        status_param = (self.request.query_params.get("status") or "").strip()
+        statuses_param = (self.request.query_params.get("statuses") or "").strip()
+        raw_statuses = statuses_param or status_param
+        if raw_statuses:
+            if "," in raw_statuses:
+                status_list = [s.strip() for s in raw_statuses.split(",") if s.strip()]
+                if status_list:
+                    qs = qs.filter(status__in=status_list)
+            else:
+                qs = qs.filter(status=raw_statuses)
 
         users_param = self.request.query_params.get("users")
         if users_param:

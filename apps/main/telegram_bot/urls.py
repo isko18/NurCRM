@@ -9,6 +9,7 @@ from apps.main.telegram_bot.views import (
     TelegramBotCustomersView,
     TelegramBotNotifyShiftClosedView,
 )
+from apps.main.telegram_bot.views_public import TelegramWebhookPublicView
 
 urlpatterns = [
     path("settings/", TelegramBotSettingsView.as_view(), name="telegram-bot-settings"),
@@ -19,4 +20,6 @@ urlpatterns = [
     path("inquiries/", TelegramBotInquiriesView.as_view(), name="telegram-bot-inquiries"),
     path("customers/", TelegramBotCustomersView.as_view(), name="telegram-bot-customers"),
     path("notify/shift-closed/", TelegramBotNotifyShiftClosedView.as_view(), name="telegram-bot-notify-shift-closed"),
+    path("webhook/<uuid:bot_uuid>/", TelegramWebhookPublicView.as_view(), name="telegram-bot-webhook-under-bot"),
+    path("webhook/", TelegramWebhookPublicView.as_view(), name="telegram-bot-webhook-under-bot-info"),
 ]

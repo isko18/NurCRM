@@ -38,6 +38,8 @@ def checkout_cart(
     payments=None,
     cash_amount=None,
     card_amount=None,
+    card_method=None,
+    prepayment_method=None,
     client=None,
     consultant=None,
     consultant_commission_enabled: bool = False,
@@ -242,9 +244,23 @@ def checkout_cart(
         sale.save(update_fields=["client"])
 
     if payments:
-        sale.mark_paid(payments=payments, cash_received=cash_received, cash_amount=cash_amount, card_amount=card_amount)
+        sale.mark_paid(
+            payments=payments,
+            cash_received=cash_received,
+            cash_amount=cash_amount,
+            card_amount=card_amount,
+            card_method=card_method,
+            prepayment_method=prepayment_method,
+        )
     elif payment_method is not None:
-        sale.mark_paid(payment_method=payment_method, cash_received=cash_received, cash_amount=cash_amount, card_amount=card_amount)
+        sale.mark_paid(
+            payment_method=payment_method,
+            cash_received=cash_received,
+            cash_amount=cash_amount,
+            card_amount=card_amount,
+            card_method=card_method,
+            prepayment_method=prepayment_method,
+        )
 
     # Автоматическое создание долговой сделки (ClientDeal) при продаже в долг
     debt_amt = Decimal("0.00")

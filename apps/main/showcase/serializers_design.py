@@ -328,6 +328,7 @@ class ShowcaseOrderSerializer(serializers.ModelSerializer):
             "delivery_address",
             "comment",
             "total",
+            "source",
             "items",
             "created_at",
             "updated_at",
@@ -359,3 +360,4 @@ class ShowcaseOrderCreateSerializer(serializers.Serializer):
     )
     delivery = ShowcaseOrderDeliverySerializer(required=False, default=dict)
     comment = serializers.CharField(required=False, allow_blank=True, default="")
+    source = serializers.CharField(required=False, default="showcase", allow_blank=True)
