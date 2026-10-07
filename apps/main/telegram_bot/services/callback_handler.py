@@ -120,6 +120,29 @@ def handle_callback_query(settings, cq: dict) -> None:
         process_telegram_update(str(settings.id), simulated_update)
         return
 
+    # 1б. ТЗ ч.15, п. 4: «Выполнить»/«Отмена» изменений, предложенных ИИ (только чат владельца)
+    if data.startswith("aiact:"):
+        from apps.main.telegram_bot.services import owner_actions
+
+        if not (settings.owner_chat_id and str(settings.owner_chat_id) == chat_id):
+            telegram_api.answer_callback_query(token, cq_id, text="Доступно только владельцу.", show_alert=True)
+            return
+        parts = data.split(":")
+        action, pid = (parts[1] if len(parts) > 1 else ""), (parts[2] if len(parts) > 2 else "")
+        pending = owner_actions.get_pending(company.id, chat_id)
+        if not pending or pending.get("id") != pid:
+            telegram_api.edit_message_reply_markup(token, chat_id, message_id, None)
+            telegram_api.send_message(token, chat_id, "Этот список уже не актуален — попросите ещё раз.")
+            return
+        telegram_api.edit_message_reply_markup(token, chat_id, message_id, None)
+        if action == "run":
+            result = owner_actions.execute_pending(company, chat_id, pending, user=getattr(company, "owner", None))
+            telegram_api.send_message(token, chat_id, owner_actions.build_result_message(result), parse_mode="HTML")
+        else:
+            owner_actions.clear_pending(company.id, chat_id)
+            telegram_api.send_message(token, chat_id, "Отменено, ничего не менял.")
+        return
+
     # 2. Кнопки количества товара p:<prod_id>:<action>:<qty>
     if data.startswith("p:"):
         parts = data.split(":")

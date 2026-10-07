@@ -14,11 +14,13 @@ from apps.main.telegram_bot.views import (
     TelegramBotScenarioTestView,
     TelegramBotScenarioSyncMenuView,
     TelegramBotAuditListView,
+    TelegramBotCapabilitiesView,
 )
 from apps.main.telegram_bot.views_public import TelegramWebhookPublicView
 
 urlpatterns = [
     path("settings/", TelegramBotSettingsView.as_view(), name="telegram-bot-settings"),
+    path("capabilities/", TelegramBotCapabilitiesView.as_view(), name="telegram-bot-capabilities"),
     path("detect-owner-chat/", TelegramBotDetectOwnerChatView.as_view(), name="telegram-bot-detect-owner-chat"),
     path("test-message/", TelegramBotTestMessageView.as_view(), name="telegram-bot-test-message"),
     path("test-ai/", TelegramBotTestAIView.as_view(), name="telegram-bot-test-ai"),

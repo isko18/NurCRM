@@ -356,21 +356,128 @@ def generate_chat_response_with_tools(
     return "Не удалось сформировать ответ за допустимое число шагов.", last_model, functions_called
 
 
+OWNER_VOICE_MARK = "[ГОЛОС]"
+OWNER_TEXT_MARK = "[ТЕКСТ]"
+KY_LETTERS = set("ңөүҢӨҮ")
+
+# Модели озвучки Gemini (TTS): ответ — PCM 16 бит 24 кГц, в OGG/Opus переводит ffmpeg.
+GEMINI_TTS_MODELS = [
+    "gemini-2.5-flash-preview-tts",
+    "gemini-3.8-flash-lite-tts",
+    "gemini-3.1-flash-tts-preview",
+]
+GEMINI_TTS_VOICE = "Kore"
+VOICE_TEXT_MAX_CHARS = 600
+
+
+def detect_language(text: str) -> str:
+    """ru|ky по тексту владельца: кыргызские буквы или частые кыргызские слова → ky."""
+    t = (text or "").lower()
+    if any(ch in KY_LETTERS for ch in t):
+        return "ky"
+    words = set(re.findall(r"[а-яёa-z]+", t))
+    ky_words = {"канча", "бүгүн", "кече", "жума", "сатуу", "карыз", "товар", "акча", "эмне", "болду", "кылуу", "керек", "ким"}
+    return "ky" if len(words & ky_words) >= 2 or (words & {"канча", "бүгүн", "эмне"}) else "ru"
+
+
+def split_voice_and_text(reply: str):
+    """
+    Ответ ИИ владельцу в голосовом режиме: «[ГОЛОС] короткий итог [ТЕКСТ] подробности».
+    Возвращает (текст для озвучки без HTML, подробности для текстового сообщения или "").
+    Без меток — озвучиваются первые 2 предложения, подробности — весь ответ.
+    """
+    raw = (reply or "").strip()
+    if not raw:
+        return "", ""
+    voice_part, text_part = raw, ""
+    if OWNER_VOICE_MARK in raw:
+        after = raw.split(OWNER_VOICE_MARK, 1)[1]
+        if OWNER_TEXT_MARK in after:
+            voice_part, text_part = after.split(OWNER_TEXT_MARK, 1)
+        else:
+            voice_part, text_part = after, ""
+    elif OWNER_TEXT_MARK in raw:
+        voice_part, text_part = raw.split(OWNER_TEXT_MARK, 1)
+    else:
+        sentences = re.split(r"(?<=[.!?])\s+", re.sub(r"<[^>]+>", "", raw))
+        voice_part = " ".join(sentences[:2])
+        text_part = raw if len(sentences) > 2 or len(raw) > 200 else ""
+
+    voice_clean = re.sub(r"<[^>]+>", "", voice_part)
+    voice_clean = re.sub(r"[*_`#•▪️\-]+", " ", voice_clean)
+    voice_clean = re.sub(r"\s+", " ", voice_clean).strip()
+    if len(voice_clean) > VOICE_TEXT_MAX_CHARS:
+        voice_clean = voice_clean[:VOICE_TEXT_MAX_CHARS].rsplit(" ", 1)[0] + "…"
+    text_clean = normalize_ai_output_for_telegram(text_part.strip())
+    return voice_clean, text_clean
+
+
+def _owner_system_instruction(company, *, is_voice: bool, actions_enabled: bool, language: str) -> str:
+    from django.utils import timezone
+
+    today = timezone.localdate()
+    now = timezone.now()
+    tz_name = getattr(timezone.get_current_timezone(), "zone", "Asia/Bishkek")
+    company_name = getattr(company, "name", "магазина")
+    lang_name = "кыргызском" if language == "ky" else "русском"
+
+    voice_rules = ""
+    if is_voice:
+        voice_rules = (
+            "\nРЕЖИМ ГОЛОСА — владелец спросил голосом, ты ответишь голосовым сообщением. Формат ответа СТРОГО такой:\n"
+            f"{OWNER_VOICE_MARK} 1–3 коротких предложения для озвучки на {lang_name}: только главный итог, без списков, таблиц, "
+            "HTML и эмодзи; все числа и суммы — словами, округлённо («около восьмисот тысяч сом», «двенадцать чеков»).\n"
+            f"{OWNER_TEXT_MARK} подробности текстом (список, цифры, <pre>-блок) — если есть что уточнить; иначе оставь пустым.\n"
+            "ЗАПРЕЩЕНО писать «я текстовый бот», «не умею говорить/издавать звуки» и подобное: ты умеешь отвечать голосом.\n"
+        )
+
+    actions_rules = ""
+    if actions_enabled:
+        actions_rules = (
+            "\nИЗМЕНЕНИЯ ТОВАРОВ (только по просьбе владельца): приход, списание/брак, точный остаток, цена продажи, закупка, "
+            "минимальный остаток, срок годности, описание, страна, бренд, категория, штрихкод, артикул, новый товар. "
+            "Для этого вызови функцию propose_product_changes со списком изменений. Сам ты ничего не меняешь: бот покажет "
+            "владельцу список и кнопки «Выполнить»/«Отмена». В ответе кратко перечисли, что изменится, и попроси подтвердить. "
+            "Если функция вернула not_found — скажи, какие товары не нашлись, и попроси уточнить название.\n"
+        )
+
+    return (
+        f"Ты персональный ИИ-советник владельца магазина «{company_name}» в системе NurCRM (Telegram-бот).\n"
+        f"Сегодня: {today.strftime('%d.%m.%Y')} ({today.strftime('%A')}), время {now.strftime('%H:%M')} ({tz_name}).\n\n"
+        "СТРОГИЕ ПРАВИЛА:\n"
+        "1. Цифры — только из результатов функций (get_sales_summary, get_staff, get_shift_archive, get_stock_alerts, "
+        "get_debtors, get_expiring, get_stock, get_product и др.). Выдумывать суммы, остатки и проценты запрещено.\n"
+        "2. Период бери из вопроса (сегодня, вчера, неделя, прошлый месяц); если не сказан — с начала месяца.\n"
+        "3. Функция вернула ошибку или пусто — честно скажи «нет данных».\n"
+        f"4. Отвечай на языке владельца ({lang_name}); если он пишет на другом — на нём.\n"
+        "5. Формат для Telegram (HTML): короткие строки; списки «• Имя — 221 507 сом, 6 чеков, с 24.09», последней строкой «Итого»; "
+        "таблицы до 3–4 колонок — блоком <pre> с выровненными колонками. Markdown-таблицы запрещены. "
+        "Суммы — с пробелом между тысячами и словом «сом».\n"
+        "6. Длинный отчёт — главные цифры и предложи «Показать подробнее?».\n"
+        "7. Должники: на «напомни должникам» бот сам пришлёт список со ссылками WhatsApp — не придумывай ссылки.\n"
+        f"{actions_rules}{voice_rules}"
+    )
+
+
 def generate_owner_ai_response(
     company,
     settings,
     user_question: str,
     history: Optional[List[dict]] = None,
     is_voice: bool = False,
+    chat_id: str = None,
+    language: str = "ru",
 ) -> Tuple[str, str, List[str]]:
     """
-    Генерирует ответ владельцу с использованием аналитических функций F1-F20.
+    Ответ владельцу с аналитическими функциями (F1-F20 + ТЗ ч.15: сотрудники, архив смен,
+    остатки к заказу, сроки годности, предложения изменений товаров).
     Проверяет дневной лимит запросов ai_daily_limit.
     """
     from django.core.cache import cache
     from django.utils import timezone
     from apps.main.telegram_bot.services.ai_analytics_functions import (
         AI_TOOL_DECLARATIONS,
+        OWNER_ACTION_TOOL_DECLARATIONS,
         execute_ai_function,
     )
 
@@ -401,34 +508,12 @@ def generate_owner_ai_response(
             [],
         )
 
-    # 3. Формирование подсказки (systemInstruction)
-    today = timezone.localdate()
-    now = timezone.now()
-    tz_name = getattr(timezone.get_current_timezone(), "zone", "Asia/Bishkek")
-    company_name = getattr(company, "name", "магазина")
-
-    voice_instruction = (
-        "\nПОЛЬЗОВАТЕЛЬ ЗАДАЛ ВОПРОС ГОЛОСОМ: Отвечай предельно кратко, в 1–3 предложениях! "
-        "Только суть и главный итог цифр без длинных списков."
-        if is_voice else ""
+    actions_enabled = bool(getattr(settings, "ai_owner_actions_enabled", True)) and bool(chat_id)
+    system_instruction = _owner_system_instruction(
+        company, is_voice=is_voice, actions_enabled=actions_enabled, language=language,
     )
-
-    system_instruction = (
-        f"Ты персональный финансовый и операционный аналитик магазина «{company_name}» в системе NurCRM.\n"
-        f"Сегодняшняя дата: {today.strftime('%d.%m.%Y')} ({today.strftime('%A')}). Текущее время и часовой пояс: {now.strftime('%H:%M')} ({tz_name}).\n\n"
-        "СТРОГИЕ ПРАВИЛА:\n"
-        "1. Ты ОБЯЗАН вызывать соответствующие функции (get_sales_summary, get_pnl, get_cashflow, get_stock, get_debtors и др.) для получения точных цифр!\n"
-        "2. ЦИФРЫ — ТОЛЬКО ИЗ РЕЗУЛЬТАТОВ ВЫЗОВА ФУНКЦИЙ! Категорически запрещено выдумывать или предполагать любые суммы, остатки, проценты или количество.\n"
-        "3. Если функция вернула ошибку или данных нет — честно скажи: «нет данных» и подскажи команду из меню /help.\n"
-        "4. Отвечай на том языке, на котором задан вопрос (русский или кыргызский).\n"
-        "5. Формат для Telegram:\n"
-        "   - Короткие понятные строки.\n"
-        "   - Списки с маркером «•».\n"
-        "   - Суммы форматируй с пробелом между тысячами и словом «сом» (например: «12 450 сом»).\n"
-        "   - НЕ используй markdown-таблицы (они ломаются на смартфонах).\n"
-        "6. Если отчёт длиннее 15 строк — приведи главные цифры и спроси «Показать подробнее?».\n"
-        f"{voice_instruction}"
-    )
+    tools = list(AI_TOOL_DECLARATIONS) + (list(OWNER_ACTION_TOOL_DECLARATIONS) if actions_enabled else [])
+    ctx = {"settings": settings, "chat_id": chat_id}
 
     contents: List[dict] = []
     if history:
@@ -440,18 +525,19 @@ def generate_owner_ai_response(
         api_key=api_key,
         system_instruction=system_instruction,
         contents=contents,
-        tools=AI_TOOL_DECLARATIONS,
-        execute_tool_fn=lambda name, args: execute_ai_function(company, name, args),
+        tools=tools,
+        execute_tool_fn=lambda name, args: execute_ai_function(company, name, args, ctx=ctx),
         temperature=0.2,
-        max_tokens=900,
+        max_tokens=1100,
     )
 
 
 def transcribe_voice(api_key: str, audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
     """
-    Распознает голосовое сообщение через Gemini (inline_data).
+    Распознаёт речь (voice/audio/video_note) через Gemini (inline_data). Русский и кыргызский.
+    Пустая строка — не распознано.
     """
-    if not api_key:
+    if not api_key or not audio_bytes:
         return ""
 
     b64_audio = base64.b64encode(audio_bytes).decode("ascii")
@@ -461,13 +547,14 @@ def transcribe_voice(api_key: str, audio_bytes: bytes, mime_type: str = "audio/o
             "parts": [
                 {
                     "text": (
-                        "Транскрибируй аудиосообщение на русском или кыргызском языке. "
-                        "Верни ТОЛЬКО распознанный текст без кавычек, пояснений и вводных слов."
+                        "Транскрибируй речь из этого аудио. Язык — русский или кыргызский (может быть смешанный). "
+                        "Верни ТОЛЬКО распознанный текст без кавычек, пояснений и вводных слов. "
+                        "Если речи нет или её невозможно разобрать — верни ровно: [НЕРАЗБОРЧИВО]"
                     )
                 },
                 {
                     "inline_data": {
-                        "mime_type": mime_type,
+                        "mime_type": mime_type or "audio/ogg",
                         "data": b64_audio,
                     }
                 },
@@ -483,10 +570,131 @@ def transcribe_voice(api_key: str, audio_bytes: bytes, mime_type: str = "audio/o
             temperature=0.0,
             max_tokens=500,
         )
-        return text.strip()
     except Exception as exc:
         logger.error("Voice transcription failed: %s", exc)
         return ""
+    text = re.sub(r"<[^>]+>", "", text or "").strip()
+    if not text or "НЕРАЗБОРЧИВО" in text.upper():
+        return ""
+    return text
+
+
+def _pcm_to_ogg_opus(pcm: bytes, rate: int = 24000) -> bytes:
+    """PCM s16le mono → OGG/Opus для sendVoice (ffmpeg + libopus)."""
+    import subprocess
+
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",
+            "-c:a", "libopus", "-b:a", "32k", "-vbr", "on", "-application", "voip",
+            "-f", "ogg", "pipe:1",
+        ],
+        input=pcm, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg: {proc.stderr.decode('utf-8', 'ignore')[:300]}")
+    return proc.stdout
+
+
+def synthesize_voice(api_key: str, text: str, language: str = "ru") -> bytes:
+    """
+    Озвучивает короткий текст (ТЗ ч.15, п. 2.2): Gemini TTS → OGG/Opus. Пустые байты — не получилось,
+    вызывающий отвечает текстом.
+    """
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    if not api_key or not text:
+        return b""
+    if len(text) > VOICE_TEXT_MAX_CHARS:
+        text = text[:VOICE_TEXT_MAX_CHARS].rsplit(" ", 1)[0]
+    lang_hint = "на кыргызском языке" if language == "ky" else "на русском языке"
+    prompt = f"Прочитай спокойно и естественно, как помощник владельца магазина, {lang_hint}: {text}"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_TTS_VOICE}}},
+        },
+    }
+    _check_key_rate_limit(api_key)
+    with httpx.Client(timeout=40.0) as client:
+        for model in GEMINI_TTS_MODELS:
+            try:
+                resp = client.post(f"{GEMINI_API_BASE}/{model}:generateContent?key={api_key}", json=payload)
+            except httpx.RequestError as exc:
+                logger.warning("Gemini TTS %s connection error: %s", model, exc)
+                continue
+            if resp.status_code != 200:
+                logger.warning("Gemini TTS %s HTTP %s: %s", model, resp.status_code, resp.text[:200])
+                continue
+            try:
+                parts = resp.json()["candidates"][0]["content"]["parts"]
+            except (KeyError, IndexError, ValueError):
+                continue
+            for part in parts:
+                data = part.get("inlineData") or part.get("inline_data") or {}
+                if not data.get("data"):
+                    continue
+                mime = data.get("mimeType") or data.get("mime_type") or ""
+                raw = base64.b64decode(data["data"])
+                if "ogg" in mime or "opus" in mime:
+                    return raw
+                m = re.search(r"rate=(\d+)", mime)
+                rate = int(m.group(1)) if m else 24000
+                try:
+                    return _pcm_to_ogg_opus(raw, rate)
+                except Exception as exc:
+                    logger.error("TTS convert failed: %s", exc)
+                    return b""
+    return b""
+
+
+def generate_json(api_key: str, parts: List[dict], system_instruction: str = "", max_tokens: int = 2000):
+    """
+    Ответ Gemini как JSON (разбор накладной по фото и т.п.): без HTML-нормализации.
+    parts — части одного user-сообщения (текст и inline_data). Возвращает распарсенный объект или None.
+    """
+    import json
+
+    if not api_key:
+        return None
+    _check_key_rate_limit(api_key)
+    payload = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": max_tokens, "responseMimeType": "application/json"},
+    }
+    if system_instruction:
+        payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+    with httpx.Client(timeout=45.0) as client:
+        for model in GEMINI_MODELS:
+            try:
+                resp = client.post(f"{GEMINI_API_BASE}/{model}:generateContent?key={api_key}", json=payload)
+            except httpx.RequestError as exc:
+                logger.warning("Gemini JSON %s connection error: %s", model, exc)
+                continue
+            if resp.status_code != 200:
+                logger.warning("Gemini JSON %s HTTP %s: %s", model, resp.status_code, resp.text[:200])
+                if resp.status_code >= 500 or resp.status_code == 429:
+                    continue
+                return None
+            try:
+                cands = resp.json().get("candidates") or []
+                text = "".join(p.get("text", "") for p in cands[0]["content"]["parts"] if "text" in p).strip()
+            except (KeyError, IndexError, ValueError):
+                continue
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
+            try:
+                return json.loads(text)
+            except ValueError:
+                m = re.search(r"[\[{].*[\]}]", text, flags=re.DOTALL)
+                if m:
+                    try:
+                        return json.loads(m.group(0))
+                    except ValueError:
+                        pass
+                logger.warning("Gemini JSON %s returned non-JSON: %s", model, text[:200])
+                continue
+    return None
 
 
 def test_ai(api_key: str) -> dict:

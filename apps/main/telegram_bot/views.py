@@ -100,7 +100,7 @@ class TelegramBotSettingsView(APIView):
                 new_v = getattr(settings, k)
                 old_v = old_data.get(k)
                 if old_v != new_v:
-                    changes[k] = [old_v, new_v]
+                    changes[k] = [_jsonable(old_v), _jsonable(new_v)]
         if changes:
             TelegramBotAudit.objects.create(
                 company=company,
@@ -114,6 +114,35 @@ class TelegramBotSettingsView(APIView):
         if {"token", "owner_chat_id"} & set(changes):
             _sync_menu_quietly(company)  # ТЗ ч.12, 2.9: меню команд — сразу при подключении бота
         return Response(serializer.data)
+
+
+BOT_CAPABILITIES = {
+    "voice_in": True,
+    "voice_out": True,
+    "staff": True,
+    "shift_archive": True,
+    "product_actions": True,
+    "invoice_photo": True,
+    "debt_reminders": True,
+}
+
+
+class TelegramBotCapabilitiesView(APIView):
+    """
+    GET /api/main/telegram-bot/capabilities/ (ТЗ ч.15, п. 7) — что умеет бот на этом сервере.
+    Касса по этому ответу показывает владельцу только рабочие переключатели.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        return Response(dict(BOT_CAPABILITIES))
+
+
+def _jsonable(value):
+    """Decimal/дата → строка, чтобы класть в JSONField журнала."""
+    if isinstance(value, (Decimal,)) or hasattr(value, "isoformat"):
+        return str(value)
+    return value
 
 
 def _sync_menu_quietly(company):

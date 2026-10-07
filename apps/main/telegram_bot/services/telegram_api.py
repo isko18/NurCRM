@@ -167,6 +167,17 @@ def send_message(token: str, chat_id: str, text: str, parse_mode: str = "HTML", 
         return {"ok": False, "description": str(exc)}
 
 
+def send_chat_action(token: str, chat_id: str, action: str = "typing") -> None:
+    """«Печатает…» / «записывает голосовое…» (record_voice), пока бот думает. Ошибки не мешают ответу."""
+    if not token or not chat_id:
+        return
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            client.post(f"{TELEGRAM_API_BASE}/bot{token}/sendChatAction", json={"chat_id": str(chat_id), "action": action})
+    except Exception as exc:
+        logger.debug("sendChatAction error for chat %s: %s", chat_id, exc)
+
+
 def send_voice(token: str, chat_id: str, voice_bytes: bytes, caption: str = None) -> dict:
     """Отправляет голосовое сообщение (OGG/Opus)."""
     if not token or not chat_id or not voice_bytes:

@@ -1,4 +1,5 @@
 import uuid
+from decimal import Decimal
 from django.conf import settings as django_settings
 from django.db import models
 from apps.main.telegram_bot.crypto import encrypt_secret, decrypt_secret
@@ -45,6 +46,19 @@ class TelegramBotSettings(models.Model):
     consultant_enabled = models.BooleanField("ИИ-консультант покупателей включён", default=True)
     customer_limit_per_hour = models.PositiveIntegerField("Лимит запросов покупателя в час", default=20)
     voice_replies_enabled = models.BooleanField("Голосовые ответы включены", default=True)
+    # ТЗ ч.15: голос и действия ИИ в чате владельца
+    class VoiceLanguage(models.TextChoices):
+        AUTO = "auto", "Как у владельца"
+        RU = "ru", "Русский"
+        KY = "ky", "Кыргызский"
+
+    voice_language = models.CharField(
+        "Язык голосового ответа", max_length=8, choices=VoiceLanguage.choices, default=VoiceLanguage.AUTO,
+    )
+    ai_min_markup_percent = models.DecimalField(
+        "Минимальная наценка при приходе по накладной, %", max_digits=6, decimal_places=2, default=Decimal("20.00"),
+    )
+    ai_owner_actions_enabled = models.BooleanField("ИИ может предлагать изменения товаров", default=True)
     send_product_photos = models.BooleanField("Присылать фото товаров", default=True)
     last_update_at = models.DateTimeField("Последнее входящее обновление", blank=True, null=True)
     last_reply_at = models.DateTimeField("Последний ответ бота", blank=True, null=True)

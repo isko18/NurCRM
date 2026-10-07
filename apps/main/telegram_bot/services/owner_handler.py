@@ -2,6 +2,7 @@ import re
 import urllib.parse
 from decimal import Decimal
 from datetime import timedelta
+import html
 import logging
 
 from django.utils import timezone
@@ -940,6 +941,98 @@ def build_owner_system_summary(company, user_question: str = "") -> str:
 
 
 # =========================================================================
+# ТЗ ч.15: язык, голосовой ответ, подтверждения, фото накладной
+# =========================================================================
+
+def _owner_language(settings, text: str) -> str:
+    forced = getattr(settings, "voice_language", "auto") or "auto"
+    if forced in ("ru", "ky"):
+        return forced
+    return ai_service.detect_language(text)
+
+
+def _reply_owner(settings, chat_id: str, reply_html: str, *, is_voice: bool = False, language: str = "ru") -> None:
+    """
+    Текстовый ответ, а если вопрос был голосовым и «Ответы голосом» включены — сначала голосовое
+    (короткий итог), затем подробности текстом (ТЗ ч.15, п. 2.2). Нет озвучки — отвечаем текстом.
+    """
+    token = settings.token
+    reply_html = reply_html or ""
+    if not (is_voice and getattr(settings, "voice_replies_enabled", True)):
+        if reply_html:
+            telegram_api.send_message(token, chat_id, ai_service.normalize_ai_output_for_telegram(reply_html) or reply_html)
+        return
+
+    voice_text, details = ai_service.split_voice_and_text(reply_html)
+    sent_voice = False
+    api_key = ai_service.get_effective_ai_key(settings.ai_key)
+    if voice_text and api_key:
+        try:
+            audio = ai_service.synthesize_voice(api_key, voice_text, language=language)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("TTS failed for company %s: %s", settings.company_id, exc)
+            audio = b""
+        if audio:
+            res = telegram_api.send_voice(token, chat_id, audio)
+            sent_voice = bool(res.get("ok"))
+    if sent_voice:
+        if details:
+            telegram_api.send_message(token, chat_id, details)
+    else:
+        # Озвучить не вышло — весь ответ текстом без служебных меток
+        full = reply_html.replace(ai_service.OWNER_VOICE_MARK, "").replace(ai_service.OWNER_TEXT_MARK, "\n")
+        telegram_api.send_message(token, chat_id, ai_service.normalize_ai_output_for_telegram(full) or full)
+
+
+def _announce_pending(settings, chat_id: str, pending: dict) -> None:
+    from apps.main.telegram_bot.services import owner_actions
+
+    text, markup = owner_actions.build_confirmation_message(pending)
+    res = telegram_api.send_message(settings.token, chat_id, text, parse_mode="HTML", reply_markup=markup)
+    pending["announced"] = True
+    pending["message_id"] = (res.get("result") or {}).get("message_id") if isinstance(res, dict) else None
+    owner_actions.save_pending(settings.company_id, chat_id, pending)
+
+
+def handle_owner_photo(settings, chat_id: str, image_bytes: bytes, mime_type: str = "image/jpeg", caption: str = "") -> None:
+    """ТЗ ч.15, п. 5: фото накладной/чека/прайса → список прихода с наценкой и кнопками."""
+    from apps.main.telegram_bot.services import owner_actions
+
+    token = settings.token
+    company = settings.company
+    if not getattr(settings, "ai_enabled", True) or not getattr(settings, "ai_owner_actions_enabled", True):
+        telegram_api.send_message(token, chat_id, "Разбор накладных по фото отключён в настройках бота.")
+        return
+    api_key = ai_service.get_effective_ai_key(settings.ai_key)
+    if not api_key:
+        telegram_api.send_message(token, chat_id, "Ключ Google Gemini не настроен — не могу прочитать фото.")
+        return
+    telegram_api.send_chat_action(token, chat_id, "typing")
+    parsed = owner_actions.parse_invoice_photo(api_key, image_bytes, mime_type)
+    if parsed.get("error") or (not parsed.get("rows") and not parsed.get("unparsed")):
+        telegram_api.send_message(token, chat_id, "Не смог разобрать документ на фото. Сфотографируйте ближе и ровнее, чтобы были видны названия, количество и цены.")
+        return
+    min_markup = Decimal(str(getattr(settings, "ai_min_markup_percent", 20) or 20))
+    cap_markup = owner_actions.parse_markup_request(caption or "")
+    if cap_markup is not None and cap_markup >= min_markup:
+        min_markup = cap_markup
+    pending = owner_actions.build_invoice_pending(company, chat_id, parsed, min_markup=min_markup)
+    if not pending["changes"]:
+        lines = ["Ни одной строки с названием, количеством и ценой не разобрал."]
+        if pending.get("unparsed"):
+            lines.append("Что увидел:")
+            lines += [f"• {html.escape(str(u))}" for u in pending["unparsed"][:15]]
+        telegram_api.send_message(token, chat_id, "\n".join(lines), parse_mode="HTML")
+        owner_actions.clear_pending(company.id, chat_id)
+        return
+    telegram_api.send_message(
+        token, chat_id,
+        f"Наценка {owner_actions.fmt_money(min_markup)} % — оставить или другую? (например: «поставь 25 %»)",
+    )
+    _announce_pending(settings, chat_id, pending)
+
+
+# =========================================================================
 # Главный диспетчер сообщений владельца
 # =========================================================================
 
@@ -952,6 +1045,34 @@ def handle_owner_message(settings, chat_id: str, text: str, is_voice: bool = Fal
 
     company = settings.company
     norm = (text or "").strip().lower()
+    language = _owner_language(settings, text)
+
+    # 0. ТЗ ч.15, п. 4–5: ожидающие подтверждения изменения («да»/«нет», «поставь 25 %»)
+    from apps.main.telegram_bot.services import owner_actions
+
+    pending = owner_actions.get_pending(company.id, chat_id)
+    if pending:
+        if owner_actions.is_yes(norm):
+            result = owner_actions.execute_pending(company, chat_id, pending, user=getattr(company, "owner", None))
+            _reply_owner(settings, chat_id, owner_actions.build_result_message(result), is_voice=is_voice, language=language)
+            return
+        if owner_actions.is_no(norm):
+            owner_actions.clear_pending(company.id, chat_id)
+            _reply_owner(settings, chat_id, "Отменено, ничего не менял.", is_voice=is_voice, language=language)
+            return
+        if pending.get("kind") == "invoice":
+            new_markup = owner_actions.parse_markup_request(norm)
+            if new_markup is not None:
+                pending = owner_actions.apply_markup_to_pending(pending, new_markup)
+                owner_actions.save_pending(company.id, chat_id, pending)
+                _announce_pending(settings, chat_id, pending)
+                return
+
+    # ТЗ ч.15, п. 6: «напомни должникам» — список со ссылками WhatsApp (бот сам должникам не пишет)
+    if re.search(r"напомни(ть)?\s+(всем\s+)?должник|напоминани[ея]\s+должник|карыздарга\s+эскерт", norm) and "разослать" not in norm:
+        reply = owner_actions.build_debt_reminders_message(company, owner_actions.extract_debtor_names(norm))
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
+        return
 
     # 1. Команды с слэшем и кнопки постоянного меню владельца (ТЗ-09 п. 2.5)
     owner_menu = get_owner_main_menu_keyboard()
@@ -1186,6 +1307,10 @@ def handle_owner_message(settings, chat_id: str, text: str, is_voice: bool = Fal
     cache_key = f"tg_chat_history:{company.id}:{chat_id}"
     history = cache.get(cache_key) or []
 
+    # ТЗ ч.15, п. 2.3: пока бот думает — «записывает голосовое» / «печатает»
+    voice_reply = bool(is_voice and getattr(settings, "voice_replies_enabled", True))
+    telegram_api.send_chat_action(token, chat_id, "record_voice" if voice_reply else "typing")
+
     try:
         if getattr(settings, "ai_functions_enabled", True):
             ai_reply, _model, functions_called = ai_service.generate_owner_ai_response(
@@ -1193,7 +1318,9 @@ def handle_owner_message(settings, chat_id: str, text: str, is_voice: bool = Fal
                 settings=settings,
                 user_question=text,
                 history=history,
-                is_voice=is_voice,
+                is_voice=voice_reply,
+                chat_id=chat_id,
+                language=language,
             )
         else:
             system_instruction = build_owner_system_summary(company, user_question=text)
@@ -1215,8 +1342,13 @@ def handle_owner_message(settings, chat_id: str, text: str, is_voice: bool = Fal
         history.append({"role": "model", "parts": [{"text": ai_reply}]})
         cache.set(cache_key, history[-8:], timeout=86400)
 
-        # Отправка текстового ответа
-        telegram_api.send_message(token, chat_id, ai_reply)
+        # Ответ: голосом + подробности текстом, либо просто текстом
+        _reply_owner(settings, chat_id, ai_reply, is_voice=is_voice, language=language)
+
+        # ИИ предложил изменения товаров — показываем список с кнопками (ТЗ ч.15, п. 4.2)
+        pending = owner_actions.get_pending(company.id, chat_id)
+        if pending and not pending.get("announced"):
+            _announce_pending(settings, chat_id, pending)
 
     except Exception as exc:
         logger.error("Owner AI conversation failed: %s", exc)

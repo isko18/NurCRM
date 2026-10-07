@@ -180,9 +180,20 @@ def process_telegram_update(settings_id: str, update_data: dict, enqueued_at: fl
         chat_title = chat.get("title") or ""
         sender_name = f"{(from_user.get('first_name') or '').strip()} {(from_user.get('last_name') or '').strip()}".strip() or (from_user.get("username") or "")
 
-        text = message.get("text") or ""
-        voice = message.get("voice")
-        is_voice = bool(voice)
+        text = message.get("text") or message.get("caption") or ""
+        # ТЗ ч.15, п. 2.1: voice, audio и video_note распознаются одинаково
+        audio_part, audio_mime = None, "audio/ogg"
+        if message.get("voice"):
+            audio_part, audio_mime = message["voice"], message["voice"].get("mime_type") or "audio/ogg"
+        elif message.get("audio"):
+            audio_part, audio_mime = message["audio"], message["audio"].get("mime_type") or "audio/mpeg"
+        elif message.get("video_note"):
+            audio_part, audio_mime = message["video_note"], "video/mp4"
+        is_voice = audio_part is not None
+
+        # Проверяем: владелец или покупатель (TZ 5.1)
+        is_owner = (settings.owner_chat_id and str(settings.owner_chat_id) == str(chat_id))
+        audience = "owner" if is_owner else "customers"
 
         # Логируем для detect-owner-chat
         TelegramMessageLog.objects.create(
@@ -193,10 +204,29 @@ def process_telegram_update(settings_id: str, update_data: dict, enqueued_at: fl
             text=text if not is_voice else "[Голосовое сообщение]",
         )
 
-        # Если входящее голосовое сообщение
-        if is_voice and voice:
-            file_id = voice.get("file_id")
+        # ТЗ ч.15, п. 5: фото накладной от владельца (photo или document-картинка)
+        image_part, image_mime = None, "image/jpeg"
+        if message.get("photo"):
+            image_part = sorted(message["photo"], key=lambda ph: ph.get("file_size") or 0)[-1]
+        elif (message.get("document") or {}).get("mime_type", "").startswith("image/"):
+            image_part, image_mime = message["document"], message["document"]["mime_type"]
+        if image_part is not None and is_owner:
             token = settings.token
+            file_info = telegram_api.get_file(token, image_part.get("file_id")) if token else {}
+            image_bytes = telegram_api.download_file(token, file_info["file_path"]) if file_info.get("file_path") else b""
+            if image_bytes:
+                owner_handler.handle_owner_photo(settings, chat_id, image_bytes, image_mime, caption=text)
+            else:
+                telegram_api.send_message(token, chat_id, "Не удалось скачать фото из Telegram, пришлите ещё раз.")
+            from django.utils import timezone
+            TelegramBotSettings.objects.filter(id=settings.id).update(last_reply_at=timezone.now())
+            return
+
+        # Если входящее голосовое сообщение
+        if is_voice:
+            file_id = audio_part.get("file_id")
+            token = settings.token
+            transcribed = ""
             if token and file_id:
                 file_info = telegram_api.get_file(token, file_id)
                 file_path = file_info.get("file_path")
@@ -204,16 +234,16 @@ def process_telegram_update(settings_id: str, update_data: dict, enqueued_at: fl
                     audio_bytes = telegram_api.download_file(token, file_path)
                     ai_key = ai_service.get_effective_ai_key(settings.ai_key)
                     if audio_bytes and ai_key:
-                        transcribed = ai_service.transcribe_voice(ai_key, audio_bytes)
-                        if transcribed:
-                            text = transcribed
+                        transcribed = ai_service.transcribe_voice(ai_key, audio_bytes, mime_type=audio_mime)
+            if transcribed:
+                text = transcribed
+            elif not text:
+                if token:
+                    telegram_api.send_message(token, chat_id, "Не расслышал, повторите или напишите текстом.", parse_mode=None)
+                return
 
         if not text:
             return
-
-        # Проверяем: владелец или покупатель (TZ 5.1)
-        is_owner = (settings.owner_chat_id and str(settings.owner_chat_id) == str(chat_id))
-        audience = "owner" if is_owner else "customers"
 
         # 1. Проверяем кастомный сценарий-команду (ТЗ-11 п. 1.4)
         if text.strip().startswith("/"):
