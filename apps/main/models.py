@@ -1007,7 +1007,9 @@ class Product(models.Model):
                 has_history = True
         if has_history:
             self.status = self.Status.ARCHIVED
-            self.save(update_fields=["status"])
+            self.save(update_fields=["status", "updated_at"])
+            # Для кассы архивный товар — удалённый: убирает его из каталога при синхронизации.
+            ProductDeletion.objects.create(company_id=self.company_id, product_id=self.pk)
             return 1, {self._meta.label: 1}
         return super().delete(*args, **kwargs)
 

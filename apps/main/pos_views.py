@@ -1226,7 +1226,16 @@ def _lookup_product_for_pos_scan(company_id, barcode: str, *, only_fields=POS_SC
     """
     Единый поиск товара для POS-скана.
     Возвращает (product, scale_data|None, error_message|None).
+    Удалённый (архивный) товар не продаётся.
     """
+    product, scale_data, error = _lookup_product_for_pos_scan_any(company_id, barcode, only_fields=only_fields)
+    if product is not None and getattr(product, "status", None) == Product.Status.ARCHIVED:
+        return None, scale_data, "Товар удалён"
+    return product, scale_data, error
+
+
+def _lookup_product_for_pos_scan_any(company_id, barcode: str, *, only_fields=POS_SCAN_PRODUCT_FIELDS):
+    """Поиск товара для POS-скана без учёта статуса (см. _lookup_product_for_pos_scan)."""
     barcode = (barcode or "").strip()
     if not barcode:
         return None, None, "Пустой штрихкод"

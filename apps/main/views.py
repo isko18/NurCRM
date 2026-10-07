@@ -834,6 +834,15 @@ def _filter_products_company_only(view, qs):
         qp = req.GET
     branch_param = qp.get("branch") if qp else None
 
+    # Удалённый товар с историей продаж остаётся в базе со статусом archived —
+    # в каталоге его не показываем (архив — только по ?include_archived=1 или ?status=archived).
+    show_archived = bool(qp) and (
+        str(qp.get("include_archived") or "").strip().lower() in ("1", "true", "yes")
+        or str(qp.get("status") or "").strip().lower() == Product.Status.ARCHIVED
+    )
+    if not show_archived:
+        qs = qs.exclude(status=Product.Status.ARCHIVED)
+
     if branch_param:
         if str(branch_param).strip().lower() == "main":
             qs = qs.filter(branch__isnull=True)
