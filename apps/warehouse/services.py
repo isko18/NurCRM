@@ -1,10 +1,11 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from django.db import transaction
 from django.utils import timezone
 from django.conf import settings
 
 from . import models
+from . import stock as stock_service
 from .models import q_qty
 from .utils import effective_payment_kind
 
@@ -104,53 +105,6 @@ def resolve_document_context_warehouse(document):
     raise ValueError("Для документа нужен warehouse_from или строки с товарами со склада.")
 
 
-def product_card_qty(product) -> Decimal:
-    """
-    Количество из карточки товара, прочитанное из БД.
-
-    Внутри проведения документа карточка обновляется через QuerySet.update(), поэтому
-    экземпляр в памяти остаётся со старым количеством. Если сверять остаток с ним,
-    вторая строка по тому же товару «поднимет» остаток обратно и списание потеряется.
-    """
-    pk = getattr(product, "pk", None)
-    if pk is None:
-        return q_qty(Decimal(getattr(product, "quantity", None) or 0))
-    row = type(product).objects.filter(pk=pk).values_list("quantity", flat=True).first()
-    return q_qty(Decimal(row or 0))
-
-
-def resolve_warehouse_on_hand_qty(*, warehouse, product, balance=None, sync=False):
-    """
-    Эффективный остаток на складе для проверок и списаний.
-
-    В UI и карточке товара показывается WarehouseProduct.quantity, а операции
-    часто смотрят StockBalance.qty. Если записи разошлись (balance=0, product>0),
-    берём max(...) для товара, привязанного к этому складу.
-    """
-    product_on_warehouse = getattr(product, "warehouse_id", None) == getattr(warehouse, "id", None)
-    prod_qty = product_card_qty(product) if product_on_warehouse else Decimal("0.000")
-
-    if balance is not None:
-        bal_qty = q_qty(Decimal(getattr(balance, "qty", None) or 0))
-        effective = max(bal_qty, prod_qty) if product_on_warehouse else bal_qty
-        if sync and effective != bal_qty:
-            balance.qty = effective
-            balance.save(update_fields=["qty"])
-        return effective, balance
-
-    effective = prod_qty if product_on_warehouse else Decimal("0.000")
-    if sync and product_on_warehouse and effective > 0:
-        balance, _ = models.StockBalance.objects.get_or_create(
-            warehouse=warehouse,
-            product=product,
-            defaults={"qty": effective},
-        )
-        if q_qty(Decimal(balance.qty or 0)) != effective:
-            balance.qty = effective
-            balance.save(update_fields=["qty"])
-    return effective, balance
-
-
 def agent_has_common_access_to_warehouse(*, user, warehouse, company=None) -> bool:
     """Активное членство агента с общим доступом к указанному складу (продажи с остатка склада)."""
     if user is None or warehouse is None:
@@ -245,6 +199,47 @@ def _ensure_number(document: models.Document):
         document.save()
 
 
+DOCUMENT_FUTURE_DATE_ERROR = "Дата документа не может быть в будущем."
+
+
+def is_document_date_in_future(value) -> bool:
+    """Дата документа позже «сейчас + 1 день» — такие продажи выпадают из текущего периода аналитики."""
+    if not value:
+        return False
+    if not isinstance(value, datetime):
+        value = datetime.combine(value, datetime.min.time())
+    if timezone.is_naive(value):
+        value = timezone.make_aware(value)
+    return value > timezone.now() + timedelta(days=1)
+
+
+def compute_net_amounts(items, doc_discount) -> dict:
+    """
+    Чистая сумма каждой строки: line_total минус пропорциональная доля скидки документа.
+    Остаток округления уходит в самую крупную строку, чтобы Σ net_amount == итог документа.
+    Возвращает {item.pk: Decimal}.
+    """
+    cent = Decimal("0.01")
+    items = list(items)
+    lines = {i.pk: Decimal(i.line_total or 0) for i in items}
+    subtotal = sum(lines.values(), Decimal("0.00"))
+    doc_discount = Decimal(doc_discount or 0)
+    target = max(Decimal("0.00"), (subtotal - doc_discount).quantize(cent))
+    if not lines:
+        return {}
+    if subtotal <= 0 or doc_discount <= 0:
+        nets = {pk: v.quantize(cent) for pk, v in lines.items()}
+    else:
+        nets = {
+            pk: (v - doc_discount * v / subtotal).quantize(cent) for pk, v in lines.items()
+        }
+    diff = target - sum(nets.values(), Decimal("0.00"))
+    if diff != 0:
+        biggest = max(lines, key=lambda pk: lines[pk])
+        nets[biggest] = (nets[biggest] + diff).quantize(cent)
+    return nets
+
+
 def recalc_document_totals(document: models.Document) -> models.Document:
     # line_total: одна скидка на строку — процент (строковый или общий по документу),
     # а если процента нет — сумма скидки строки. Оба сразу не вычитаем.
@@ -272,26 +267,15 @@ def recalc_document_totals(document: models.Document) -> models.Document:
     total = max(Decimal("0.00"), (subtotal - doc_da).quantize(Decimal("0.01")))
     document.total = total
     document.save(update_fields=["total"])
+
+    all_items = list(document.items.all())
+    nets = compute_net_amounts(all_items, doc_da)
+    for item in all_items:
+        net = nets.get(item.pk, Decimal("0.00"))
+        if item.net_amount != net:
+            item.net_amount = net
+            item.save(update_fields=["net_amount"])
     return document
-
-
-def _apply_move(move: models.StockMove):
-    # apply qty_delta to StockBalance
-    # Оптимизация: используем select_related если warehouse и product уже загружены
-    bal, created = models.StockBalance.objects.select_for_update().get_or_create(
-        warehouse=move.warehouse, product=move.product, defaults={"qty": Decimal("0.000")}
-    )
-    if move.product.warehouse_id == move.warehouse_id:
-        # Количество читаем из БД, а не из move.product: в цикле проведения карточка
-        # уже могла быть обновлена предыдущей строкой по этому же товару.
-        prod_qty = product_card_qty(move.product)
-        bal_qty = q_qty(Decimal(bal.qty or 0))
-        if created or (bal_qty <= 0 and prod_qty > 0) or (prod_qty > bal_qty):
-            bal.qty = prod_qty
-    bal.qty = Decimal(bal.qty or 0) + Decimal(move.qty_delta or 0)
-    bal.save()
-    if move.product.warehouse_id == move.warehouse_id:
-        type(move.product).objects.filter(pk=move.product_id).update(quantity=q_qty(bal.qty))
 
 
 def _apply_agent_move(move: models.AgentStockMove):
@@ -319,11 +303,40 @@ def _resolve_money_doc_type(doc_type: str):
         models.Document.DocType.PURCHASE: models.MoneyDocument.DocType.MONEY_EXPENSE,
         models.Document.DocType.SALE_RETURN: models.MoneyDocument.DocType.MONEY_EXPENSE,
         models.Document.DocType.PURCHASE_RETURN: models.MoneyDocument.DocType.MONEY_RECEIPT,
-        models.Document.DocType.RECEIPT: models.MoneyDocument.DocType.MONEY_RECEIPT,
-        models.Document.DocType.WRITE_OFF: models.MoneyDocument.DocType.MONEY_EXPENSE,
-        # INVENTORY / TRANSFER - без денежного движения (только подтверждение/отклонение).
+        # Приход товара, оплаченный из кассы, — это расход денег (поставщику).
+        models.Document.DocType.RECEIPT: models.MoneyDocument.DocType.MONEY_EXPENSE,
+        # WRITE_OFF / INVENTORY / TRANSFER - без денежного движения.
     }
     return mapping.get(doc_type)
+
+
+def _resolve_document_payment_category(document, company, branch):
+    """
+    Категория платежа для авто-денежного документа: указанная в документе, иначе
+    системная по типу документа (создаётся при необходимости), иначе None («Без категории»).
+    Раньше бралась «первая попавшаяся» категория компании — отсюда мусор в отчётах.
+    """
+    payment_category = getattr(document, "payment_category", None)
+    if payment_category is not None:
+        return payment_category
+
+    SC = models.PaymentCategory.SystemCode
+    code_by_doc_type = {
+        models.Document.DocType.SALE: SC.SALE,
+        models.Document.DocType.PURCHASE: SC.PURCHASE,
+        models.Document.DocType.RECEIPT: SC.PURCHASE,
+        models.Document.DocType.SALE_RETURN: SC.SALE_RETURN,
+        models.Document.DocType.PURCHASE_RETURN: SC.PURCHASE_RETURN,
+    }
+    code = code_by_doc_type.get(document.doc_type)
+    if code is None:
+        return None
+    from .utils import ensure_system_payment_categories
+
+    ensure_system_payment_categories(company, branch)
+    return models.PaymentCategory.objects.filter(
+        company=company, branch=branch, system_code=code
+    ).first()
 
 
 def _pick_single(qs, *, what: str, allow_multiple_take_first: bool = False):
@@ -344,6 +357,58 @@ def _pick_single(qs, *, what: str, allow_multiple_take_first: bool = False):
         except Exception:
             return qs.first()
     raise ValueError(f"Найдено несколько объектов ({what}). Укажите явно в документе.")
+
+
+class CashRegisterNotFound(ValueError):
+    """Касса для складского документа не найдена. api_code — для фронта (кнопка «Создать кассу»)."""
+
+    api_code = "cash_register_not_found"
+
+
+def error_payload(exc) -> dict:
+    """Тело ответа 400 для ошибки сервиса: {"detail": ...} и "code", если он есть у исключения."""
+    data = {"detail": str(exc)}
+    code = getattr(exc, "api_code", None)
+    if code:
+        data["code"] = code
+    return data
+
+
+def resolve_cash_register(*, company, branch, explicit=None):
+    """
+    Касса для денег складского документа.
+
+    explicit — касса из документа: своя компания; касса филиала склада или касса
+    компании без филиала (общая). Без явной кассы: касса филиала склада (при нескольких —
+    первая), иначе — единственная касса компании без филиала. Нет подходящей —
+    CashRegisterNotFound с понятным текстом.
+    """
+    if explicit is not None:
+        if explicit.company_id != company.id:
+            raise ValueError("Касса принадлежит другой компании.")
+        if explicit.branch_id is not None and (branch is None or explicit.branch_id != branch.id):
+            raise ValueError("Касса принадлежит другому филиалу.")
+        return explicit
+
+    base = models.CashRegister.objects.filter(company=company)
+    if branch is not None:
+        cash_register = _pick_single(base.filter(branch=branch), what="касс", allow_multiple_take_first=True)
+        if cash_register is not None:
+            return cash_register
+    company_level = list(base.filter(branch__isnull=True).order_by("id")[:2])
+    if len(company_level) == 1:
+        return company_level[0]
+    if len(company_level) > 1:
+        if branch is None:
+            return company_level[0]
+        raise CashRegisterNotFound(
+            f"В филиале «{branch.name}» нет кассы, а касс компании несколько. "
+            "Создайте кассу филиала или выберите кассу в документе."
+        )
+    where = f"В компании (филиале «{branch.name}»)" if branch is not None else "В компании"
+    raise CashRegisterNotFound(
+        f"{where} нет кассы. Создайте кассу или выберите оплату «В долг» / «Вне кассы»."
+    )
 
 
 def _create_or_reset_cash_request(document: models.Document):
@@ -448,28 +513,13 @@ def _create_or_post_money_document(
     company = warehouse.company
     branch = warehouse.branch
 
-    # cash register: from document or auto-pick (при нескольких кассах берём первую)
-    cash_register = getattr(document, "cash_register", None)
-    if cash_register is None:
-        qs = models.CashRegister.objects.filter(company=company)
-        qs = qs.filter(branch=branch) if branch is not None else qs.filter(branch__isnull=True)
-        cash_register = _pick_single(qs, what="касс", allow_multiple_take_first=True)
-        if cash_register is None:
-            raise ValueError("Не найдена касса. Создайте кассу или укажите cash_register в документе.")
-
-    if cash_register.company_id != company.id:
-        raise ValueError("Касса принадлежит другой компании.")
-    if (branch is None and cash_register.branch_id is not None) or (branch is not None and cash_register.branch_id != branch.id):
-        raise ValueError("Касса принадлежит другому филиалу.")
+    # cash register: from document or auto-pick (касса филиала, иначе касса компании)
+    cash_register = resolve_cash_register(
+        company=company, branch=branch, explicit=getattr(document, "cash_register", None)
+    )
 
     # payment category: с документа или автовыбор (как касса — при нескольких берём первую); можно не указывать
-    payment_category = getattr(document, "payment_category", None)
-    if payment_category is None:
-        qs = models.PaymentCategory.objects.filter(company=company)
-        qs = qs.filter(branch=branch) if branch is not None else qs.filter(branch__isnull=True)
-        payment_category = _pick_single(
-            qs, what="категорий платежа", allow_multiple_take_first=True
-        )
+    payment_category = _resolve_document_payment_category(document, company, branch)
 
     if payment_category is not None:
         if payment_category.company_id != company.id:
@@ -559,7 +609,10 @@ def post_document(
 
     if not document.items.exists():
         raise ValueError("Cannot post empty document")
-    
+
+    if is_document_date_in_future(document.date):
+        raise ValueError(DOCUMENT_FUTURE_DATE_ERROR)
+
     # Валидация документа перед проведением
     try:
         document.clean()
@@ -613,6 +666,23 @@ def post_document(
 
         # Оптимизация: предзагружаем items с продуктами
         items = list(document.items.select_related("product", "product__warehouse", "product__brand", "product__category").all())
+
+        if document.company_id is None:
+            company_id = document.resolve_company_id()
+            if company_id is not None:
+                document.company_id = company_id
+                models.Document.objects.filter(pk=document.pk).update(company_id=company_id)
+
+        # Себестоимость фиксируется на момент проведения (C5): смена закупочной цены
+        # позже не меняет прибыль и убытки прошлых периодов.
+        costed = []
+        for item in items:
+            cost = Decimal(getattr(item.product, "purchase_price", None) or 0).quantize(Decimal("0.01"))
+            if item.cost_price != cost:
+                item.cost_price = cost
+                costed.append(item)
+        if costed:
+            models.DocumentItem.objects.bulk_update(costed, ["cost_price"])
 
         agent_personal_stock = bool(
             document.agent_id and not bool(getattr(document, "use_common_stock", False))
@@ -710,10 +780,9 @@ def post_document(
                     if existing:
                         return existing
 
-                if source.name:
-                    existing = qs.filter(name=source.name).first()
-                    if existing:
-                        return existing
+                # Поиск только по названию убран: разные товары с одинаковым именем
+                # склеивались, и приход уходил не в тот товар. Нет совпадения по
+                # штрихкоду/коду/артикулу+названию — создаём новый товар на приёмнике.
 
                 code = source.code
                 if code and qs.filter(code=code).exists():
@@ -762,86 +831,69 @@ def post_document(
             for item in items:
                 if item.product.warehouse_id != document.warehouse_from_id:
                     raise ValueError("Transfer requires product from warehouse_from")
-                # Проверка остатков перед созданием moves
+                qty_to_move = q_qty(Decimal(item.qty))
+                # Проверка остатка — только по регистру склада-источника, под блокировкой.
                 if not allow_negative:
-                    bal_from = models.StockBalance.objects.select_for_update().filter(
-                        warehouse=document.warehouse_from, product=item.product
-                    ).first()
-                    if bal_from:
-                        cur_from = Decimal(bal_from.qty) if bal_from.qty else Decimal("0")
-                    else:
-                        # Если StockBalance нет, проверяем quantity товара (если товар принадлежит этому складу)
-                        if item.product.warehouse_id == document.warehouse_from_id:
-                            cur_from = product_card_qty(item.product)
-                        else:
-                            cur_from = Decimal("0")
-                    qty_to_move = Decimal(item.qty)
+                    cur_from = stock_service.get_on_hand(
+                        warehouse=document.warehouse_from, product=item.product, lock=True
+                    )
                     if cur_from - qty_to_move < 0:
-                        # Формируем информативное название товара: артикул или имя
-                        if item.product:
-                            product_display = item.product.article if item.product.article else item.product.name
-                            if not product_display:
-                                product_display = f"ID {item.product_id}"
-                        else:
-                            product_display = f"ID {item.product_id}"
-                        warehouse_name = document.warehouse_from.name if document.warehouse_from else "не указан"
-                        raise ValueError(f"Недостаточно товара '{product_display}' на складе '{warehouse_name}'. Доступно: {cur_from}, требуется: {qty_to_move}")
-                
+                        raise stock_service.InsufficientStock(
+                            product=item.product,
+                            warehouse=document.warehouse_from,
+                            available=cur_from,
+                            required=qty_to_move,
+                        )
+
                 # from — расход со склада-источника
-                mv1 = models.StockMove.objects.create(
-                    document=document,
+                stock_service.apply_stock_delta(
                     warehouse=document.warehouse_from,
                     product=item.product,
-                    qty_delta=-(item.qty),
+                    delta=-qty_to_move,
                     move_kind=models.StockMove.MoveKind.EXPENSE,
+                    document=document,
+                    source_kind=models.StockMove.SourceKind.DOCUMENT,
+                    allow_negative=allow_negative,
                 )
                 # to — приход на склад-приёмник (product in destination warehouse)
                 dest_product = _get_or_create_transfer_product(item.product, document.warehouse_to)
-                mv2 = models.StockMove.objects.create(
-                    document=document,
+                stock_service.apply_stock_delta(
                     warehouse=document.warehouse_to,
                     product=dest_product,
-                    qty_delta=(item.qty),
+                    delta=qty_to_move,
                     move_kind=models.StockMove.MoveKind.RECEIPT,
+                    document=document,
+                    source_kind=models.StockMove.SourceKind.DOCUMENT,
+                    allow_negative=True,
                 )
-                # apply moves
-                _apply_move(mv1)
-                _apply_move(mv2)
 
         elif document.doc_type == document.DocType.INVENTORY:
+            if document.warehouse_from is None:
+                raise ValueError("Для инвентаризации укажите склад (warehouse_from).")
             for item in items:
-                # fact = item.qty, compare with current
-                bal = models.StockBalance.objects.select_for_update().filter(warehouse=document.warehouse_from, product=item.product).first()
-                if bal:
-                    cur = Decimal(bal.qty) if bal.qty else Decimal("0")
-                else:
-                    # Если StockBalance нет, проверяем quantity товара (если товар принадлежит этому складу)
-                    if item.product.warehouse_id == document.warehouse_from_id:
-                        cur = product_card_qty(item.product)
-                    else:
-                        cur = Decimal("0")
-                delta = Decimal(item.qty) - cur
+                # Инвентаризация ставит ровно факт: delta = факт − регистр (под блокировкой).
+                fact = q_qty(Decimal(item.qty))
+                cur = stock_service.get_on_hand(
+                    warehouse=document.warehouse_from, product=item.product, lock=True
+                )
+                delta = fact - cur
                 if delta == 0:
                     continue
-                if not allow_negative and cur + delta < 0:
-                    # Формируем информативное название товара: артикул или имя
-                    if item.product:
-                        product_display = item.product.article if item.product.article else item.product.name
-                        if not product_display:
-                            product_display = f"ID {item.product_id}"
-                    else:
-                        product_display = f"ID {item.product_id}"
+                if not allow_negative and fact < 0:
                     warehouse_name = document.warehouse_from.name if document.warehouse_from else "не указан"
-                    raise ValueError(f"Инвентаризация приведет к отрицательному остатку для товара '{product_display}' на складе '{warehouse_name}'. Текущий остаток: {cur}, устанавливается: {item.qty}")
-                move_kind = models.StockMove.MoveKind.RECEIPT if delta > 0 else models.StockMove.MoveKind.EXPENSE
-                mv = models.StockMove.objects.create(
-                    document=document,
+                    raise ValueError(
+                        f"Инвентаризация приведет к отрицательному остатку для товара "
+                        f"'{stock_service.product_display(item.product)}' на складе '{warehouse_name}'. "
+                        f"Текущий остаток: {cur}, устанавливается: {item.qty}"
+                    )
+                stock_service.apply_stock_delta(
                     warehouse=document.warehouse_from,
                     product=item.product,
-                    qty_delta=delta,
-                    move_kind=move_kind,
+                    delta=delta,
+                    document=document,
+                    source_kind=models.StockMove.SourceKind.DOCUMENT,
+                    allow_negative=True,
                 )
-                _apply_move(mv)
 
         else:
             # other single-warehouse operations
@@ -864,36 +916,24 @@ def post_document(
                         f"Не удалось определить склад для товара {item.product_id}. "
                         "Укажите warehouse_from или выберите товар, привязанный к складу."
                     )
-                if not allow_negative:
-                    bal = models.StockBalance.objects.select_for_update().filter(
-                        warehouse=warehouse,
-                        product=item.product,
-                    ).first()
-                    cur, _bal = resolve_warehouse_on_hand_qty(
-                        warehouse=warehouse,
-                        product=item.product,
-                        balance=bal,
-                        sync=True,
-                    )
+                if not allow_negative and delta < 0:
+                    # Одно число и для проверки, и для списания: регистр под блокировкой.
+                    cur = stock_service.get_on_hand(warehouse=warehouse, product=item.product, lock=True)
                     if cur + delta < 0:
-                        # Формируем информативное название товара: артикул или имя
-                        if item.product:
-                            product_display = item.product.article if item.product.article else item.product.name
-                            if not product_display:
-                                product_display = f"ID {item.product_id}"
-                        else:
-                            product_display = f"ID {item.product_id}"
-                        warehouse_name = warehouse.name if warehouse else "не указан"
-                        raise ValueError(f"Недостаточно товара '{product_display}' на складе '{warehouse_name}'. Доступно: {cur}, требуется: {abs(delta)}")
-                move_kind = models.StockMove.MoveKind.RECEIPT if delta > 0 else models.StockMove.MoveKind.EXPENSE
-                mv = models.StockMove.objects.create(
-                    document=document,
+                        raise stock_service.InsufficientStock(
+                            product=item.product,
+                            warehouse=warehouse,
+                            available=cur,
+                            required=-delta,
+                        )
+                stock_service.apply_stock_delta(
                     warehouse=warehouse,
                     product=item.product,
-                    qty_delta=delta,
-                    move_kind=move_kind,
+                    delta=delta,
+                    document=document,
+                    source_kind=models.StockMove.SourceKind.DOCUMENT,
+                    allow_negative=allow_negative,
                 )
-                _apply_move(mv)
 
         # Предоплата для credit-документов: создаём и сразу проводим денежный документ на сумму предоплаты.
         prepayment = Decimal(getattr(document, "prepayment_amount", None) or 0).quantize(Decimal("0.01"))
@@ -925,21 +965,11 @@ def post_document(
             company = warehouse.company
             branch = warehouse.branch
 
-            cash_register = getattr(document, "cash_register", None)
-            if cash_register is None:
-                qs = models.CashRegister.objects.filter(company=company)
-                qs = qs.filter(branch=branch) if branch is not None else qs.filter(branch__isnull=True)
-                cash_register = _pick_single(qs, what="касс", allow_multiple_take_first=True)
-                if cash_register is None:
-                    raise ValueError("Не найдена касса. Создайте кассу или укажите cash_register в документе.")
+            cash_register = resolve_cash_register(
+                company=company, branch=branch, explicit=getattr(document, "cash_register", None)
+            )
 
-            payment_category = getattr(document, "payment_category", None)
-            if payment_category is None:
-                qs = models.PaymentCategory.objects.filter(company=company)
-                qs = qs.filter(branch=branch) if branch is not None else qs.filter(branch__isnull=True)
-                payment_category = _pick_single(
-                    qs, what="категорий платежа", allow_multiple_take_first=True
-                )
+            payment_category = _resolve_document_payment_category(document, company, branch)
 
             # Идемпотентность: используем OneToOne money_document (source_document)
             money_doc = getattr(document, "money_document", None)
@@ -1072,31 +1102,43 @@ def unpost_document(document: models.Document) -> models.Document:
                         f"for product {mv.product_id} at warehouse {mv.warehouse_id}"
                     )
                 bal.save()
-                if mv.product.warehouse_id == mv.warehouse_id:
-                    type(mv.product).objects.filter(pk=mv.product_id).update(quantity=q_qty(bal.qty))
+                # Личный остаток агента не связан с карточкой склада — карточку не трогаем
+                # (симметрично _apply_agent_move при проведении).
                 mv.delete()
         else:
-            # Оптимизация: предзагружаем moves с продуктами и складами
-            moves = list(document.moves.select_related("warehouse", "product", "product__warehouse").select_for_update())
+            # Сторно: на каждое движение документа — обратное движение через сервис
+            # остатков. Исходные движения не удаляются (история «провели → отменили»),
+            # а отвязываются от документа (document=NULL, source_id=id документа),
+            # чтобы повторное проведение не смешивалось со старыми движениями.
+            moves = list(
+                document.moves.select_related("warehouse", "product").select_for_update(of=("self",))
+            )
             for mv in moves:
-                # Получаем или создаем StockBalance (на случай если был удален)
-                bal, _ = models.StockBalance.objects.select_for_update().get_or_create(
-                    warehouse=mv.warehouse, 
-                    product=mv.product, 
-                    defaults={"qty": Decimal("0.000")}
+                qty_delta = q_qty(Decimal(mv.qty_delta or 0))
+                bal = stock_service.apply_stock_delta(
+                    warehouse=mv.warehouse,
+                    product=mv.product,
+                    delta=-qty_delta,
+                    move_kind=(
+                        models.StockMove.MoveKind.EXPENSE
+                        if qty_delta > 0
+                        else models.StockMove.MoveKind.RECEIPT
+                    ),
+                    document=None,
+                    source_kind=models.StockMove.SourceKind.DOCUMENT,
+                    source_id=document.id,
+                    allow_negative=True,  # отмену не блокируем, но логируем минус
                 )
-                cur = Decimal(bal.qty or 0)
-                # reverse: вычитаем qty_delta (т.к. при post мы добавляли)
-                bal.qty = cur - Decimal(mv.qty_delta or 0)
-                if bal.qty < 0:
-                    # Логируем предупреждение, но не блокируем отмену
+                if Decimal(bal.qty or 0) < 0:
                     import logging
-                    logger = logging.getLogger(__name__)
-                    logger.warning(f"Unposting document {document.number} results in negative balance {bal.qty} for product {mv.product_id} at warehouse {mv.warehouse_id}")
-                bal.save()
-                if mv.product.warehouse_id == mv.warehouse_id:
-                    type(mv.product).objects.filter(pk=mv.product_id).update(quantity=q_qty(bal.qty))
-                mv.delete()
+                    logging.getLogger(__name__).warning(
+                        "Unposting document %s results in negative balance %s for product %s at warehouse %s",
+                        document.number, bal.qty, mv.product_id, mv.warehouse_id,
+                    )
+            if moves:
+                models.StockMove.objects.filter(pk__in=[mv.pk for mv in moves]).update(
+                    document=None, source_id=document.id
+                )
 
         # Если был уже создан денежный документ - откатим его.
         try:

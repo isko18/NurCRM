@@ -49,7 +49,7 @@ from apps.main.models import (
     Order, Product, Review, Notification, Event,
     ProductBrand, ProductCategory, Warehouse, WarehouseEvent, Client, ClientDebtBulkPayment,
     GlobalProduct, GlobalBrand, GlobalCategory, ClientDeal, Bid, SocialApplications, TransactionRecord,
-    ContractorWork, DealInstallment, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
+    ContractorWork, DealInstallment, DealInstallmentHistory, DebtPayment, Debt, ObjectSaleItem, ObjectSale, ObjectItem, ItemMake,
     ManufactureSubreal, Acceptance, ReturnFromAgent, AgentSaleAllocation, ProductImage,
     AgentRequestCart, AgentRequestItem, ProductPackage, ProductCharacteristics, DealPayment,
     ProductRecipeItem,
@@ -116,6 +116,7 @@ from django.db.models import ProtectedError
 from apps.utils import product_images_prefetch, _is_owner_like
 from apps.main.analytics_agent import build_agent_analytics_payload, _parse_period, _compute_agent_on_hand
 from apps.main.analytics_owner_production import build_owner_analytics_payload, _dt_range
+from apps.main.recommendations import parse_upsell_fields
 from apps.main.services import (
     _parse_bool_like,
     _parse_date_to_aware_datetime,
@@ -1018,17 +1019,58 @@ class WeightProductsScaleExportAPIView(CompanyBranchRestrictedMixin, APIView):
 # ===========================
 #  Product create by barcode (ручной view)
 # ===========================
+def _barcode_lookup_variants(barcode: str):
+    """Совместимые варианты UPC/EAN для поиска: 12/13 цифр, без / с ведущим нулём."""
+    raw = (barcode or "").strip()
+    if not raw:
+        return []
+
+    seen = set()
+    variants = []
+
+    def add(value):
+        if value is None:
+            return
+        value = str(value).strip()
+        if not value or value in seen:
+            return
+        seen.add(value)
+        variants.append(value)
+
+    add(raw)
+    if raw.isdigit():
+        add(raw.lstrip("0") or "0")
+        add(raw.zfill(13))
+        if len(raw) == 13 and raw.startswith("0"):
+            add(raw[1:])
+        if len(raw) == 12:
+            add(raw.rjust(13, "0"))
+            add(raw.zfill(13))
+            if raw.startswith("0"):
+                add(raw[1:])
+    return variants
+
+
 class ProductBarcodeAwareSearchFilter(filters.SearchFilter):
     """Разделяет точное сканирование ШК и обычный текстовый поиск.
 
-    Если строка поиска выглядит как цельный штрихкод (только цифры, длина ≥ 8),
-    ищем ТОЧНО по `barcode` и `alternate_barcodes__barcode`.
+    Если строка выглядит как цельный штрихкод (только цифры, длина ≥ 8),
+    ищем по всем совместимым вариантам UPC/EAN: без / с ведущим нулём.
     """
+
+    def filter_queryset(self, request, queryset, view):
+        term = (request.query_params.get(self.search_param) or "").strip()
+        if term and term.isdigit() and len(term) >= 8:
+            variants = _barcode_lookup_variants(term)
+            if variants:
+                q = Q(barcode__in=variants) | Q(alternate_barcodes__barcode__in=variants)
+                return queryset.filter(q).distinct()
+        return super().filter_queryset(request, queryset, view)
 
     def get_search_fields(self, view, request):
         term = (request.query_params.get(self.search_param) or "").strip()
         if term.isdigit() and len(term) >= 8:
-            return ["=barcode", "=alternate_barcodes__barcode"]  # `=` в DRF → точное совпадение
+            return ["=barcode", "=alternate_barcodes__barcode"]
         return getattr(view, "search_fields", None)
 
 
@@ -1230,6 +1272,8 @@ class ProductCompactListView(CompanyBranchRestrictedMixin, generics.ListAPIView)
                 "article",
                 "company_id",
                 "hotkey_group",
+                "upsell_priority",
+                "upsell_excluded",
                 "expiration_date",
                 "seq",  # нужен курсорной пагинации (ordering="-seq")
             )
@@ -1276,13 +1320,15 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
         if not barcode:
             return Response({"barcode": "Укажите штрих-код."}, status=status.HTTP_400_BAD_REQUEST)
 
+        barcode_variants = _barcode_lookup_variants(barcode)
+
         # Дубликат внутри компании
-        if Product.objects.filter(company=company, barcode=barcode).exists():
+        if Product.objects.filter(company=company).filter(Q(barcode__in=barcode_variants) | Q(alternate_barcodes__barcode__in=barcode_variants)).exists():
             return Response(
                 {"barcode": "В вашей компании уже есть товар с таким штрих-кодом."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if ProductAlternateBarcode.objects.filter(company=company, barcode=barcode).exists():
+        if ProductAlternateBarcode.objects.filter(company=company, barcode__in=barcode_variants).exists():
             return Response(
                 {"barcode": "Этот штрих-код уже занят как дополнительный у другого товара."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -1291,7 +1337,7 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
         gp = (
             GlobalProduct.objects
             .select_related("brand", "category")
-            .filter(barcode=barcode)
+            .filter(barcode__in=barcode_variants)
             .first()
         )
         if not gp:
@@ -1396,6 +1442,7 @@ class ProductCreateByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Creat
             date=date_value,
             created_by=request.user,
             stock=_parse_bool_like(data.get("stock", False)),
+            **parse_upsell_fields(data),
         )
 
         # characteristics
@@ -1844,6 +1891,7 @@ class ProductCreateManualAPIView(CompanyBranchRestrictedMixin, generics.CreateAP
 
             created_by=request.user,
             stock=_parse_bool_like(data.get("stock", False)),
+            **parse_upsell_fields(data),
         )
         if price_provided:
             setattr(product, "_manual_price", True)
@@ -2656,7 +2704,7 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
         barcode = self.kwargs.get("barcode")
         if not barcode:
             raise NotFound(detail="Штрих-код не указан")
-            
+
         barcode = barcode.replace(' ', '')
         if 'Alt' in barcode:
             alt_codes = re.findall(r'Alt(\d+)', barcode)
@@ -2666,9 +2714,10 @@ class ProductByBarcodeAPIView(CompanyBranchRestrictedMixin, generics.RetrieveAPI
                 except ValueError:
                     pass
 
+        variants = _barcode_lookup_variants(barcode)
         product = (
             self.get_queryset()
-            .filter(Q(barcode=barcode) | Q(alternate_barcodes__barcode=barcode))
+            .filter(Q(barcode__in=variants) | Q(alternate_barcodes__barcode__in=variants))
             .distinct()
             .first()
         )
@@ -3041,7 +3090,7 @@ class ProductByGlobalBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Retri
         barcode = self.kwargs.get("barcode")
         if not barcode:
             raise NotFound(detail="Штрих-код не указан")
-            
+
         barcode = barcode.replace(' ', '')
         if 'Alt' in barcode:
             alt_codes = re.findall(r'Alt(\d+)', barcode)
@@ -3050,7 +3099,9 @@ class ProductByGlobalBarcodeAPIView(CompanyBranchRestrictedMixin, generics.Retri
                     barcode = ''.join(chr(int(code)) for code in alt_codes)
                 except ValueError:
                     pass
-        obj = self.get_queryset().filter(barcode=barcode).first()
+
+        variants = _barcode_lookup_variants(barcode)
+        obj = self.get_queryset().filter(barcode__in=variants).first()
         if not obj:
             raise NotFound(detail="Товар с таким штрих-кодом не найден в глобальной базе")
         return obj
@@ -3134,13 +3185,31 @@ def _filter_clients_visible_for_user(qs, user):
     return qs
 
 
+class ClientPhoneAwareSearchFilter(filters.SearchFilter):
+    """
+    ?search=0555 12-34-56 находит клиента, записанного как +996555123456 (и наоборот):
+    если строка похожа на телефон — ищем по нормализованному номеру (последние 9 цифр).
+    """
+
+    def filter_queryset(self, request, queryset, view):
+        from apps.main.phone_utils import looks_like_phone, phone_search_suffix
+
+        term = (request.query_params.get(self.search_param) or "").strip()
+        if looks_like_phone(term):
+            suffix = phone_search_suffix(term)
+            return queryset.filter(
+                Q(phone_normalized__contains=suffix) | Q(phone__icontains=term)
+            )
+        return super().filter_queryset(request, queryset, view)
+
+
 class ClientListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     """
     GET  /api/main/clients/
     POST /api/main/clients/
     """
     serializer_class = ClientSerializer
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filter_backends = [DjangoFilterBackend, ClientPhoneAwareSearchFilter, filters.OrderingFilter]
     filterset_fields = ["status", "date", "type", "sector"]
     search_fields = ["full_name", "phone", "email"]
     ordering_fields = ["created_at", "updated_at", "date"]
@@ -3451,6 +3520,154 @@ class ClientDealRetrieveUpdateDestroyAPIView(
         serializer.instance = deal
 
 
+# ===== RESCHEDULE / PROMISED DATE (перенос срока по взносу) =====
+
+class ClientDealInstallmentUpdateAPIView(APIView, CompanyBranchRestrictedMixin):
+    """
+    PATCH /api/main/clients/<client_id>/deals/<deal_id>/installments/<installment_id>/
+    PATCH /api/main/deals/<deal_id>/installments/<installment_id>/
+
+    Перенос срока / обещанная дата по взносу согласно debt-reschedule-promise-backend.md (§2).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def patch(self, request, *args, **kwargs):
+        client_id = kwargs.get("client_id")
+        deal_id = kwargs.get("deal_id") or kwargs.get("pk")
+        installment_id = kwargs.get("installment_id")
+
+        deal_qs = self._filter_qs_company_branch(
+            ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch())
+        ).filter(pk=deal_id)
+        if not _is_owner_like(request.user):
+            deal_qs = deal_qs.filter(client__salesperson=request.user)
+
+        if client_id:
+            deal_qs = deal_qs.filter(client_id=client_id)
+
+        deal = get_object_or_404(deal_qs)
+
+        # 10. Сделка v1 -> 409 deal_not_v2
+        if getattr(deal, "schedule_version", "v2") != "v2":
+            return Response(
+                {"detail": "Сделка версии v1 не поддерживает перенос отдельных взносов.", "code": "deal_not_v2"},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        inst_qs = DealInstallment.objects.select_for_update().filter(deal=deal)
+        inst = get_object_or_404(inst_qs, id=installment_id)
+
+        # 2. Взнос закрыт полностью -> 409 installment_already_paid
+        if inst.paid_on is not None or (inst.paid_amount and inst.paid_amount >= inst.amount):
+            return Response(
+                {"detail": "Взнос уже полностью оплачен.", "code": "installment_already_paid"},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        raw_data = request.data or {}
+        has_due_date = "due_date" in raw_data and raw_data["due_date"] is not None
+        has_promised_date = "promised_date" in raw_data
+        has_note = "note" in raw_data and bool(str(raw_data["note"]).strip())
+
+        # 6. Минимум одно из due_date / promised_date / note обязательно
+        if not has_due_date and not has_promised_date and not has_note:
+            return Response(
+                {"detail": "Необходимо указать хотя бы одно поле для изменения: due_date, promised_date или note.", "code": "nothing_to_change"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        today = timezone.localdate()
+
+        new_due_date = None
+        if has_due_date:
+            val = raw_data["due_date"]
+            if isinstance(val, str):
+                new_due_date = parse_date(val)
+            elif isinstance(val, (_date, datetime)):
+                new_due_date = val.date() if isinstance(val, datetime) else val
+            if not new_due_date:
+                return Response(
+                    {"detail": "Неверный формат даты due_date. Ожидается YYYY-MM-DD.", "code": "invalid_date"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if new_due_date < today:
+                return Response(
+                    {"detail": "Срок оплаты не может быть раньше сегодняшней даты.", "code": "date_in_past"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        new_promised_date = None
+        if has_promised_date:
+            val = raw_data["promised_date"]
+            if val is not None and val != "":
+                if isinstance(val, str):
+                    new_promised_date = parse_date(val)
+                elif isinstance(val, (_date, datetime)):
+                    new_promised_date = val.date() if isinstance(val, datetime) else val
+                if not new_promised_date:
+                    return Response(
+                        {"detail": "Неверный формат даты promised_date. Ожидается YYYY-MM-DD или null.", "code": "invalid_date"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if new_promised_date < today:
+                    return Response(
+                        {"detail": "Обещанная дата не может быть раньше сегодняшней даты.", "code": "date_in_past"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            else:
+                new_promised_date = None
+
+        idem = raw_data.get("idempotency_key")
+        idem_uuid = None
+        if idem:
+            try:
+                idem_uuid = UUID(str(idem))
+            except Exception:
+                return Response(
+                    {"detail": "Неверный формат idempotency_key.", "code": "invalid_idempotency_key"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # Идемпотентность: повтор с тем же ключом возвращает тот же результат, историю не дублирует
+            if DealInstallmentHistory.objects.filter(installment=inst, idempotency_key=idem_uuid).exists():
+                fresh = ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch()).get(pk=deal.pk)
+                return Response(ClientDealSerializer(fresh, context={"request": request}).data, status=status.HTTP_200_OK)
+
+        old_due = inst.due_date
+        old_promised = inst.promised_date
+        note = str(raw_data.get("note", "") or "").strip()
+
+        updated_fields = []
+        if has_due_date:
+            inst.due_date = new_due_date
+            updated_fields.append("due_date")
+
+        if has_promised_date:
+            inst.promised_date = new_promised_date
+            updated_fields.append("promised_date")
+
+        if updated_fields:
+            inst.save(update_fields=updated_fields)
+
+        # Сохранение записи в историю
+        DealInstallmentHistory.objects.create(
+            company=deal.company,
+            branch=deal.branch,
+            deal=deal,
+            installment=inst,
+            idempotency_key=idem_uuid,
+            created_by=request.user,
+            old_due_date=old_due,
+            new_due_date=inst.due_date,
+            old_promised_date=old_promised,
+            new_promised_date=inst.promised_date,
+            note=note,
+        )
+
+        fresh = ClientDeal.objects.select_related("client").prefetch_related(*_deal_prefetch()).get(pk=deal.pk)
+        return Response(ClientDealSerializer(fresh, context={"request": request}).data, status=status.HTTP_200_OK)
+
+
 # ===== PAY (создаём DealPayment + обновляем installment) =====
 
 class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
@@ -3538,7 +3755,7 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
 
         # audit
         try:
-            DealPayment.objects.create(
+            deal_payment = DealPayment.objects.create(
                 company=deal.company,
                 branch=deal.branch,
                 deal=deal,
@@ -3578,6 +3795,9 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
                 amount=pay_amt,
                 source_kind=CashFlow.SourceKind.SUPPLIER_DEBT_PAYMENT,
                 source_id=str(deal.id),
+                # Ключ — платёж, а не «сделка + сумма»: иначе взносы на одинаковую сумму
+                # склеиваются в один приход и не попадают в смену (ТЗ ч.12, 2.1).
+                idempotency_key=f"deal-pay:{deal_payment.id}",
                 name=f"Оплата долга поставщику: {deal.title or (deal.client.full_name if deal.client else 'Сделка')}",
                 source_business_operation_id="Оплата долга",
                 payment_method=pm,
@@ -3595,6 +3815,9 @@ class ClientDealPayAPIView(APIView, CompanyBranchRestrictedMixin):
                 amount=pay_amt,
                 source_kind=CashFlow.SourceKind.DEBT_REPAYMENT,
                 source_id=str(deal.id),
+                # Ключ — платёж, а не «сделка + сумма»: иначе взносы на одинаковую сумму
+                # склеиваются в один приход и не попадают в смену (ТЗ ч.12, 2.1).
+                idempotency_key=f"deal-pay:{deal_payment.id}",
                 name=f"Оплата долга: {deal.title or (deal.client.full_name if deal.client else 'Сделка')}",
                 source_business_operation_id="Оплата долга",
                 payment_method=pm,
@@ -3664,13 +3887,6 @@ class ClientDealsPayAnyAPIView(APIView, CompanyBranchRestrictedMixin):
             ordered = [by_id[deal_id] for deal_id in prior_deal_ids if deal_id in by_id]
             return Response({"paid_total": str(prior_operation.amount), "deals": self._serialize_deals(request, ordered)})
 
-        operation = ClientDebtBulkPayment.objects.create(
-            company=client.company,
-            client=client,
-            idempotency_key=idem,
-            amount=amount,
-        )
-
         installments = list(
             DealInstallment.objects.select_for_update()
             .select_related("deal", "deal__client")
@@ -3686,6 +3902,13 @@ class ClientDealsPayAnyAPIView(APIView, CompanyBranchRestrictedMixin):
                 {"amount": f"Сумма оплаты превышает суммарный остаток. Максимум: {total_remaining}."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        operation = ClientDebtBulkPayment.objects.create(
+            company=client.company,
+            client=client,
+            idempotency_key=idem,
+            amount=amount,
+        )
 
         from apps.main.services_debt import normalize_debt_payment_method
         from apps.construction.auto_cashflow import create_auto_cashflow
@@ -4086,7 +4309,7 @@ class DebtRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
         if old_amount is not None and new_amount is not None and new_amount < old_amount:
             repaid_amount = (old_amount - new_amount).quantize(Decimal("0.01"))
             if repaid_amount > Decimal("0.00"):
-                instance.add_payment(
+                debt_payment = instance.add_payment(
                     amount=repaid_amount,
                     paid_at=timezone.localdate(),
                     note=f"Погашение долга ({pm})",
@@ -4109,6 +4332,7 @@ class DebtRetrieveUpdateDestroyAPIView(CompanyBranchRestrictedMixin, generics.Re
                     amount=repaid_amount,
                     source_kind=CashFlow.SourceKind.DEBT_REPAYMENT,
                     source_id=str(instance.id),
+                    idempotency_key=f"debt-pay:{debt_payment.id}",
                     name=f"Оплата долга: {instance.name or 'Долг'}",
                     source_business_operation_id="Оплата долга",
                     payment_method=pm,
@@ -4166,6 +4390,7 @@ class DebtPayAPIView(APIView, CompanyBranchRestrictedMixin):
             amount=ser.validated_data["amount"],
             source_kind=CashFlow.SourceKind.DEBT_REPAYMENT,
             source_id=str(debt.id),
+            idempotency_key=f"debt-pay:{payment.id}",
             name=f"Оплата долга: {debt.name or 'Долг'}",
             source_business_operation_id="Оплата долга",
             payment_method=pm,
@@ -4961,8 +5186,11 @@ class SupplierReceiptLimitPagination(PageNumberPagination):
         try:
             self.page = paginator.page(page_number)
         except InvalidPage:
-            if paginator.num_pages:
-                self.page = paginator.page(paginator.num_pages)
+            if paginator.count and page_number > paginator.num_pages:
+                # ТЗ ч.12, 2.10: за последней страницей — пустой список, а не повтор последней
+                # (иначе клиент, читающий «пока есть строки», зацикливается).
+                from django.core.paginator import Page
+                self.page = Page([], page_number, paginator)
             else:
                 self.page = paginator.page(1)
 
@@ -5064,19 +5292,10 @@ class SupplierReceiptAPIView(CompanyBranchRestrictedMixin, APIView):
                     except Exception:
                         pass
             elif raw_pp is not None:
-                # Пересчёт цены продажи по наценке (markup_percent) до обновления закупки
-                # selling = purchase_price * (1 + markup_percent / 100)
-                # product.price = round(selling * 100) / 100
-                mp = getattr(prod, "markup_percent", None)
-                if mp is not None and str(mp).strip() not in ("", "null", "None"):
-                    try:
-                        mp_dec = Decimal(str(mp))
-                    except (InvalidOperation, ValueError, TypeError):
-                        mp_dec = Decimal("0")
-                    if mp_dec > Decimal("0") and new_purchase_price >= Decimal("0"):
-                        selling = new_purchase_price * (Decimal("1") + mp_dec / Decimal("100"))
-                        new_price = selling.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-                        upd["price"] = new_price
+                # Цена продажи становится равной цене из прихода (без наценки),
+                # раньше она пересчитывалась по старой наценке (50 → 83.33).
+                upd["price"] = new_purchase_price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                upd["markup_percent"] = Decimal("0")
 
             type(prod).objects.filter(id=pid).update(**upd)
             # The batch retains the shelf-life configuration at the receipt moment.

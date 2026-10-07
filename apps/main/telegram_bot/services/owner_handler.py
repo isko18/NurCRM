@@ -10,6 +10,7 @@ from django.db.models.functions import Coalesce
 from django.core.cache import cache
 
 from apps.main.telegram_bot.services import telegram_api, ai_service
+from apps.main.telegram_bot.services.photo_service import format_amount, format_qty
 
 logger = logging.getLogger("telegram_bot.owner")
 
@@ -18,12 +19,8 @@ MONEY_FIELD = DecimalField(max_digits=14, decimal_places=2)
 
 
 def _fmt_money(val) -> str:
-    if val is None:
-        return "0.00"
-    try:
-        return f"{Decimal(str(val)):,.2f}".replace(",", " ")
-    except Exception:
-        return str(val)
+    # ТЗ ч.9, 1.1: без лишних нулей — 660 066, 45,50
+    return format_amount(val)
 
 
 def _clean_phone(phone: str) -> str:
@@ -36,6 +33,30 @@ def _clean_phone(phone: str) -> str:
 # =========================================================================
 # Команды и отчёты
 # =========================================================================
+
+def get_owner_main_menu_keyboard():
+    """ТЗ-09 п. 2.5: Меню владельца внизу экрана."""
+    return {
+        "keyboard": [
+            [{"text": "📊 Сегодня"}, {"text": "💰 Касса"}],
+            [{"text": "🧾 Долги"}, {"text": "📦 Остатки"}],
+            [{"text": "🛒 Заказы"}, {"text": "🔔 Прокат"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def get_today_report_markup():
+    """ТЗ-09 п. 2.5: Кнопки под отчётом 'Сегодня'."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🔄 Обновить", "callback_data": "or:today_refresh"},
+                {"text": "📈 Неделя", "callback_data": "or:week"},
+            ]
+        ]
+    }
 
 def get_report_today(company) -> str:
     """Выручка за сегодня: сумма, количество чеков, средний чек, виды оплат."""
@@ -146,7 +167,7 @@ def get_report_top(company) -> str:
         name = item.get("name_snapshot") or "Без названия"
         rev = _fmt_money(item["total_rev"])
         qty = item["total_qty"]
-        lines.append(f"{i}. <b>{name}</b> — {rev} сом ({qty:g} шт)")
+        lines.append(f"{i}. <b>{name}</b> — {rev} сом ({format_qty(qty)} шт)")
 
     return "\n".join(lines)
 
@@ -257,7 +278,7 @@ def get_report_sezon(company) -> str:
     ]
     if growers:
         for name, c, p in growers[:6]:
-            lines.append(f"• <b>{name}</b>: {c:g} шт (было {p:g} шт)")
+            lines.append(f"• <b>{name}</b>: {format_qty(c)} шт (было {format_qty(p)} шт)")
     else:
         lines.append("Недостаточно данных для выделения растущих трендов.")
 
@@ -307,27 +328,77 @@ def get_report_zakaz(company) -> str:
         min_q = p.minimum_quantity or 5
         cur_q = p.quantity or Decimal("0.00")
         suggested = max(Decimal("5"), min_q * 2 - cur_q)
-        lines.append(f"• <b>{p.name}</b>\n  Остаток: {cur_q:g} шт | Мин: {min_q} | Рекомендуем: {suggested:g} шт")
+        lines.append(f"• <b>{p.name}</b>\n  Остаток: {format_qty(cur_q)} шт | Мин: {min_q} | Рекомендуем: {format_qty(suggested)} шт")
 
     return "\n".join(lines)
 
 
 def get_report_ostatki(company) -> str:
-    """Товары с малым остатком (<= 3)."""
-    from apps.main.models import Product
+    """Товары и размеры с малым остатком (<= 3). ТЗ ч. 10 п. 3.4."""
+    import html
+    from apps.main.models import Product, ProductVariant
 
     qs = Product.objects.filter(company=company, quantity__lte=3).exclude(status=Product.Status.ARCHIVED).order_by("quantity")[:15]
     lines = [
-        "⚠️ <b>Остатки товаров (≤ 3 шт)</b>",
+        "⚠️ <b>Заканчивающиеся товары (≤ 3 шт)</b>",
         "──────────────",
     ]
-    if not qs:
+    if qs.exists():
+        for p in qs:
+            lines.append(f"• <b>{html.escape(p.name)}</b>: {format_qty(p.quantity or 0)} шт (цена: {_fmt_money(p.price)} сом)")
+
+    # Варианты одежды (размер/цвет) с малым остатком
+    low_vars = ProductVariant.objects.filter(
+        company=company,
+        is_active=True,
+        quantity__gt=0,
+        quantity__lte=3,
+    ).select_related("product")[:15]
+
+    if low_vars.exists():
+        lines.append("──────────────")
+        lines.append("👗 <b>Заканчивающиеся размеры и цвета:</b>")
+        for v in low_vars:
+            desc = f"{v.size} {v.color}".strip()
+            lines.append(f"• {html.escape(v.product.name)} {html.escape(desc)} — <b>{format_qty(v.quantity)} шт</b>")
+
+    if len(lines) == 2:
         lines.append("Товаров с критическим остатком нет.")
-        return "\n".join(lines)
 
-    for p in qs:
-        lines.append(f"• <b>{p.name}</b>: {p.quantity or 0:g} шт (цена: {_fmt_money(p.price)} сом)")
+    return "\n".join(lines)
 
+
+def get_clothing_sizes_report(company, search_query: str):
+    """ТЗ ч. 10 п. 3.4: Таблица остатков одежды по размерам и цветам для владельца."""
+    import html
+    from apps.main.models import Product, ProductVariant
+    from apps.main.variant_utils import sort_variants
+
+    clean = (search_query or "").strip()
+    if not clean:
+        return None
+
+    prods = Product.objects.filter(company=company, name__icontains=clean).exclude(status=Product.Status.ARCHIVED)
+    prod = None
+    for p in prods:
+        if p.variants.filter(is_active=True).exists():
+            prod = p
+            break
+    if not prod:
+        return None
+
+    active_vars = sort_variants(prod.variants.filter(is_active=True))
+    lines = [f"📦 <b>Остатки по размерам: {html.escape(prod.name)}</b>", "──────────────"]
+    total_var_qty = Decimal("0.00")
+    for v in active_vars:
+        qty = Decimal(str(v.quantity or 0))
+        total_var_qty += qty
+        size_lbl = v.size or "Без размера"
+        color_lbl = v.color or "Без цвета"
+        lines.append(f"• {html.escape(size_lbl)} / {html.escape(color_lbl)} — <b>{format_qty(qty)} шт.</b>")
+
+    lines.append("──────────────")
+    lines.append(f"Всего по размерам: <b>{format_qty(total_var_qty)} шт.</b> (в карточке товара: {format_qty(Decimal(str(prod.quantity or 0)))} шт.)")
     return "\n".join(lines)
 
 
@@ -375,17 +446,33 @@ def get_report_dolgi(company) -> str:
 
 
 def search_product_price(company, term: str) -> str:
-    """Поиск цены и остатка товара для владельца."""
+    """Поиск цены и остатка товара для владельца с размерами и цветами."""
     from apps.main.models import Product
+    from apps.main.variant_utils import active_variants, variant_prices
 
-    qs = Product.objects.filter(company=company, name__icontains=term).exclude(status=Product.Status.ARCHIVED)[:5]
+    qs = Product.objects.filter(company=company, name__icontains=term).exclude(status=Product.Status.ARCHIVED).prefetch_related("variants")[:5]
     if not qs:
         return f"🔍 По запросу «{term}» товаров не найдено."
 
     lines = [f"🔍 <b>Результаты поиска «{term}»:</b>", "──────────────"]
     for p in qs:
         barcode_str = f" [штрихкод: {p.barcode}]" if p.barcode else ""
-        lines.append(f"• <b>{p.name}</b>{barcode_str}\n  Цена: {_fmt_money(p.price)} сом | Остаток: {p.quantity or 0:g} шт")
+        lines.append(f"• <b>{p.name}</b>{barcode_str}\n  Цена: {_fmt_money(p.price)} сом | Общий остаток: {format_qty(p.quantity or 0)} шт")
+        active_vars = active_variants(p)
+        if active_vars:
+            lines.append("  <i>Размеры и цвета:</i>")
+            for v in active_vars:
+                parts = []
+                if v.size:
+                    parts.append(f"размер: {v.size}")
+                if v.color:
+                    parts.append(f"цвет: {v.color}")
+                var_desc = ", ".join(parts) if parts else "вариант"
+                price, old_price = variant_prices(v, p)
+                var_price = f"{_fmt_money(price)} сом"
+                if old_price is not None:
+                    var_price = f"{_fmt_money(price)} сом (акция, обычная {_fmt_money(old_price)} сом)"
+                lines.append(f"    - {var_desc}: остаток {format_qty(v.quantity)} шт, {var_price}")
     return "\n".join(lines)
 
 
@@ -421,28 +508,323 @@ def get_inquiries_stats(company) -> str:
     return "\n".join(lines)
 
 
-def get_help_message() -> str:
-    """Справка по командам."""
+def get_command_pribyl(company) -> str:
+    """/pribyl: P&L за месяц (F2)."""
+    from apps.main.telegram_bot.services.ai_analytics_functions import fn_get_pnl
+    today = timezone.localdate()
+    first_day = today.replace(day=1)
+    data = fn_get_pnl(company, date_from=first_day.isoformat(), date_to=today.isoformat())
+    if "error" in data:
+        return f"❌ Ошибка получения P&L: {data['error']}"
+
+    rev = _fmt_money(data.get("revenue"))
+    cogs = _fmt_money(data.get("cogs"))
+    gp = _fmt_money(data.get("gross_profit"))
+    margin = data.get("gross_margin_percent")
+    margin_str = f"{margin}%" if margin is not None else "0%"
+    opex = _fmt_money(data.get("operating_expenses_total"))
+    net_profit = _fmt_money(data.get("net_profit"))
+
+    lines = [
+        "📊 <b>Отчёт о прибылях и убытках (P&L) за месяц</b>",
+        f"Период: {first_day.strftime('%d.%m.%Y')} — {today.strftime('%d.%m.%Y')}",
+        "──────────────",
+        f"💰 <b>Выручка:</b> {rev} сом",
+        f"📦 <b>Себестоимость (COGS):</b> {cogs} сом",
+        f"📈 <b>Валовая прибыль:</b> {gp} сом (маржа {margin_str})",
+        f"📉 <b>Операционные расходы:</b> {opex} сом",
+    ]
+    cats = data.get("operating_expenses_by_category") or []
+    for c in cats[:5]:
+        lines.append(f"  • {c.get('category') or 'Прочее'}: {_fmt_money(c.get('amount'))} сом")
+    lines.append("──────────────")
+    lines.append(f"💵 <b>Чистая прибыль:</b> {net_profit} сом")
+    return "\n".join(lines)
+
+
+def get_command_dengi(company) -> str:
+    """/dengi: Cash Flow за месяц (F3)."""
+    from apps.main.telegram_bot.services.ai_analytics_functions import fn_get_cashflow
+    today = timezone.localdate()
+    first_day = today.replace(day=1)
+    data = fn_get_cashflow(company, date_from=first_day.isoformat(), date_to=today.isoformat())
+    if "error" in data:
+        return f"❌ Ошибка получения Cash Flow: {data['error']}"
+
+    inflow = data.get("inflow", {})
+    outflow = data.get("outflow", {})
+    net_cf = _fmt_money(data.get("net_cashflow"))
+
+    lines = [
+        "💸 <b>Движение денег (Cash Flow) за месяц</b>",
+        f"Период: {first_day.strftime('%d.%m.%Y')} — {today.strftime('%d.%m.%Y')}",
+        "──────────────",
+        f"📥 <b>Всего приход:</b> {_fmt_money(inflow.get('total'))} сом",
+        f"  • Продажи (наличные): {_fmt_money(inflow.get('cash_sales'))} сом",
+        f"  • Продажи (безнал): {_fmt_money(inflow.get('non_cash_sales'))} сом",
+        f"  • Оплата долгов: {_fmt_money(inflow.get('debt_repayments'))} сом",
+        f"  • Прочее: {_fmt_money(inflow.get('other_inflow'))} сом",
+        "──────────────",
+        f"📤 <b>Всего расход:</b> {_fmt_money(outflow.get('total'))} сом",
+        f"  • Поставщикам: {_fmt_money(outflow.get('supplier_payments'))} сом",
+        f"  • Зарплаты: {_fmt_money(outflow.get('salary_payments'))} сом",
+        f"  • Прочее: {_fmt_money(outflow.get('other_outflow'))} сом",
+        "──────────────",
+        f"⚖️ <b>Чистый денежный поток:</b> {net_cf} сом",
+    ]
+    return "\n".join(lines)
+
+
+def get_command_sklad(company) -> str:
+    """/sklad: склад: позиций, стоимость по закупке и продаже, мало на складе (F6)."""
+    from apps.main.telegram_bot.services.ai_analytics_functions import fn_get_stock
+    data = fn_get_stock(company, limit=10)
+    if "error" in data:
+        return f"❌ Ошибка получения склада: {data['error']}"
+
+    cnt = data.get("total_products_count", 0)
+    cost_val = _fmt_money(data.get("inventory_cost_value"))
+    retail_val = _fmt_money(data.get("inventory_retail_value"))
+    low_cnt = data.get("low_stock_count", 0)
+    rule = data.get("low_stock_rule", "quantity <= 3")
+
+    lines = [
+        "📦 <b>Складской учёт и остатки</b>",
+        "──────────────",
+        f"🏷 <b>Всего позиций в каталоге:</b> {cnt}",
+        f"💰 <b>Стоимость склада (в закупке):</b> {cost_val} сом",
+        f"🏷 <b>Стоимость склада (в продаже):</b> {retail_val} сом",
+        f"⚠️ <b>Заканчивается товаров ({rule}):</b> {low_cnt} шт",
+    ]
+    prods = data.get("products", [])
+    if prods:
+        lines.append("──────────────")
+        lines.append("<b>Примеры позиций:</b>")
+        for p in prods[:5]:
+            lines.append(f"• <b>{p.get('name')}</b>: {format_qty(p.get('quantity'))} {p.get('unit')} (цена: {_fmt_money(p.get('price'))} сом, закуп: {_fmt_money(p.get('purchase_price'))} сом)")
+    return "\n".join(lines)
+
+
+def get_command_mertvyi(company) -> str:
+    """/mertvyi: товары без продаж 30 дней (F7)."""
+    from apps.main.telegram_bot.services.ai_analytics_functions import fn_get_dead_stock
+    data = fn_get_dead_stock(company, days=30, limit=10)
+    if "error" in data:
+        return f"❌ Ошибка: {data['error']}"
+
+    cnt = data.get("dead_products_count", 0)
+    frozen = _fmt_money(data.get("frozen_money_cost"))
+    days = data.get("days_without_sales", 30)
+
+    lines = [
+        f"🕸 <b>Неликвидные товары (без продаж {days} дней)</b>",
+        "──────────────",
+        f"📦 <b>Товаров без движения:</b> {cnt}",
+        f"🧊 <b>Заморожено денег (в закупке):</b> {frozen} сом",
+    ]
+    prods = data.get("products", [])
+    if prods:
+        lines.append("──────────────")
+        for p in prods[:8]:
+            lines.append(f"• <b>{p.get('name')}</b>: {format_qty(p.get('quantity'))} {p.get('unit')} (закуп: {_fmt_money(p.get('frozen_cost'))} сом)")
+    else:
+        lines.append("Зависших товаров не обнаружено — все товары продаются!")
+    return "\n".join(lines)
+
+
+def get_command_smena(company) -> str:
+    """/smena: текущая смена (F11)."""
+    from apps.main.telegram_bot.services.ai_analytics_functions import fn_get_shift
+    data = fn_get_shift(company, which="current")
+    if "error" in data:
+        return f"❌ Ошибка: {data['error']}"
+
+    status_str = "🟢 Открыта" if data.get("status") == "open" else f"⚪ Закрыта ({data.get('status')})"
+    cashier = data.get("cashier") or "Не указан"
+    rev = _fmt_money(data.get("revenue"))
+    exp_cash = _fmt_money(data.get("expected_cash"))
+
+    lines = [
+        "🧾 <b>Отчёт кассовой смены</b>",
+        f"Статус: {status_str} | Кассир: {cashier}",
+        "──────────────",
+        f"💰 <b>Выручка за смену:</b> {rev} сом",
+        f"💵 Наличные продажи: {_fmt_money(data.get('cash_sales'))} сом",
+        f"💳 Безнал: {_fmt_money(data.get('card_sales'))} сом",
+        f"📝 В долг: {_fmt_money(data.get('debt_sales'))} сом",
+        "──────────────",
+        f"📥 Внесения в кассу: {_fmt_money(data.get('cash_in'))} сом",
+        f"📤 Изъятия из кассы: {_fmt_money(data.get('cash_out'))} сом",
+        f"💵 Оплата долгов налом: {_fmt_money(data.get('debt_repayments_cash'))} сом",
+        "──────────────",
+        f"🎯 <b>Ожидаемая наличность в кассе:</b> {exp_cash} сом",
+    ]
+    if data.get("actual_cash") is not None:
+        lines.append(f"💵 Фактическая наличность: {_fmt_money(data.get('actual_cash'))} сом")
+        diff = _fmt_money(data.get("difference"))
+        lines.append(f"⚖️ Расхождение: {diff} сом")
+    return "\n".join(lines)
+
+
+def get_command_vozvraty(company) -> str:
+    """/vozvraty: возвраты за неделю (F12)."""
+    from apps.main.telegram_bot.services.ai_analytics_functions import fn_get_returns
+    today = timezone.localdate()
+    week_ago = today - timedelta(days=7)
+    data = fn_get_returns(company, date_from=week_ago.isoformat(), date_to=today.isoformat())
+    if "error" in data:
+        return f"❌ Ошибка: {data['error']}"
+
+    amt = _fmt_money(data.get("total_returns_amount"))
+    cnt = data.get("total_returns_count", 0)
+
+    lines = [
+        "↩️ <b>Возвраты за последние 7 дней</b>",
+        f"Период: {week_ago.strftime('%d.%m.%Y')} — {today.strftime('%d.%m.%Y')}",
+        "──────────────",
+        f"💸 <b>Сумма возвратов:</b> {amt} сом",
+        f"🧾 <b>Количество возвратов:</b> {cnt}",
+    ]
+    top = data.get("top_returned_products") or []
+    if top:
+        lines.append("──────────────")
+        lines.append("<b>Часто возвращаемые товары:</b>")
+        for it in top[:5]:
+            lines.append(f"• <b>{it.get('name')}</b>: {format_qty(it.get('quantity_returned'))} шт на сумму {_fmt_money(it.get('amount_returned'))} сом")
+    else:
+        lines.append("За выбранный период возвратов не было.")
+    return "\n".join(lines)
+
+
+def get_command_zakupki(company) -> str:
+    """/zakupki: закупки за месяц по поставщикам (F13)."""
+    from apps.main.telegram_bot.services.ai_analytics_functions import fn_get_purchases
+    today = timezone.localdate()
+    first_day = today.replace(day=1)
+    data = fn_get_purchases(company, date_from=first_day.isoformat(), date_to=today.isoformat())
+    if "error" in data:
+        return f"❌ Ошибка: {data['error']}"
+
+    total = _fmt_money(data.get("total_purchases_amount"))
+    cnt = data.get("total_purchases_count", 0)
+    debt = _fmt_money(data.get("total_debt_to_suppliers"))
+
+    lines = [
+        "🚚 <b>Закупки за текущий месяц</b>",
+        f"Период: {first_day.strftime('%d.%m.%Y')} — {today.strftime('%d.%m.%Y')}",
+        "──────────────",
+        f"📦 <b>Сумма закупок:</b> {total} сом ({cnt} поставок)",
+        f"💳 <b>Текущий долг поставщикам:</b> {debt} сом",
+    ]
+    suppliers = data.get("by_supplier") or []
+    if suppliers:
+        lines.append("──────────────")
+        lines.append("<b>По поставщикам:</b>")
+        for s in suppliers[:6]:
+            lines.append(f"• <b>{s.get('supplier')}</b>: {_fmt_money(s.get('amount'))} сом (долг: {_fmt_money(s.get('debt'))} сом)")
+    return "\n".join(lines)
+
+
+def get_command_sverka(company) -> str:
+    """/sverka: сверка за месяц (F17)."""
+    from apps.main.telegram_bot.services.ai_analytics_functions import fn_get_reconcile
+    today = timezone.localdate()
+    first_day = today.replace(day=1)
+    data = fn_get_reconcile(company, date_from=first_day.isoformat(), date_to=today.isoformat())
+    if "error" in data:
+        return f"❌ Ошибка: {data['error']}"
+
+    all_ok = data.get("all_checks_ok", False)
+    status_icon = "✅ Все проверки сошлись!" if all_ok else "⚠️ Обнаружены расхождения!"
+
+    lines = [
+        "🔍 <b>Сверка данных магазина (7 проверок)</b>",
+        f"Период: {first_day.strftime('%d.%m.%Y')} — {today.strftime('%d.%m.%Y')}",
+        f"Результат: <b>{status_icon}</b>",
+        "──────────────",
+    ]
+    for chk in data.get("checks", []):
+        icon = "✅" if chk.get("ok") else "❌"
+        name = chk.get("name")
+        diff = _fmt_money(chk.get("difference"))
+        lines.append(f"{icon} <b>{name}</b>: {chk.get('description', '')}")
+        if not chk.get("ok") and diff != "0.00":
+            lines.append(f"   <i>Разница: {diff} сом</i>")
+    return "\n".join(lines)
+
+
+def get_command_zakazy(company) -> str:
+    """/zakazy: заказы за неделю (F18)."""
+    from apps.main.telegram_bot.services.ai_analytics_functions import fn_get_orders
+    today = timezone.localdate()
+    week_ago = today - timedelta(days=7)
+    data = fn_get_orders(company, date_from=week_ago.isoformat(), date_to=today.isoformat())
+    if "error" in data:
+        return f"❌ Ошибка: {data['error']}"
+
+    total = _fmt_money(data.get("total_amount"))
+    cnt = data.get("total_orders", 0)
+
+    lines = [
+        "🛒 <b>Заказы покупателей за 7 дней</b>",
+        f"Период: {week_ago.strftime('%d.%m.%Y')} — {today.strftime('%d.%m.%Y')}",
+        "──────────────",
+        f"📦 <b>Всего заказов:</b> {cnt}",
+        f"💰 <b>На сумму:</b> {total} сом",
+    ]
+    sources = data.get("by_source") or []
+    if sources:
+        lines.append("──────────────")
+        lines.append("<b>По источникам:</b>")
+        for s in sources:
+            src_name = s.get("source") or "Витрина"
+            lines.append(f"• {src_name}: {s.get('count')} заказов ({_fmt_money(s.get('total'))} сом)")
+
+    statuses = data.get("by_status") or []
+    if statuses:
+        lines.append("──────────────")
+        lines.append("<b>По статусам:</b>")
+        for st in statuses:
+            lines.append(f"• {st.get('status')}: {st.get('count')} заказов")
+    return "\n".join(lines)
+
+
+def get_start_message() -> str:
+    """ТЗ ч.9, 2.7: /start — один экран: что умеет бот и как спросить; полный список — в /help."""
     return (
-        "🤖 <b>Команды бота для владельца NurCRM:</b>\n"
-        "──────────────\n"
+        "👋 <b>Бот магазина на связи.</b>\n"
+        "Отчёты — кнопками внизу экрана.\n\n"
+        "💬 Или спросите обычными словами:\n"
+        "• «Сколько заработали вчера?»\n"
+        "• «Кто больше всех должен?»\n"
+        "• «Что заказать у поставщиков?»\n\n"
+        "Все команды — /help"
+    )
+
+
+def get_help_message() -> str:
+    """Справка по командам (ТЗ ч.9, 2.7 — без длинного списка примеров)."""
+    return (
+        "🤖 <b>Команды</b>\n"
         "/segodnya — выручка и касса за сегодня\n"
-        "/nedelya — продажи за 7 дней по дням\n"
-        "/top — топ-8 товаров за 7 дней\n"
-        "/abc — ABC анализ товаров за 30 дней\n"
-        "/sezon — сезонные товары и растущие тренды\n"
-        "/soveti — рекомендации по продажам\n"
-        "/zakaz — что заказать у поставщиков\n"
-        "/ostatki — товары с малым остатком (≤ 3 шт)\n"
-        "/dolgi — список должников со ссылками на WhatsApp\n"
-        "/help — это справочное меню\n\n"
-        "💬 <b>Или пишите обычными словами:</b>\n"
-        "• «сколько заработали сегодня»\n"
-        "• «кто должен» / «ким карыз»\n"
-        "• «цена кола» / «баасы кола»\n"
-        "• «сколько обращений было»\n"
-        "• «разослать напоминания о долге»\n"
-        "• свободный вопрос ИИ (например: «почему упала выручка», «как поднять продажи»)"
+        "/nedelya — продажи за 7 дней\n"
+        "/top — топ товаров за 7 дней\n"
+        "/abc — ABC анализ за 30 дней\n"
+        "/sezon — сезонные товары\n"
+        "/soveti — рекомендации\n"
+        "/zakaz — что заказать\n"
+        "/ostatki — малый остаток\n"
+        "/dolgi — должники\n"
+        "/pribyl — прибыль за месяц\n"
+        "/dengi — движение денег\n"
+        "/sklad — стоимость склада\n"
+        "/mertvyi — неликвид\n"
+        "/smena — текущая смена\n"
+        "/vozvraty — возвраты\n"
+        "/zakupki — закупки\n"
+        "/sverka — сверка данных\n"
+        "/zakazy — заказы покупателей\n\n"
+        "💬 Можно писать и говорить обычными словами."
     )
 
 
@@ -520,7 +902,7 @@ def build_owner_system_summary(company, user_question: str = "") -> str:
         .values("name", "quantity")
         .order_by("quantity")[:10]
     )
-    low_text = ", ".join(f"{p['name']} ({p['quantity']:g} шт)" for p in low_stock) or "нет критических остатков"
+    low_text = ", ".join(f"{p['name']} ({format_qty(p['quantity'])} шт)" for p in low_stock) or "нет критических остатков"
 
     # 5. Обращения покупателей сегодня
     inq_count = TelegramInquiry.objects.filter(company=company, created_at__date=today).count()
@@ -534,7 +916,7 @@ def build_owner_system_summary(company, user_question: str = "") -> str:
             for w in words[:4]:
                 query |= Q(name__icontains=w)
             for p in Product.objects.filter(company=company).exclude(status=Product.Status.ARCHIVED).filter(query)[:5]:
-                matched_products.append(f"{p.name}: цена {_fmt_money(p.price)} сом, остаток {p.quantity or 0:g} шт")
+                matched_products.append(f"{p.name}: цена {_fmt_money(p.price)} сом, остаток {format_qty(p.quantity or 0)} шт")
 
     matched_text = ""
     if matched_products:
@@ -571,15 +953,75 @@ def handle_owner_message(settings, chat_id: str, text: str, is_voice: bool = Fal
     company = settings.company
     norm = (text or "").strip().lower()
 
-    # 1. Команды с слэшем
+    # 1. Команды с слэшем и кнопки постоянного меню владельца (ТЗ-09 п. 2.5)
+    owner_menu = get_owner_main_menu_keyboard()
     if norm in ("/start", "/help", "помощь", "жардам"):
-        reply = get_help_message()
-        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
+        reply = get_start_message() if norm == "/start" else get_help_message()
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML", reply_markup=owner_menu)
         return
 
-    if norm == "/segodnya":
+    if norm in ("/segodnya", "📊 сегодня", "сегодня"):
         reply = get_report_today(company)
-        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML", reply_markup=get_today_report_markup())
+        return
+
+    if norm in ("💰 касса", "/kassa"):
+        reply = get_report_today(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML", reply_markup=get_today_report_markup())
+        return
+
+    if norm in ("/dolgi", "🧾 долги"):
+        reply = get_report_dolgi(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML", reply_markup=owner_menu)
+        return
+
+    if norm in ("/ostatki", "📦 остатки") and len(norm.split()) <= 2 and not any(w in norm for w in ("размер", "размеры")):
+        reply = get_report_ostatki(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML", reply_markup=owner_menu)
+        return
+
+    if norm in ("/zakaz", "/zakazy", "🛒 заказы"):
+        reply = get_report_zakaz(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML", reply_markup=owner_menu)
+        return
+
+    if norm in ("/prokat", "🔔 прокат"):
+        reply = get_command_prokat(company) if "get_command_prokat" in globals() else get_report_zakaz(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML", reply_markup=owner_menu)
+        return
+
+    # Запрос фото товара (ТЗ-11 п. 3.1): "фото <товар>", "покажи фото <товар>"
+    m_photo = re.search(r"(?:покажи\s+фото|фото)\s+(.+)", norm)
+    if m_photo:
+        search_term = m_photo.group(1).strip()
+        from apps.main.models import Product
+        from apps.main.telegram_bot.services.photo_service import send_single_product_photo
+        prod = Product.objects.filter(company=company, name__icontains=search_term).first()
+        if prod:
+            ok = send_single_product_photo(settings, chat_id, prod)
+            if not ok:
+                telegram_api.send_message(token, chat_id, f"У товара «{prod.name}» нет фотографии или не удалось её отправить.")
+        else:
+            telegram_api.send_message(token, chat_id, f"Товар по запросу «{search_term}» не найден в каталоге.")
+        return
+
+    # Запрос остатков одежды по размерам: "худи остатки", "остатки худи", "размеры" (ТЗ ч. 10 п. 3.4)
+    if any(w in norm for w in ("размер", "размеры", "өлчөм")) or ("остатки" in norm and len(norm.split()) >= 2):
+        cleaned_term = re.sub(r"\b(остатки|остаток|размеры|размер|какие|есть|по|в|наличии|на|складе|детские|мужские|женские)\b", "", norm).strip()
+        if cleaned_term and len(cleaned_term) >= 2:
+            sizes_rep = get_clothing_sizes_report(company, cleaned_term)
+            if sizes_rep:
+                telegram_api.send_message(token, chat_id, sizes_rep, parse_mode="HTML")
+                return
+
+    # Проверка кастомных сценариев по ключевым словам для владельца (ТЗ-11 п. 1.4)
+    from apps.main.telegram_bot.views import match_scenario
+    from apps.main.telegram_bot.models import TelegramBotScenario
+    from apps.main.telegram_bot.tasks import _execute_scenario
+
+    sc = match_scenario(company, text, audience="owner")
+    if sc and sc.kind == TelegramBotScenario.Kind.KEYWORDS:
+        _execute_scenario(settings, chat_id, sc, {"username": "owner"}, text, is_voice)
         return
 
     if norm == "/nedelya":
@@ -619,6 +1061,51 @@ def handle_owner_message(settings, chat_id: str, text: str, is_voice: bool = Fal
 
     if norm == "/dolgi":
         reply = get_report_dolgi(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
+        return
+
+    if norm == "/pribyl":
+        reply = get_command_pribyl(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
+        return
+
+    if norm == "/dengi":
+        reply = get_command_dengi(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
+        return
+
+    if norm == "/sklad":
+        reply = get_command_sklad(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
+        return
+
+    if norm == "/mertvyi":
+        reply = get_command_mertvyi(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
+        return
+
+    if norm == "/smena":
+        reply = get_command_smena(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
+        return
+
+    if norm == "/vozvraty":
+        reply = get_command_vozvraty(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
+        return
+
+    if norm == "/zakupki":
+        reply = get_command_zakupki(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
+        return
+
+    if norm == "/sverka":
+        reply = get_command_sverka(company)
+        telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
+        return
+
+    if norm == "/zakazy":
+        reply = get_command_zakazy(company)
         telegram_api.send_message(token, chat_id, reply, parse_mode="HTML")
         return
 
@@ -699,25 +1186,32 @@ def handle_owner_message(settings, chat_id: str, text: str, is_voice: bool = Fal
     cache_key = f"tg_chat_history:{company.id}:{chat_id}"
     history = cache.get(cache_key) or []
 
-    # Добавляем реплику пользователя
-    history.append({"role": "user", "parts": [{"text": text}]})
-    # Держим не более 8 реплик
-    history = history[-8:]
-
-    system_instruction = build_owner_system_summary(company, user_question=text)
-
     try:
-        ai_reply, _model = ai_service.generate_chat_response(
-            api_key=ai_key,
-            system_instruction=system_instruction,
-            contents=history,
-            temperature=0.4,
-            max_tokens=800,
-        )
+        if getattr(settings, "ai_functions_enabled", True):
+            ai_reply, _model, functions_called = ai_service.generate_owner_ai_response(
+                company=company,
+                settings=settings,
+                user_question=text,
+                history=history,
+                is_voice=is_voice,
+            )
+        else:
+            system_instruction = build_owner_system_summary(company, user_question=text)
+            user_contents = list(history[-6:])
+            user_contents.append({"role": "user", "parts": [{"text": text}]})
+            ai_reply, _model = ai_service.generate_chat_response(
+                api_key=ai_key,
+                system_instruction=system_instruction,
+                contents=user_contents,
+                temperature=0.4,
+                max_tokens=800,
+            )
+
         if not ai_reply:
             ai_reply = "Не удалось сгенерировать ответ. Попробуйте сформулировать иначе или используйте /help."
 
-        # Сохраняем ответ в память
+        # Сохраняем в память
+        history.append({"role": "user", "parts": [{"text": text}]})
         history.append({"role": "model", "parts": [{"text": ai_reply}]})
         cache.set(cache_key, history[-8:], timeout=86400)
 
@@ -728,5 +1222,5 @@ def handle_owner_message(settings, chat_id: str, text: str, is_voice: bool = Fal
         logger.error("Owner AI conversation failed: %s", exc)
         telegram_api.send_message(
             token, chat_id,
-            f"В данный момент ИИ недоступен. Воспользуйтесь командами из списка /help."
+            "В данный момент ИИ недоступен. Воспользуйтесь командами из списка /help."
         )

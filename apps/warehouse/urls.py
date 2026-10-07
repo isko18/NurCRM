@@ -6,6 +6,7 @@ from .views import (
     CategoryView, CategoryDetailView,
     ProductGroupView, ProductGroupDetailView,
     ProductView, ProductDetailView,
+    ProductStockAdjustmentView,
     WarehouseProductCatalogListView,
     ProductScanView,
     WarehouseBarcodeCheckAPIView,
@@ -83,6 +84,17 @@ from .views_partnership import (
     PartnerCompanyCatalogAPIView,
     DocumentPartnerTransferCreateAPIView,
     PartnerCashIncassationListCreateAPIView,
+    PartnershipTerminateAPIView,
+    PartnershipSettingsAPIView,
+    PartnershipCompanySearchAPIView,
+    PartnerWarehousesAPIView,
+    PartnerWarehouseProductsAPIView,
+    PartnerOperationListAPIView,
+    PartnerOperationApproveAPIView,
+    PartnerOperationRejectAPIView,
+    PartnerOperationCancelAPIView,
+    PartnerSalesListAPIView,
+    PartnerSaleDetailAPIView,
 )
 from .views_analytics import (
     WarehouseAgentMyAnalyticsAPIView,
@@ -126,6 +138,12 @@ urlpatterns = [
 
     # product detail (global by product uuid)
     path("products/<uuid:product_uuid>/", ProductDetailView.as_view(), name="warehouse-product-detail"),
+    # корректировка остатка (проведённый документ INVENTORY)
+    path(
+        "products/<uuid:product_uuid>/stock-adjustment/",
+        ProductStockAdjustmentView.as_view(),
+        name="warehouse-product-stock-adjustment",
+    ),
 
     # product images
     path("products/<uuid:product_uuid>/images/", ProductImagesView.as_view(), name="product-images"),
@@ -217,6 +235,17 @@ urlpatterns += [
     path("stock-partnerships/companies/<uuid:company_id>/catalog/", PartnerCompanyCatalogAPIView.as_view(), name="warehouse-stock-partnership-catalog"),
     path("stock-partnerships/transfer/", DocumentPartnerTransferCreateAPIView.as_view(), name="warehouse-stock-partnership-transfer"),
     path("stock-partnerships/cash-incassations/", PartnerCashIncassationListCreateAPIView.as_view(), name="warehouse-stock-partnership-cash-incassations"),
+    path("stock-partnerships/companies/search/", PartnershipCompanySearchAPIView.as_view(), name="warehouse-stock-partnership-company-search"),
+    path("stock-partnerships/companies/<uuid:partner_company_id>/terminate/", PartnershipTerminateAPIView.as_view(), name="warehouse-stock-partnership-terminate"),
+    path("stock-partnerships/companies/<uuid:partner_company_id>/settings/", PartnershipSettingsAPIView.as_view(), name="warehouse-stock-partnership-settings"),
+    path("stock-partnerships/companies/<uuid:partner_company_id>/warehouses/", PartnerWarehousesAPIView.as_view(), name="warehouse-stock-partnership-warehouses"),
+    path("stock-partnerships/companies/<uuid:partner_company_id>/warehouses/<uuid:warehouse_id>/products/", PartnerWarehouseProductsAPIView.as_view(), name="warehouse-stock-partnership-warehouse-products"),
+    path("stock-partnerships/companies/<uuid:partner_company_id>/sales/", PartnerSalesListAPIView.as_view(), name="warehouse-stock-partnership-sales"),
+    path("stock-partnerships/companies/<uuid:partner_company_id>/sales/<uuid:document_id>/", PartnerSaleDetailAPIView.as_view(), name="warehouse-stock-partnership-sale-detail"),
+    path("stock-partnerships/operations/", PartnerOperationListAPIView.as_view(), name="warehouse-stock-partnership-operations"),
+    path("stock-partnerships/operations/<uuid:pk>/approve/", PartnerOperationApproveAPIView.as_view(), name="warehouse-stock-partnership-operation-approve"),
+    path("stock-partnerships/operations/<uuid:pk>/reject/", PartnerOperationRejectAPIView.as_view(), name="warehouse-stock-partnership-operation-reject"),
+    path("stock-partnerships/operations/<uuid:pk>/cancel/", PartnerOperationCancelAPIView.as_view(), name="warehouse-stock-partnership-operation-cancel"),
     path("documents/sale/", DocumentSaleListCreateView.as_view(), name="warehouse-documents-sale"),
     path("documents/purchase/", DocumentPurchaseListCreateView.as_view(), name="warehouse-documents-purchase"),
     path("documents/sale-return/", DocumentSaleReturnListCreateView.as_view(), name="warehouse-documents-sale-return"),

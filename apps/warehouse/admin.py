@@ -24,8 +24,8 @@ class StockBalanceAdmin(admin.ModelAdmin):
 
 @admin.register(models.StockMove)
 class StockMoveAdmin(admin.ModelAdmin):
-	list_display = ("document", "warehouse", "product", "qty_delta", "created_at")
-	list_filter = ("warehouse__company", "warehouse")
+	list_display = ("document", "source_kind", "source_id", "warehouse", "product", "qty_delta", "created_at")
+	list_filter = ("source_kind", "warehouse__company", "warehouse")
 
 
 @admin.register(models.Counterparty)
@@ -37,8 +37,37 @@ class CounterpartyAdmin(admin.ModelAdmin):
 
 @admin.register(models.CompanyStockPartnership)
 class CompanyStockPartnershipAdmin(admin.ModelAdmin):
-	list_display = ("company_a", "company_b", "created_at")
-	list_filter = ("company_a", "company_b")
+	list_display = ("company_a", "company_b", "status", "activated_at", "terminated_at", "created_at")
+	list_filter = ("status",)
+	search_fields = ("company_a__name", "company_b__name")
+
+	def has_delete_permission(self, request, obj=None):
+		# stock-partnership §6.2: не удалять — для выхода есть «Разорвать», история сохраняется
+		return False
+
+
+@admin.register(models.CompanyStockPartnershipEvent)
+class CompanyStockPartnershipEventAdmin(admin.ModelAdmin):
+	list_display = ("partnership", "kind", "company", "user", "created_at")
+	list_filter = ("kind",)
+	readonly_fields = ("partnership", "kind", "company", "user", "payload", "created_at")
+
+	def has_add_permission(self, request):
+		return False
+
+	def has_delete_permission(self, request, obj=None):
+		return False
+
+
+@admin.register(models.PartnerOperationRequest)
+class PartnerOperationRequestAdmin(admin.ModelAdmin):
+	list_display = ("kind", "status", "initiator_company", "source_company", "amount", "created_at")
+	list_filter = ("kind", "status")
+	raw_id_fields = ("partnership", "initiator_company", "source_company", "warehouse_from", "warehouse_to",
+	                 "cash_register_from", "cash_register_to", "created_by", "decided_by", "document", "incassation")
+
+	def has_delete_permission(self, request, obj=None):
+		return False
 
 
 @admin.register(models.CompanyStockPartnershipRequest)

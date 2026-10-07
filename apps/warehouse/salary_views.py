@@ -326,7 +326,7 @@ class SalaryPayoutListCreateAPIView(APIView):
         if scope is None:
             return Response({"detail": "Нет доступа к зарплате."}, status=status.HTTP_403_FORBIDDEN)
 
-        qs = m.AgentSalaryPayout.objects.select_related("agent", "created_by")
+        qs = m.AgentSalaryPayout.objects.select_related("agent", "created_by", "money_document__cash_register")
         if scope in ("manager", "employee"):
             qs = qs.filter(company=company)
             agent = (request.query_params.get("agent") or "").strip()
@@ -365,6 +365,16 @@ class SalaryPayoutListCreateAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        cash_register = None
+        cash_register_id = ser.validated_data.get("cash_register")
+        if cash_register_id:
+            cash_register = m.CashRegister.objects.filter(id=cash_register_id, company=company).first()
+            if cash_register is None:
+                return Response(
+                    {"cash_register": ["Касса не найдена в компании."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         try:
             payout = salary_services.create_payout(
                 company=company,
@@ -372,7 +382,10 @@ class SalaryPayoutListCreateAPIView(APIView):
                 amount=ser.validated_data["amount"],
                 comment=ser.validated_data.get("comment") or "",
                 created_by=request.user,
+                cash_register=cash_register,
             )
+        except salary_services.SalaryCashError as exc:
+            return Response({"cash_register": [str(exc)]}, status=status.HTTP_400_BAD_REQUEST)
         except salary_services.SalaryBalanceError as exc:
             return Response(
                 {"amount": [f"Сумма превышает баланс агента ({_money2(exc.balance)})"]},

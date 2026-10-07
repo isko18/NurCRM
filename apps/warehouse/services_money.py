@@ -467,12 +467,6 @@ def post_partner_cash_incassation(
     if not models.has_active_stock_partnership_between_ids(cfrom, cto):
         raise ValueError("Между компаниями этих касс нет принятого партнёрства.")
 
-    balance = cash_register_balance(cash_register_from)
-    if balance < amount:
-        raise ValueError(
-            f"Недостаточно средств в кассе «{cash_register_from.name}». Доступно: {balance}, требуется: {amount}."
-        )
-
     from_co = cash_register_from.company
     to_co = cash_register_to.company
     base_comment = (comment or "").strip()
@@ -480,6 +474,19 @@ def post_partner_cash_incassation(
     in_note = base_comment or f"Инкассация из «{from_co.name}», касса «{cash_register_from.name}»"
 
     with transaction.atomic():
+        # П6: блокируем обе кассы (в порядке id — без взаимоблокировок) и только потом проверяем баланс,
+        # иначе два параллельных запроса уводят кассу в минус.
+        list(
+            models.CashRegister.objects.select_for_update()
+            .filter(id__in=[cash_register_from.id, cash_register_to.id])
+            .order_by("id")
+        )
+        balance = cash_register_balance(cash_register_from)
+        if balance < amount:
+            raise ValueError(
+                f"Недостаточно средств в кассе «{cash_register_from.name}». Доступно: {balance}, требуется: {amount}."
+            )
+
         cat_out = _payment_category_incassation(cash_register_from.company, cash_register_from.branch)
         cat_in = _payment_category_incassation(cash_register_to.company, cash_register_to.branch)
 

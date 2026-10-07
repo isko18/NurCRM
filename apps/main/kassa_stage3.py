@@ -275,6 +275,12 @@ def _move_stock(company, warehouse, product, variant, delta):
         type(target).objects.filter(pk=target.pk).update(quantity=F("quantity") + delta)
         if variant is not None:
             Product.objects.filter(pk=product.pk).update(quantity=F("quantity") + delta)
+        if company:
+            try:
+                from django.core.cache import cache
+                cache.delete(f"tg_catalog_data:{getattr(company, 'id', company)}")
+            except Exception:
+                pass
         return
     row, _ = ProductStock.objects.select_for_update().get_or_create(
         company=company, warehouse=warehouse, product=product, variant=variant,

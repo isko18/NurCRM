@@ -1017,7 +1017,27 @@ def company_feature_codes(company):
     codes.extend(a["code"] for a in company_addons_payload(company) if a["active"])
     if getattr(company, "can_view_showcase", False):
         codes.append("showcase_editor")
+    free = _client_app_free()
+    if free is not None:
+        codes.append(free[0])
     return list(dict.fromkeys(c for c in codes if c))
+
+
+def _client_app_free():
+    """
+    Приложение клиентов: пока идёт бесплатный период (ClientAppConfig.free_until),
+    функция есть у каждой компании. → (code, until_iso | None) или None, если период кончился.
+    """
+    try:
+        from apps.clientapp.services import app_free_until
+        from apps.clientapp.models import ClientAppConfig
+
+        free, until = app_free_until()
+        if not free:
+            return None
+        return ClientAppConfig.get().paid_feature_code, (until.isoformat() if until else None)
+    except Exception:
+        return None
 
 
 def company_features_detail(company, *, plan_until=None):
@@ -1037,6 +1057,9 @@ def company_features_detail(company, *, plan_until=None):
     if getattr(company, "can_view_showcase", False):
         if "showcase_editor" not in out:
             out["showcase_editor"] = plan_until
+    free = _client_app_free()
+    if free is not None and free[0] not in out:
+        out[free[0]] = free[1]
     return [{"code": code, "until": until} for code, until in out.items()]
 
 
@@ -1107,6 +1130,9 @@ class CompanySerializer(serializers.ModelSerializer):
         data["market_spheres"] = instance.market_spheres or (
             [instance.market_sphere] if instance.market_sphere else []
         )
+        # ТЗ ч.12, 2.8: откроется ли редактор витрины (то же условие, что у 403 в showcase/*),
+        # чтобы программа заранее показывала «подключите услугу», а не ошибку.
+        data["can_edit_showcase"] = bool(getattr(instance, "can_view_showcase", False))
 
         return data
 

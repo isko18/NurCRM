@@ -849,12 +849,17 @@ def build_owner_warehouse_analytics_payload(
     on_hand_qs = wm.AgentStockBalance.objects.select_related("product", "agent").filter(company=company)
     on_hand_qs = _apply_branch_scope(on_hand_qs, branch, all_branches=all_branches)
 
-    on_hand_qty = on_hand_qs.aggregate(
-        s=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY)
-    )["s"] or Decimal("0.000")
-    on_hand_amount = on_hand_qs.aggregate(
-        s=Coalesce(Sum(F("qty") * F("product__price"), output_field=MONEY_FIELD), ZERO_MONEY)
-    )["s"] or Decimal("0.00")
+    on_hand_agg = on_hand_qs.aggregate(
+        total_qty=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
+        total_amount=Coalesce(Sum(F("qty") * F("product__price"), output_field=MONEY_FIELD), ZERO_MONEY),
+        total_purchase_amount=Coalesce(
+            Sum(F("qty") * Coalesce(F("product__purchase_price"), ZERO_MONEY), output_field=MONEY_FIELD),
+            ZERO_MONEY,
+        ),
+    )
+    on_hand_qty = on_hand_agg["total_qty"] or Decimal("0.000")
+    on_hand_amount = on_hand_agg["total_amount"] or Decimal("0.00")
+    on_hand_purchase_amount = on_hand_agg["total_purchase_amount"] or Decimal("0.00")
 
     trunc_sales = _trunc_by_group("date", group_by)
     sales_by_date_qs = (
@@ -980,6 +985,7 @@ def build_owner_warehouse_analytics_payload(
         r["warehouse_id"]: {
             "on_hand_qty": r["on_hand_qty"],
             "on_hand_amount": r["on_hand_amount"],
+            "on_hand_purchase_amount": r["on_hand_purchase_amount"],
         }
         for r in (
             on_hand_qs
@@ -988,6 +994,10 @@ def build_owner_warehouse_analytics_payload(
                 on_hand_qty=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
                 on_hand_amount=Coalesce(
                     Sum(F("qty") * F("product__price"), output_field=MONEY_FIELD),
+                    ZERO_MONEY,
+                ),
+                on_hand_purchase_amount=Coalesce(
+                    Sum(F("qty") * Coalesce(F("product__purchase_price"), ZERO_MONEY), output_field=MONEY_FIELD),
                     ZERO_MONEY,
                 ),
             )
@@ -1011,6 +1021,7 @@ def build_owner_warehouse_analytics_payload(
             "sales_amount": _money_str(sales.get("sales_amount", Decimal("0.00"))),
             "on_hand_qty": str(on_hand.get("on_hand_qty", Decimal("0.000"))),
             "on_hand_amount": _money_str(on_hand.get("on_hand_amount", Decimal("0.00"))),
+            "on_hand_purchase_amount": _money_str(on_hand.get("on_hand_purchase_amount", Decimal("0.00"))),
         })
 
     cash = _build_owner_cash_analytics(
@@ -1035,6 +1046,7 @@ def build_owner_warehouse_analytics_payload(
             "sales_amount": _money_str(sales_amount),
             "on_hand_qty": str(on_hand_qty),
             "on_hand_amount": _money_str(on_hand_amount),
+            "on_hand_purchase_amount": _money_str(on_hand_purchase_amount),
             **cash["summary"],
         },
         "charts": {

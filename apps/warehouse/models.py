@@ -1247,6 +1247,55 @@ class CompanyStockPartnership(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
 
+    class Status(models.TextChoices):
+        ACTIVE = "ACTIVE", "Активно"
+        TERMINATED = "TERMINATED", "Разорвано"
+
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.ACTIVE, db_index=True, verbose_name="Статус"
+    )
+    # Флаги «своей стороны»: a_* — решение компании A о себе (B может забирать у A без подтверждения и т.п.)
+    a_allows_direct_pull = models.BooleanField(default=False, verbose_name="A разрешает B забирать без подтверждения")
+    b_allows_direct_pull = models.BooleanField(default=False, verbose_name="B разрешает A забирать без подтверждения")
+    a_shares_sales_history = models.BooleanField(default=True, verbose_name="A показывает B свои продажи")
+    b_shares_sales_history = models.BooleanField(default=True, verbose_name="B показывает A свои продажи")
+    created_from_request = models.ForeignKey(
+        "warehouse.CompanyStockPartnershipRequest", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="+", verbose_name="Из заявки",
+    )
+    activated_at = models.DateTimeField(null=True, blank=True, verbose_name="Активировано")
+    terminated_at = models.DateTimeField(null=True, blank=True, verbose_name="Разорвано")
+    terminated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+        verbose_name="Кто разорвал",
+    )
+    terminated_by_company = models.ForeignKey(
+        "users.Company", null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+        verbose_name="Какая компания разорвала",
+    )
+
+    def _side(self, company_id) -> str:
+        cid = str(company_id)
+        if cid == str(self.company_a_id):
+            return "a"
+        if cid == str(self.company_b_id):
+            return "b"
+        raise ValueError("Компания не участвует в этом партнёрстве.")
+
+    def partner_id_of(self, company_id):
+        return self.company_b_id if self._side(company_id) == "a" else self.company_a_id
+
+    def allows_direct_pull_from(self, company_id) -> bool:
+        """Разрешила ли компания company_id партнёру забирать у себя без подтверждения."""
+        return bool(getattr(self, f"{self._side(company_id)}_allows_direct_pull"))
+
+    def shares_sales_history_of(self, company_id) -> bool:
+        """Показывает ли компания company_id партнёру свою историю продаж."""
+        return bool(getattr(self, f"{self._side(company_id)}_shares_sales_history"))
+
+    def set_side_flag(self, company_id, name: str, value: bool):
+        setattr(self, f"{self._side(company_id)}_{name}", bool(value))
+
     class Meta:
         verbose_name = "Партнёрство компаний (склад и касса)"
         verbose_name_plural = "Партнёрства компаний (склад и касса)"
@@ -1378,6 +1427,10 @@ class CompanyCashIncassation(models.Model):
     )
     amount = models.DecimalField(max_digits=18, decimal_places=2, verbose_name="Сумма")
     comment = models.CharField(max_length=512, blank=True, verbose_name="Комментарий")
+    partner_operation = models.ForeignKey(
+        "warehouse.PartnerOperationRequest", null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+        verbose_name="Подтверждённый запрос",
+    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -1400,6 +1453,90 @@ class CompanyCashIncassation(models.Model):
         return f"{self.from_company_id} → {self.to_company_id} {self.amount}"
 
 
+class CompanyStockPartnershipEvent(models.Model):
+    """Журнал партнёрства: активация, разрыв, смена настроек стороны. Не удаляется."""
+
+    class Kind(models.TextChoices):
+        ACTIVATED = "ACTIVATED", "Активировано"
+        TERMINATED = "TERMINATED", "Разорвано"
+        SETTINGS_CHANGED = "SETTINGS_CHANGED", "Настройки изменены"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    partnership = models.ForeignKey(CompanyStockPartnership, on_delete=models.PROTECT, related_name="events")
+    kind = models.CharField(max_length=24, choices=Kind.choices)
+    company = models.ForeignKey("users.Company", null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    payload = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Событие партнёрства"
+        verbose_name_plural = "События партнёрства"
+        ordering = ("-created_at",)
+
+
+class PartnerOperationRequest(models.Model):
+    """«Забрать у партнёра» (товар или деньги), ожидающее подтверждения владельца/админа партнёра."""
+
+    class Kind(models.TextChoices):
+        TRANSFER = "TRANSFER", "Товар"
+        INCASSATION = "INCASSATION", "Деньги"
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Ожидает"
+        APPROVED = "APPROVED", "Проведена"
+        REJECTED = "REJECTED", "Отклонена"
+        CANCELLED = "CANCELLED", "Отозвана"
+        FAILED = "FAILED", "Ошибка"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    partnership = models.ForeignKey(CompanyStockPartnership, on_delete=models.PROTECT, related_name="operations")
+    kind = models.CharField(max_length=16, choices=Kind.choices)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True)
+    initiator_company = models.ForeignKey(
+        "users.Company", on_delete=models.PROTECT, related_name="partner_operations_out"
+    )
+    source_company = models.ForeignKey(
+        "users.Company", on_delete=models.PROTECT, related_name="partner_operations_in"
+    )
+    warehouse_from = models.ForeignKey("warehouse.Warehouse", null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    warehouse_to = models.ForeignKey("warehouse.Warehouse", null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    items = models.JSONField(default=list, blank=True)
+    cash_register_from = models.ForeignKey("warehouse.CashRegister", null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    cash_register_to = models.ForeignKey("warehouse.CashRegister", null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    comment = models.CharField(max_length=512, blank=True)
+    reject_reason = models.CharField(max_length=512, blank=True)
+    error = models.CharField(max_length=512, blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    decided_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    decided_at = models.DateTimeField(null=True, blank=True)
+    document = models.ForeignKey("warehouse.Document", null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    incassation = models.ForeignKey(
+        "warehouse.CompanyCashIncassation", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Операция с партнёром (ожидает подтверждения)"
+        verbose_name_plural = "Операции с партнёром"
+        indexes = [
+            models.Index(fields=["source_company", "status"]),
+            models.Index(fields=["initiator_company", "status"]),
+        ]
+
+
+def get_stock_partnership(company_id_a, company_id_b, *, active_only=True):
+    if not company_id_a or not company_id_b or str(company_id_a) == str(company_id_b):
+        return None
+    id_lo, id_hi = canonical_company_pair_ids(company_id_a, company_id_b)
+    qs = CompanyStockPartnership.objects.filter(company_a_id=id_lo, company_b_id=id_hi)
+    if active_only:
+        qs = qs.filter(status=CompanyStockPartnership.Status.ACTIVE)
+    return qs.first()
+
+
 def canonical_company_pair_ids(company_id_a, company_id_b):
     """Два UUID компании в стабильном порядке для company_a / company_b."""
     return sorted([company_id_a, company_id_b], key=str)
@@ -1409,7 +1546,9 @@ def has_active_stock_partnership_between_ids(company_id_a, company_id_b) -> bool
     if not company_id_a or not company_id_b or str(company_id_a) == str(company_id_b):
         return False
     id_lo, id_hi = canonical_company_pair_ids(company_id_a, company_id_b)
-    return CompanyStockPartnership.objects.filter(company_a_id=id_lo, company_b_id=id_hi).exists()
+    return CompanyStockPartnership.objects.filter(
+        company_a_id=id_lo, company_b_id=id_hi, status=CompanyStockPartnership.Status.ACTIVE
+    ).exists()
 
 
 def list_active_stock_partner_companies(company):
@@ -1420,7 +1559,7 @@ def list_active_stock_partner_companies(company):
     if not company:
         return []
     qs = CompanyStockPartnership.objects.filter(
-        Q(company_a=company) | Q(company_b=company)
+        Q(company_a=company) | Q(company_b=company), status=CompanyStockPartnership.Status.ACTIVE
     ).select_related("company_a", "company_b")
     partners = []
     seen = set()
@@ -1566,6 +1705,20 @@ class Document(models.Model):
     )
 
     comment = models.TextField(blank=True, verbose_name="Комментарий")
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+        verbose_name="Кто создал",
+    )
+    initiator_company = models.ForeignKey(
+        "users.Company", null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+        verbose_name="Компания-инициатор (межкомпанейское перемещение)",
+    )
+    # Компания документа (A13): заполняется по складу-источнику (иначе приёмнику), для
+    # мультискладских документов без склада — по товарам строк при проведении.
+    company = models.ForeignKey(
+        "users.Company", null=True, blank=True, on_delete=models.SET_NULL, related_name="warehouse_documents",
+        verbose_name="Компания",
+    )
     total = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого")
     discount_percent = models.DecimalField(
         max_digits=5, decimal_places=2, default=Decimal("0.00"),
@@ -1581,9 +1734,39 @@ class Document(models.Model):
     class Meta:
         verbose_name = "Документ"
         verbose_name_plural = "Документы"
+        indexes = [
+            models.Index(fields=["company", "doc_type", "status", "date"]),
+        ]
 
     def __str__(self):
         return f"{self.number} ({self.doc_type})"
+
+    def resolve_company_id(self):
+        """Компания по складам документа, иначе по товарам строк (для мультискладских)."""
+        for wh in (self.warehouse_from, self.warehouse_to):
+            if wh is not None and wh.company_id:
+                return wh.company_id
+        if self.pk:
+            return (
+                DocumentItem.objects.filter(document_id=self.pk, product__isnull=False)
+                .values_list("product__company_id", flat=True)
+                .first()
+            )
+        return None
+
+    def save(self, *args, **kwargs):
+        if self.company_id is None:
+            company_id = None
+            for wh_id_attr, wh_attr in (("warehouse_from_id", "warehouse_from"), ("warehouse_to_id", "warehouse_to")):
+                if getattr(self, wh_id_attr):
+                    company_id = getattr(self, wh_attr).company_id
+                    break
+            if company_id is not None:
+                self.company_id = company_id
+                update_fields = kwargs.get("update_fields")
+                if update_fields is not None:
+                    kwargs["update_fields"] = list(set(update_fields) | {"company"})
+        super().save(*args, **kwargs)
 
     def clean(self):
         from django.core.exceptions import ValidationError
@@ -1707,6 +1890,19 @@ class DocumentItem(models.Model):
         verbose_name="Скидка на товар, сумма", help_text="Фиксированная скидка по строке"
     )
     line_total = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Итого по строке")
+    net_amount = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="Чистая сумма строки",
+        help_text="line_total минус доля скидки документа; Σ по документу == Document.total.",
+    )
+    cost_price = models.DecimalField(
+        max_digits=18, decimal_places=2, null=True, blank=True,
+        verbose_name="Себестоимость единицы",
+        help_text="Закупочная цена товара на момент проведения. NULL — строка проведена до появления поля "
+                  "(аналитика берёт текущую закупочную цену и помечает cost_is_estimated).",
+    )
 
     class Meta:
         verbose_name = "Строка документа"
@@ -1715,7 +1911,12 @@ class DocumentItem(models.Model):
     def clean(self):
         from django.core.exceptions import ValidationError
 
-        if self.qty is None or Decimal(self.qty) <= Decimal("0"):
+        doc_for_qty = getattr(self, "document", None)
+        is_inventory = getattr(doc_for_qty, "doc_type", None) == "INVENTORY"
+        # Инвентаризация задаёт фактический остаток — факт 0 допустим.
+        if self.qty is None or Decimal(self.qty) < Decimal("0") or (
+            Decimal(self.qty) == Decimal("0") and not is_inventory
+        ):
             raise ValidationError({"qty": "Quantity must be > 0"})
 
         if self.discount_percent is None:
@@ -1902,16 +2103,9 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         return self.status == self.Status.DRAFT
 
     def _warehouse_on_hand(self, product):
-        from apps.warehouse import services as warehouse_services
+        from apps.warehouse import stock as stock_service
 
-        balance = StockBalance.objects.filter(warehouse=self.warehouse, product=product).first()
-        on_hand, _ = warehouse_services.resolve_warehouse_on_hand_qty(
-            warehouse=self.warehouse,
-            product=product,
-            balance=balance,
-            sync=False,
-        )
-        return on_hand
+        return stock_service.get_on_hand(warehouse=self.warehouse, product=product)
 
     def _submitted_reserved_qty(self, product_id, *, exclude_cart_id=None):
         qs = AgentRequestItem.objects.filter(
@@ -2000,7 +2194,7 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         ])
 
     def _transfer_items_to_agent(self):
-        from apps.warehouse import services as warehouse_services
+        from apps.warehouse import stock as stock_service
 
         for it in self.items.select_related("product"):
             prod = it.product
@@ -2008,26 +2202,19 @@ class AgentRequestCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
             if need_qty <= 0:
                 continue
 
-            bal, created = StockBalance.objects.select_for_update().get_or_create(
-                warehouse=self.warehouse,
-                product=prod,
-                defaults={"qty": Decimal("0.000")},
-            )
-            cur_qty, bal = warehouse_services.resolve_warehouse_on_hand_qty(
-                warehouse=self.warehouse,
-                product=prod,
-                balance=bal,
-                sync=True,
-            )
+            cur_qty = stock_service.get_on_hand(warehouse=self.warehouse, product=prod, lock=True)
             if cur_qty < need_qty:
                 raise ValidationError({
                     "items": f"Недостаточно на складе для {prod.name}: нужно {need_qty}, доступно {cur_qty}."
                 })
 
-            bal.qty = cur_qty - need_qty
-            bal.save(update_fields=["qty"])
-            if prod.warehouse_id == self.warehouse_id:
-                type(prod).objects.filter(pk=prod.pk).update(quantity=q_qty(bal.qty))
+            stock_service.apply_stock_delta(
+                warehouse=self.warehouse,
+                product=prod,
+                delta=-need_qty,
+                source_kind=StockMove.SourceKind.AGENT_ISSUE,
+                source_id=self.pk,
+            )
 
             stock, _ = AgentStockBalance.objects.select_for_update().get_or_create(
                 agent=self.agent,
@@ -2237,7 +2424,7 @@ class AgentReturnCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         return max(cur - pending, Decimal("0.000"))
 
     def _transfer_items_from_agent_to_warehouse(self):
-        from apps.warehouse import services as warehouse_services
+        from apps.warehouse import stock as stock_service
 
         for it in self.items.select_related("product"):
             prod = it.product
@@ -2259,22 +2446,13 @@ class AgentReturnCart(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
             stock.qty = cur_agent_qty - return_qty
             stock.save(update_fields=["qty"])
 
-            bal, created = StockBalance.objects.select_for_update().get_or_create(
+            stock_service.apply_stock_delta(
                 warehouse=self.warehouse,
                 product=prod,
-                defaults={"qty": Decimal("0.000")},
+                delta=return_qty,
+                source_kind=StockMove.SourceKind.AGENT_RETURN,
+                source_id=self.pk,
             )
-            cur_wh_qty, bal = warehouse_services.resolve_warehouse_on_hand_qty(
-                warehouse=self.warehouse,
-                product=prod,
-                balance=bal,
-                sync=True,
-            )
-            new_wh_qty = q_qty(cur_wh_qty + return_qty)
-            bal.qty = new_wh_qty
-            bal.save(update_fields=["qty"])
-            if prod.warehouse_id == self.warehouse_id:
-                type(prod).objects.filter(pk=prod.pk).update(quantity=new_wh_qty)
 
     @transaction.atomic
     def submit(self):
@@ -2433,8 +2611,31 @@ class StockMove(models.Model):
         RECEIPT = "RECEIPT", "Приход"
         EXPENSE = "EXPENSE", "Расход"
 
+    class SourceKind(models.TextChoices):
+        DOCUMENT = "document", "Документ"
+        AGENT_ISSUE = "agent_issue", "Выдача агенту"
+        AGENT_RETURN = "agent_return", "Возврат от агента"
+        OPENING = "opening", "Начальный остаток"
+        ADJUSTMENT = "adjustment", "Корректировка"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="moves", verbose_name="Документ")
+    # Движение без документа (выдача/возврат агента, начальный остаток) — document=NULL,
+    # источник в source_kind/source_id. SET_NULL: удаление документа не стирает историю,
+    # иначе нарушится инвариант StockBalance.qty == Σ StockMove.qty_delta.
+    document = models.ForeignKey(
+        Document, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="moves", verbose_name="Документ",
+    )
+    source_kind = models.CharField(
+        max_length=16,
+        choices=SourceKind.choices,
+        default=SourceKind.DOCUMENT,
+        verbose_name="Источник движения",
+    )
+    source_id = models.UUIDField(
+        null=True, blank=True, verbose_name="ID источника",
+        help_text="Документ (для сторно и отвязанных движений), заявка/возврат агента и т.п.",
+    )
     warehouse = models.ForeignKey("warehouse.Warehouse", on_delete=models.CASCADE, verbose_name="Склад")
     product = models.ForeignKey("warehouse.WarehouseProduct", on_delete=models.CASCADE, verbose_name="Товар")
     qty_delta = models.DecimalField(max_digits=18, decimal_places=3, verbose_name="Изменение количества")
@@ -2452,10 +2653,15 @@ class StockMove(models.Model):
         indexes = [
             models.Index(fields=["warehouse", "product", "created_at"]),
             models.Index(fields=["document", "move_kind"]),
+            models.Index(fields=["source_kind", "source_id"]),
         ]
 
     def __str__(self):
-        return f"Move {self.document.number} {self.product} {self.qty_delta} @ {self.warehouse}"
+        if self.document_id:
+            src = self.document.number or self.document_id
+        else:
+            src = f"{self.source_kind}:{self.source_id}" if self.source_id else self.source_kind
+        return f"Move {src} {self.product} {self.qty_delta} @ {self.warehouse}"
 
 
 # -----------------------
@@ -2498,6 +2704,10 @@ class PaymentCategory(BaseModelId, BaseModelCompanyBranch):
         SALE = "sale", "Продажа"
         DEBT = "debt", "Долги"
         INCASSATION = "incassation", "Инкассация"
+        PURCHASE = "purchase", "Закупка"
+        SALE_RETURN = "sale_return", "Возврат покупателю"
+        PURCHASE_RETURN = "purchase_return", "Возврат от поставщика"
+        SALARY = "salary", "Зарплата"
 
     title = models.CharField(max_length=255, verbose_name="Название")
     system_code = models.CharField(
@@ -3085,6 +3295,11 @@ class AgentSalaryPayout(models.Model):
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
         related_name="+", verbose_name="Кем создано",
+    )
+    # Выплата из кассы: проведённый MONEY_EXPENSE (категория «Зарплата»). NULL — выплата вне кассы.
+    money_document = models.OneToOneField(
+        "warehouse.MoneyDocument", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="salary_payout", verbose_name="Денежный документ (касса)",
     )
     created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="Создано")
 

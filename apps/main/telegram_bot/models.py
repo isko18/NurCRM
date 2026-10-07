@@ -1,4 +1,5 @@
 import uuid
+from django.conf import settings as django_settings
 from django.db import models
 from apps.main.telegram_bot.crypto import encrypt_secret, decrypt_secret
 
@@ -36,9 +37,17 @@ class TelegramBotSettings(models.Model):
     commands_enabled = models.BooleanField("Команды владельца включены", default=True)
     ai_enabled = models.BooleanField("ИИ включён", default=True)
     encrypted_ai_key = models.TextField("Зашифрованный ключ ИИ", blank=True, default="")
+    ai_functions_enabled = models.BooleanField("Вызов функций ИИ (аналитика)", default=True)
+    daily_report_time = models.CharField("Время ежедневного отчёта (HH:MM)", max_length=16, blank=True, null=True, default="21:00")
+    weekly_report = models.BooleanField("Еженедельный отчёт (пн 9:00)", default=True)
+    monthly_report = models.BooleanField("Ежемесячный отчёт (1-е число)", default=True)
+    ai_daily_limit = models.PositiveIntegerField("Дневной лимит запросов к ИИ", default=200)
     consultant_enabled = models.BooleanField("ИИ-консультант покупателей включён", default=True)
     customer_limit_per_hour = models.PositiveIntegerField("Лимит запросов покупателя в час", default=20)
     voice_replies_enabled = models.BooleanField("Голосовые ответы включены", default=True)
+    send_product_photos = models.BooleanField("Присылать фото товаров", default=True)
+    last_update_at = models.DateTimeField("Последнее входящее обновление", blank=True, null=True)
+    last_reply_at = models.DateTimeField("Последний ответ бота", blank=True, null=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -74,6 +83,10 @@ class TelegramBotSettings(models.Model):
     def ai_key_set(self) -> bool:
         return bool(self.encrypted_ai_key)
 
+    @property
+    def ai_source(self) -> str:
+        return "own" if self.ai_key_set else "shared"
+
 
 class TelegramInquiry(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -98,6 +111,15 @@ class TelegramInquiry(models.Model):
         related_name="telegram_inquiries",
         verbose_name="Заказ",
     )
+    scenario = models.ForeignKey(
+        "TelegramBotScenario",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="inquiries",
+        verbose_name="Сработавший сценарий",
+    )
+    scenario_title = models.CharField("Название сценария", max_length=255, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
@@ -191,3 +213,123 @@ class TelegramMessageLog(models.Model):
 
     def __str__(self):
         return f"TelegramMessageLog({self.chat_id}, {self.created_at})"
+
+
+class TelegramBotScenario(models.Model):
+    class Kind(models.TextChoices):
+        COMMAND = "command", "Команда"
+        KEYWORDS = "keywords", "Ключевые слова"
+
+    class Audience(models.TextChoices):
+        CUSTOMERS = "customers", "Покупатели"
+        OWNER = "owner", "Владелец"
+        ALL = "all", "Все"
+
+    class Source(models.TextChoices):
+        OWNER = "owner", "Владелец"
+        AI_ADVISOR = "ai_advisor", "ИИ-советник"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        "users.Company",
+        on_delete=models.CASCADE,
+        related_name="telegram_bot_scenarios",
+        verbose_name="Компания",
+        db_index=True,
+    )
+    kind = models.CharField("Вид сценария", max_length=16, choices=Kind.choices, default=Kind.KEYWORDS)
+    command = models.CharField("Команда", max_length=32, blank=True, default="", db_index=True)
+    keywords = models.JSONField("Ключевые слова", default=list, blank=True)
+    title = models.CharField("Название", max_length=80)
+    reply_text = models.TextField("Текст ответа", max_length=3500)
+    buttons = models.JSONField("Кнопки", default=list, blank=True)
+    photo_product = models.ForeignKey(
+        "main.Product",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="scenario_photos",
+        verbose_name="Товар для фото",
+    )
+    audience = models.CharField("Аудитория", max_length=16, choices=Audience.choices, default=Audience.CUSTOMERS)
+    languages = models.JSONField("Языки", default=list, blank=True)
+    priority = models.PositiveSmallIntegerField("Приоритет", default=50)
+    is_active = models.BooleanField("Активен", default=True)
+    show_in_menu = models.BooleanField("Показывать в меню", default=False)
+    created_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Создал",
+    )
+    updated_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Изменил",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    source = models.CharField("Источник", max_length=16, choices=Source.choices, default=Source.OWNER)
+    hits = models.PositiveIntegerField("Количество срабатываний", default=0)
+
+    class Meta:
+        db_table = "telegram_bot_scenarios"
+        verbose_name = "Сценарий Telegram-бота"
+        verbose_name_plural = "Сценарии Telegram-бота"
+        ordering = ["-priority", "title"]
+        indexes = [
+            models.Index(fields=["company", "-priority"]),
+            models.Index(fields=["company", "is_active"]),
+        ]
+
+    def __str__(self):
+        return f"TelegramBotScenario({self.company_id}, {self.kind}, {self.title})"
+
+
+class TelegramBotAudit(models.Model):
+    class Action(models.TextChoices):
+        SETTINGS_UPDATE = "settings_update", "Обновление настроек"
+        SCENARIO_CREATE = "scenario_create", "Создание сценария"
+        SCENARIO_UPDATE = "scenario_update", "Обновление сценария"
+        SCENARIO_DELETE = "scenario_delete", "Удаление сценария"
+        AI_ADVICE_APPLY = "ai_advice_apply", "Применение совета ИИ"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        "users.Company",
+        on_delete=models.CASCADE,
+        related_name="telegram_bot_audits",
+        verbose_name="Компания",
+        db_index=True,
+    )
+    user = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Пользователь",
+    )
+    user_name = models.CharField("Имя пользователя", max_length=255, blank=True, default="")
+    action = models.CharField("Действие", max_length=64, choices=Action.choices, db_index=True)
+    object_title = models.CharField("Объект", max_length=255, blank=True, default="")
+    source = models.CharField("Источник", max_length=32, default="owner")
+    changes = models.JSONField("Изменения", default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = "telegram_bot_audit"
+        verbose_name = "Аудит Telegram-бота"
+        verbose_name_plural = "Аудит Telegram-бота"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "-created_at"]),
+        ]
+
+    def __str__(self):
+        return f"TelegramBotAudit({self.company_id}, {self.action}, {self.created_at})"

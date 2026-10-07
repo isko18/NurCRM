@@ -4,6 +4,7 @@ from contextlib import contextmanager
 
 from django.apps import apps
 from django.contrib import admin
+from django import forms
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.db import models as dj_models
 from django.db.models import Prefetch
@@ -864,8 +865,22 @@ class ScaleDeviceAdmin(CompanyScopedFKMixin, admin.ModelAdmin):
 from apps.users.models import CompanyAddon, UserUiPreferences  # noqa: E402
 
 
+KNOWN_FEATURE_CODES = (
+    "ai, clients, sales_analytics, restock, salary, debts, service "
+    "(ТЗ ч.13: функции «Стандарта», купленные на «Старте»), voice, loyalty, showcase_editor"
+)
+
+
+class CompanyAddonForm(forms.ModelForm):
+    class Meta:
+        model = CompanyAddon
+        fields = "__all__"
+        help_texts = {"code": f"Код функции: {KNOWN_FEATURE_CODES}. Касса видит его в company → features."}
+
+
 @admin.register(CompanyAddon)
 class CompanyAddonAdmin(admin.ModelAdmin):
+    form = CompanyAddonForm
     list_display = ("company", "code", "active", "until", "updated_at")
     list_filter = ("active", "code")
     search_fields = ("company__name", "code")
@@ -880,3 +895,39 @@ class UserUiPreferencesAdmin(admin.ModelAdmin):
     raw_id_fields = ("user",)
     readonly_fields = ("created_at", "updated_at")
 
+
+
+# --- ТЗ ч.13: настройки программ и ключи функций ---------------------------------
+from apps.users.models import CompanyAppSettings, FeatureActivationKey, UserAppSettings  # noqa: E402
+
+
+class _AppSettingsAdminBase(admin.ModelAdmin):
+    exclude = ("secrets",)
+    readonly_fields = ("version", "secrets_masked", "created_at", "updated_at")
+
+    @admin.display(description="Секреты")
+    def secrets_masked(self, obj):
+        return ", ".join(f"{k}: ••••" for k in (obj.secrets or {})) or "—"
+
+
+@admin.register(UserAppSettings)
+class UserAppSettingsAdmin(_AppSettingsAdminBase):
+    list_display = ("user", "app", "version", "updated_at")
+    search_fields = ("user__email", "app")
+    raw_id_fields = ("user",)
+
+
+@admin.register(CompanyAppSettings)
+class CompanyAppSettingsAdmin(_AppSettingsAdminBase):
+    list_display = ("company", "branch", "app", "version", "updated_at")
+    search_fields = ("company__name", "app")
+    raw_id_fields = ("company", "branch", "updated_by")
+
+
+@admin.register(FeatureActivationKey)
+class FeatureActivationKeyAdmin(admin.ModelAdmin):
+    list_display = ("key", "code", "days", "used_by_company", "used_at", "created_at")
+    list_filter = ("code", ("used_by_company", admin.EmptyFieldListFilter))
+    search_fields = ("key", "code", "used_by_company__name", "note")
+    raw_id_fields = ("used_by_company", "used_by_user")
+    readonly_fields = ("used_by_company", "used_by_user", "used_at", "created_at")

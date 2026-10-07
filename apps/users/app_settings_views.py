@@ -1,0 +1,318 @@
+"""
+ТЗ ч.13: настройки программ на сервере и купленные функции компании.
+
+  GET/PATCH /api/users/app-settings/{app}/        — личные настройки пользователя (1.1)
+  GET/PATCH /api/main/app-settings/{app}/?branch= — общие настройки компании / филиала (1.2)
+  POST      /api/users/company/features/activate/ — включить функцию компании ключом (2.3)
+
+Тело PATCH — JSON-объект: верхний уровень сливается, null удаляет ключ. Секреты (ключи ИИ,
+токен бота) кладутся в объект "secrets": хранятся зашифрованными, в ответе — только владельцу
+и администратору (в личных настройках — самому пользователю). If-Match: <version> — при
+устаревшей версии 412 и текущие настройки.
+"""
+import json
+import re
+from datetime import timedelta
+
+from django.db import IntegrityError, transaction
+from django.utils import timezone
+from rest_framework import status
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from apps.main.telegram_bot.crypto import decrypt_secret, encrypt_secret
+from apps.users.models import (
+    Branch,
+    CompanyAddon,
+    CompanyAppSettings,
+    FeatureActivationKey,
+    UserAppSettings,
+)
+
+APP_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+MAX_BYTES = 256 * 1024
+SECRETS_KEY = "secrets"
+
+
+def _check_app(app):
+    if not APP_RE.match(app or ""):
+        raise ValidationError({"app": "Имя программы: латиница, цифры, «-», до 64 символов."})
+
+
+def _company_of(user):
+    return getattr(user, "owned_company", None) or getattr(user, "company", None)
+
+
+def _is_owner_or_admin(user, company):
+    if getattr(user, "is_superuser", False):
+        return True
+    if company is not None and getattr(company, "owner_id", None) == user.id:
+        return True
+    return getattr(user, "role", None) in ("owner", "admin")
+
+
+def _decrypt_all(enc):
+    out = {}
+    for k, v in (enc or {}).items():
+        raw = decrypt_secret(v)
+        try:
+            out[k] = json.loads(raw)
+        except (TypeError, ValueError):
+            out[k] = raw
+    return out
+
+
+def _payload(obj, *, with_secrets):
+    settings = dict(obj.settings or {}) if obj else {}
+    if obj and obj.secrets and with_secrets:
+        settings[SECRETS_KEY] = _decrypt_all(obj.secrets)
+    return {
+        "settings": settings,
+        "version": obj.version if obj else 0,
+        "updated_at": obj.updated_at.isoformat() if obj and obj.updated_at else None,
+    }
+
+
+def _response(payload, code=status.HTTP_200_OK):
+    resp = Response(payload, status=code)
+    resp["ETag"] = f'"{payload["version"]}"'
+    return resp
+
+
+def _if_match(request):
+    raw = (request.headers.get("If-Match") or "").strip()
+    if not raw or raw == "*":
+        return None
+    raw = raw.removeprefix("W/").strip('"')
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValidationError({"If-Match": "Ожидается номер версии."})
+
+
+def _apply_patch(obj, body):
+    """Сливает тело в obj.settings / obj.secrets. Возвращает True, если что-то изменилось."""
+    if not isinstance(body, dict):
+        raise ValidationError({"detail": "Тело — JSON-объект с настройками."})
+    settings = dict(obj.settings or {})
+    secrets = dict(obj.secrets or {})
+    before = (json.dumps(settings, sort_keys=True), dict(secrets))
+    plain_secrets = None
+
+    for key, value in body.items():
+        if key == SECRETS_KEY:
+            if value is None:
+                secrets = {}
+                continue
+            if not isinstance(value, dict):
+                raise ValidationError({SECRETS_KEY: "Ожидается объект {имя: значение}."})
+            plain_secrets = plain_secrets if plain_secrets is not None else _decrypt_all(secrets)
+            for sk, sv in value.items():
+                if sv is None:
+                    secrets.pop(sk, None)
+                    plain_secrets.pop(sk, None)
+                elif plain_secrets.get(sk) != sv:
+                    secrets[sk] = encrypt_secret(json.dumps(sv, ensure_ascii=False))
+                    plain_secrets[sk] = sv
+        elif value is None:
+            settings.pop(key, None)
+        else:
+            settings[key] = value
+
+    size = len(json.dumps(settings, ensure_ascii=False).encode("utf-8")) + len(json.dumps(secrets).encode("utf-8"))
+    if size > MAX_BYTES:
+        raise ValidationError({"detail": "Настройки больше 256 КБ.", "code": "too_large"})
+
+    changed = (json.dumps(settings, sort_keys=True), secrets) != before
+    if changed:
+        obj.settings = settings
+        obj.secrets = secrets
+        obj.version = (obj.version or 0) + 1
+    return changed
+
+
+class _AppSettingsMixin:
+    """get/patch для записи настроек (личной или компании)."""
+
+    model = None
+
+    def _lookup(self, request, app):  # -> dict фильтра записи
+        raise NotImplementedError
+
+    def _can_write(self, request):
+        return True
+
+    def _with_secrets(self, request):
+        return True
+
+    def _extra(self, request, app, obj):
+        return {}
+
+    def get(self, request, app):
+        _check_app(app)
+        obj = self.model.objects.filter(**self._lookup(request, app)).first()
+        payload = _payload(obj, with_secrets=self._with_secrets(request))
+        payload.update(self._extra(request, app, obj))
+        return _response(payload)
+
+    def patch(self, request, app):
+        _check_app(app)
+        if not self._can_write(request):
+            raise PermissionDenied("Менять общие настройки может владелец или администратор.")
+        lookup = self._lookup(request, app)
+        expected = _if_match(request)
+        for _attempt in range(2):
+            try:
+                with transaction.atomic():
+                    obj = self.model.objects.select_for_update().filter(**lookup).first()
+                    if obj is None:
+                        obj = self.model(**lookup)
+                    if expected is not None and expected != (obj.version or 0):
+                        payload = _payload(obj if obj.pk else None, with_secrets=self._with_secrets(request))
+                        payload["detail"] = "Настройки изменились на другом устройстве — перечитайте и слейте."
+                        payload["code"] = "version_conflict"
+                        return _response(payload, status.HTTP_412_PRECONDITION_FAILED)
+                    changed = _apply_patch(obj, request.data)
+                    if changed or not obj.pk:
+                        if hasattr(obj, "updated_by_id"):
+                            obj.updated_by = request.user
+                        obj.save()
+                break
+            except IntegrityError:
+                continue  # запись создали параллельно — перечитываем и сливаем ещё раз
+        payload = _payload(obj, with_secrets=self._with_secrets(request))
+        payload.update(self._extra(request, app, obj))
+        return _response(payload)
+
+    def put(self, request, app):
+        return self.patch(request, app)
+
+
+class UserAppSettingsAPIView(_AppSettingsMixin, APIView):
+    """GET/PATCH /api/users/app-settings/{app}/ — только сам пользователь (ТЗ ч.13, 1.1)."""
+
+    permission_classes = [IsAuthenticated]
+    model = UserAppSettings
+
+    def _lookup(self, request, app):
+        return {"user": request.user, "app": app}
+
+
+class CompanyAppSettingsAPIView(_AppSettingsMixin, APIView):
+    """
+    GET/PATCH /api/main/app-settings/{app}/?branch=<id> (ТЗ ч.13, 1.2).
+    Читают все сотрудники компании, меняют владелец и администратор.
+    С ?branch= — настройки филиала; в ответе ещё effective = настройки компании + филиала.
+    """
+
+    permission_classes = [IsAuthenticated]
+    model = CompanyAppSettings
+
+    def _company(self, request):
+        company = _company_of(request.user)
+        if company is None:
+            raise PermissionDenied("Пользователь не привязан к компании.")
+        return company
+
+    def _branch(self, request, company):
+        raw = request.query_params.get("branch")
+        if not raw:
+            return None
+        branch = Branch.objects.filter(id=raw, company=company).first() if _is_uuid(raw) else None
+        if branch is None:
+            raise NotFound("Филиал не найден.")
+        return branch
+
+    def _lookup(self, request, app):
+        company = self._company(request)
+        return {"company": company, "branch": self._branch(request, company), "app": app}
+
+    def _can_write(self, request):
+        return _is_owner_or_admin(request.user, self._company(request))
+
+    def _with_secrets(self, request):
+        return _is_owner_or_admin(request.user, self._company(request))
+
+    def _extra(self, request, app, obj):
+        lookup = self._lookup(request, app)
+        if lookup["branch"] is None:
+            return {}
+        base = CompanyAppSettings.objects.filter(company=lookup["company"], branch__isnull=True, app=app).first()
+        with_secrets = self._with_secrets(request)
+        eff = dict(_payload(base, with_secrets=with_secrets)["settings"])
+        own = _payload(obj, with_secrets=with_secrets)["settings"]
+        if SECRETS_KEY in eff or SECRETS_KEY in own:
+            own = dict(own)
+            eff[SECRETS_KEY] = {**eff.get(SECRETS_KEY, {}), **own.pop(SECRETS_KEY, {})}
+        eff.update(own)
+        return {"effective": eff, "company_version": base.version if base else 0}
+
+
+def _is_uuid(raw):
+    import uuid
+
+    try:
+        uuid.UUID(str(raw))
+        return True
+    except ValueError:
+        return False
+
+
+class CompanyFeatureActivateAPIView(APIView):
+    """
+    POST /api/users/company/features/activate/  {"key": "ABCD-…"}   (ТЗ ч.13, 2.3)
+    Ключ включает функцию компании (CompanyAddon) на свой срок и запоминается как использованный.
+    → 200 {"code": "ai", "until": "2027-10-06" | null, "features": [...]}
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.users.serializers import company_feature_codes
+
+        company = _company_of(request.user)
+        if company is None:
+            raise PermissionDenied("Пользователь не привязан к компании.")
+        if not _is_owner_or_admin(request.user, company):
+            raise PermissionDenied("Включить функцию может владелец или администратор.")
+        raw = str(request.data.get("key") or "").strip().upper()
+        if not raw:
+            raise ValidationError({"key": "Введите ключ."})
+
+        with transaction.atomic():
+            key = FeatureActivationKey.objects.select_for_update().filter(key__iexact=raw).first()
+            if key is None:
+                return Response({"detail": "Ключ не найден.", "code": "invalid_key"}, status=status.HTTP_400_BAD_REQUEST)
+            if key.used_by_company_id and key.used_by_company_id != company.id:
+                return Response({"detail": "Ключ уже использован.", "code": "key_used"}, status=status.HTTP_400_BAD_REQUEST)
+
+            addon = CompanyAddon.objects.select_for_update().filter(company=company, code=key.code).first()
+            if key.used_by_company_id is None:
+                today = timezone.localdate()
+                if key.days:
+                    start = today
+                    if addon and addon.is_effective(today) and addon.until and addon.until > today:
+                        start = addon.until  # продление: срок добавляется к текущему
+                    until = start + timedelta(days=key.days)
+                else:
+                    until = None
+                already_forever = addon is not None and addon.is_effective(today) and addon.until is None
+                if addon is None:
+                    addon = CompanyAddon(company=company, code=key.code)
+                if not already_forever:  # бессрочную функцию ключ со сроком не укорачивает
+                    addon.until = until
+                addon.active = True
+                addon.note = (f"ключ {key.key}")[:255]
+                addon.save()
+                key.used_by_company = company
+                key.used_by_user = request.user
+                key.used_at = timezone.now()
+                key.save(update_fields=["used_by_company", "used_by_user", "used_at"])
+
+        return Response({
+            "code": key.code,
+            "until": addon.until.isoformat() if addon and addon.until else None,
+            "features": company_feature_codes(company),
+        })

@@ -150,6 +150,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "performer",
             "display_name",
             "primary_image_url",
+            "is_wholesale",
         )
         read_only_fields = (
             "id", "kind", "product_name", "barcode",
@@ -159,6 +160,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "price_manually_edited",
             "display_name", "primary_image_url",
             "sale_package",
+            "is_wholesale",
         )
 
     def get_stock(self, obj):

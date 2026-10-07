@@ -839,6 +839,24 @@ class Product(models.Model):
         default=0,
         help_text="Скидка в процентах от цены продажи",
     )
+    upsell_priority = models.PositiveSmallIntegerField(
+        "Приоритет допродажи (0-100)",
+        default=0,
+        validators=[MaxValueValidator(100)],
+        help_text="Приоритет товара в подсказках кассиру от 0 до 100",
+    )
+    upsell_excluded = models.BooleanField(
+        "Исключить из допродажи",
+        default=False,
+        help_text="Товар никогда не предлагать в подсказках (алкоголь, табак и т.д.)",
+    )
+    telegram_photo_file_id = models.CharField(
+        "Telegram Photo file_id",
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Кэш file_id Telegram для быстрой отправки фото без повторной загрузки",
+    )
 
     # ---- Услуги: длительность и процент мастера ----
     duration_min = models.PositiveIntegerField(
@@ -2093,6 +2111,11 @@ class CartItem(models.Model):
         related_name="+",
         verbose_name="Мастер",
     )
+    is_wholesale = models.BooleanField(
+        default=False,
+        db_index=True,
+        verbose_name="Оптовая позиция",
+    )
 
     class Meta:
         constraints = [
@@ -2924,6 +2947,11 @@ class SaleItem(models.Model):
         verbose_name="Доп. услуга / произвольная позиция",
         help_text="Флаг для позиций без привязки к товару из каталога (AN-10).",
     )
+    is_wholesale = models.BooleanField(
+        default=False,
+        db_index=True,
+        verbose_name="Оптовая позиция",
+    )
 
     sale_package = models.ForeignKey(
         "main.ProductPackage",
@@ -3543,6 +3571,10 @@ class Client(models.Model):
     enterprise = models.CharField("Предприятие O", max_length=255, blank=True, null=True)
     full_name = models.CharField("ФИО", max_length=255)
     phone = models.CharField("Телефон", max_length=32)
+    # E.164 (+996…), считается из phone в save(): поиск одного клиента кассой, приложением и по QR.
+    phone_normalized = models.CharField(
+        "Телефон (E.164)", max_length=20, blank=True, default="", db_default="", editable=False
+    )
     email = models.EmailField("Почта", blank=True)
     date = models.DateField("Дата", null=True, blank=True)
     status = models.CharField("Статус", max_length=16, choices=Status.choices, default=Status.NEW)
@@ -3590,10 +3622,22 @@ class Client(models.Model):
         indexes = [
             models.Index(fields=["company", "phone"]),
             models.Index(fields=["company", "branch", "status"]),
+            models.Index(fields=["phone_normalized"], name="idx_client_phone_norm"),
         ]
 
     def __str__(self):
         return f"{self.full_name} ({self.phone})"
+
+    def save(self, *args, **kwargs):
+        from apps.main.phone_utils import normalize_phone_e164
+
+        normalized = normalize_phone_e164(self.phone)
+        if normalized != (self.phone_normalized or ""):
+            self.phone_normalized = normalized
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None and "phone_normalized" not in update_fields:
+                kwargs["update_fields"] = list(update_fields) + ["phone_normalized"]
+        return super().save(*args, **kwargs)
 
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
@@ -4028,14 +4072,19 @@ class ClientDeal(models.Model):
                 d_date = inst.get("due_date")
                 if isinstance(d_date, str):
                     d_date = parse_date(d_date)
+                p_date = inst.get("promised_date")
+                if isinstance(p_date, str):
+                    p_date = parse_date(p_date)
                 balance = (balance - amt).quantize(Decimal("0.01"))
                 installments_to_create.append(
                     DealInstallment(
+                        id=uuid.uuid4(),
                         company=self.company,
                         branch=self.branch,
                         deal=self,
                         number=inst.get("number", idx),
                         due_date=d_date,
+                        promised_date=p_date,
                         amount=amt,
                         balance_after=max(Decimal("0.00"), balance),
                     )
@@ -4074,6 +4123,7 @@ class ClientDeal(models.Model):
 
                 installments_to_create.append(
                     DealInstallment(
+                        id=uuid.uuid4(),
                         company=self.company,
                         branch=self.branch,
                         deal=self,
@@ -4087,6 +4137,7 @@ class ClientDeal(models.Model):
             due_date = self.first_due_date or (timezone.localdate() + timedelta(days=self.debt_days or 30))
             installments_to_create.append(
                 DealInstallment(
+                    id=uuid.uuid4(),
                     company=self.company,
                     branch=self.branch,
                     deal=self,
@@ -4136,9 +4187,16 @@ def sync_sale_status_from_deal(deal_id) -> None:
         return
     if sale.status not in (Sale.Status.DEBT, Sale.Status.PAID):
         return
-    target = Sale.Status.PAID if deal.remaining_debt <= 0 else Sale.Status.DEBT
+    remaining = deal.remaining_debt
+    target = Sale.Status.PAID if remaining <= 0 else Sale.Status.DEBT
+    left = max(Decimal("0.00"), remaining)
+    updates = {}
     if sale.status != target:
-        Sale.objects.filter(pk=sale.pk).update(status=target)
+        updates["status"] = target
+    if sale.debt_remaining != left:
+        updates["debt_remaining"] = left
+    if updates:
+        Sale.objects.filter(pk=sale.pk).update(**updates)
 
 
 class DealInstallment(models.Model):
@@ -4180,6 +4238,7 @@ class DealInstallment(models.Model):
 
     paid_on = models.DateField("Оплачен", blank=True, null=True)
     paid_amount = models.DecimalField("Оплачено за период", max_digits=12, decimal_places=2, default=0)
+    promised_date = models.DateField("Обещанная дата", blank=True, null=True)
 
     class Meta:
         verbose_name = "Платёж по графику"
@@ -4214,6 +4273,100 @@ class DealInstallment(models.Model):
     @property
     def remaining_for_period(self) -> Decimal:
         return (self.amount - (self.paid_amount or Decimal("0"))).quantize(Decimal("0.01"))
+
+    @property
+    def is_overdue(self) -> bool:
+        if self.paid_on is not None:
+            return False
+        today = timezone.localdate()
+        return bool(self.due_date and self.due_date < today and self.remaining_for_period > 0)
+
+    @property
+    def overdue_days(self) -> int:
+        if not self.is_overdue or not self.due_date:
+            return 0
+        today = timezone.localdate()
+        return max(0, (today - self.due_date).days)
+
+    @property
+    def overdue_amount(self) -> Decimal:
+        if not self.is_overdue:
+            return Decimal("0.00")
+        return self.remaining_for_period
+
+
+class DealInstallmentHistory(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="installment_history",
+        verbose_name="Компания",
+        db_index=True,
+        null=True,
+        blank=True,
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        related_name="installment_history",
+        null=True,
+        blank=True,
+        verbose_name="Филиал",
+        db_index=True,
+    )
+
+    deal = models.ForeignKey(
+        ClientDeal,
+        on_delete=models.CASCADE,
+        related_name="installment_history",
+        verbose_name="Сделка",
+        db_index=True,
+    )
+
+    installment = models.ForeignKey(
+        DealInstallment,
+        on_delete=models.CASCADE,
+        related_name="history",
+        verbose_name="Взнос",
+        db_index=True,
+    )
+
+    idempotency_key = models.UUIDField("Ключ идемпотентности", null=True, blank=True)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="installment_history",
+        verbose_name="Кем изменено",
+    )
+
+    old_due_date = models.DateField("Старый срок оплаты", null=True, blank=True)
+    new_due_date = models.DateField("Новый срок оплаты", null=True, blank=True)
+
+    old_promised_date = models.DateField("Старая обещанная дата", null=True, blank=True)
+    new_promised_date = models.DateField("Новая обещанная дата", null=True, blank=True)
+
+    note = models.TextField("Комментарий / Причина", blank=True)
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "История изменения взноса"
+        verbose_name_plural = "История изменений взносов"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["company", "installment", "created_at"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["installment", "idempotency_key"],
+                condition=Q(idempotency_key__isnull=False),
+                name="uniq_installment_history_idempotency_key",
+            ),
+        ]
 
 
 class DealPayment(models.Model):
@@ -5157,6 +5310,10 @@ class MarketSaleEmployeePayProfile(models.Model):
         SALARY = "salary", "Оклад"
         PERCENT = "percent", "Процент от продаж"
         SALARY_PLUS_PERCENT = "salary_plus_percent", "Оклад + процент от продаж"
+        # ТЗ ч.13, 3: фиксированная сумма за каждую проданную единицу
+        PER_ITEM = "per_item", "За проданный товар"
+        SALARY_PLUS_PER_ITEM = "salary_plus_per_item", "Оклад + за проданный товар"
+        PERCENT_PLUS_PER_ITEM = "percent_plus_per_item", "Процент + за проданный товар"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -5199,6 +5356,14 @@ class MarketSaleEmployeePayProfile(models.Model):
         decimal_places=2,
         default=Decimal("0"),
         validators=[MinValueValidator(Decimal("0"))],
+    )
+    per_item_amount = models.DecimalField(
+        "Сумма за каждый проданный товар",
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="Сом за единицу; весовой товар — 1 за строку чека. Если > 0, добавляется к любой схеме.",
     )
 
     class Meta:
@@ -6911,6 +7076,11 @@ class Rental(models.Model):
         MONEY = "money", "Деньги"
         DOCUMENT = "document", "Документ"
 
+    class DepositMethod(models.TextChoices):
+        CASH = "cash", "Наличные"
+        TRANSFER = "transfer", "Перевод"
+        CARD = "card", "Карта"
+
     class Condition(models.TextChoices):
         OK = "ok", "Без повреждений"
         DAMAGED = "damaged", "Повреждено"
@@ -6924,9 +7094,11 @@ class Rental(models.Model):
     date_from = models.DateField()
     date_to = models.DateField()
     tariff = models.CharField(max_length=255, blank=True, default="")
+    rent_amount = models.DecimalField("Стоимость проката", max_digits=12, decimal_places=2, default=Decimal("0.00"), blank=True)
+    sale = models.ForeignKey("Sale", on_delete=models.SET_NULL, null=True, blank=True, related_name="rentals", verbose_name="Продажа проката")
     deposit_type = models.CharField(max_length=16, choices=DepositType.choices, default=DepositType.MONEY)
     deposit_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
-    deposit_method = models.CharField(max_length=32, blank=True, default="cash")
+    deposit_method = models.CharField(max_length=32, choices=DepositMethod.choices, blank=True, default=DepositMethod.CASH)
     deposit_document = models.CharField(max_length=255, blank=True, default="")
     condition = models.CharField(max_length=16, choices=Condition.choices, blank=True, default="")
     penalty = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
@@ -6952,6 +7124,7 @@ class RentalItem(models.Model):
     product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="+")
     variant = models.ForeignKey(ProductVariant, on_delete=models.PROTECT, null=True, blank=True, related_name="+")
     quantity = models.DecimalField(max_digits=12, decimal_places=3, default=Decimal("1"))
+    returned_quantity = models.DecimalField("Возвращено", max_digits=12, decimal_places=3, default=Decimal("0"))
 
 
 class ProductDeletion(models.Model):
@@ -7105,7 +7278,8 @@ def default_showcase_footer():
     }
 
 
-def get_default_showcase_design():
+def get_legacy_default_showcase_design():
+    """Документ по умолчанию ТЗ-BE-2026-03 (нужен только для апгрейда старых документов)."""
     return {
         "theme": default_showcase_theme(),
         "layout": default_showcase_layout(),
@@ -7114,6 +7288,13 @@ def get_default_showcase_design():
         "brand": default_showcase_brand(),
         "footer": default_showcase_footer(),
     }
+
+
+def get_default_showcase_design():
+    """Документ вида витрины по умолчанию (ТЗ-BE-2026-05, п. 5.1/5.2) = текущий вид витрины."""
+    from apps.main.showcase.design_schema import default_document
+
+    return default_document()
 
 
 def showcase_media_upload_to(instance, filename: str) -> str:
@@ -7163,6 +7344,7 @@ class ShowcaseDesignVersion(models.Model):
         verbose_name="Автор публикации",
     )
     published_at = models.DateTimeField("Дата публикации", default=timezone.now)
+    idempotency_key = models.CharField(max_length=128, null=True, blank=True, db_index=True)
 
     class Meta:
         verbose_name = "Версия дизайна витрины"
@@ -7182,8 +7364,19 @@ class ShowcaseMedia(models.Model):
         related_name="showcase_media",
         verbose_name="Компания",
     )
+    class Kind(models.TextChoices):
+        LOGO = "logo", "Логотип"
+        BANNER = "banner", "Баннер"
+        COVER = "cover", "Обложка"
+        FAVICON = "favicon", "Favicon"
+        OG = "og", "Картинка для соцсетей"
+        CATEGORY = "category", "Категория"
+        OTHER = "other", "Другое"
+
+    kind = models.CharField("Назначение", max_length=16, choices=Kind.choices, default=Kind.OTHER, db_index=True)
     file = models.FileField(upload_to=showcase_media_upload_to, verbose_name="Оригинал/Файл")
     urls = models.JSONField("URLs по размерам", default=dict)
+    size = models.PositiveIntegerField("Размер файла, байт", default=0)
     width = models.PositiveIntegerField("Ширина", default=0)
     height = models.PositiveIntegerField("Высота", default=0)
     content_type = models.CharField("Тип контента", max_length=64, default="image/webp")
@@ -7204,6 +7397,7 @@ class ShowcaseBanner(models.Model):
         HERO = "hero", "Сверху-карусель (Hero)"
         INLINE = "inline", "Между рядами (Inline)"
         SIDEBAR = "sidebar", "Сбоку (Sidebar)"
+        POPUP = "popup", "Всплывающий (Popup)"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     company = models.ForeignKey(
@@ -7212,8 +7406,13 @@ class ShowcaseBanner(models.Model):
         related_name="showcase_banners",
         verbose_name="Компания",
     )
+    # title/subtitle — текст на ru (совместимость со старым API); тексты по языкам — в *_i18n.
     title = models.CharField("Заголовок", max_length=255, blank=True, default="")
     subtitle = models.CharField("Подпись", max_length=255, blank=True, default="")
+    title_i18n = models.JSONField("Заголовок (по языкам)", default=dict, blank=True)
+    subtitle_i18n = models.JSONField("Подпись (по языкам)", default=dict, blank=True)
+    button_text = models.JSONField("Текст кнопки (по языкам)", default=dict, blank=True)
+    inline_after_row = models.PositiveSmallIntegerField("После какого ряда (inline)", null=True, blank=True)
     image = models.ForeignKey(
         ShowcaseMedia,
         on_delete=models.SET_NULL,
@@ -7266,8 +7465,11 @@ class ShowcasePromoBlock(models.Model):
         related_name="showcase_promo_blocks",
         verbose_name="Компания",
     )
-    title = models.CharField("Заголовок", max_length=255)
+    title = models.CharField("Заголовок", max_length=255, blank=True, default="")
+    title_i18n = models.JSONField("Заголовок (по языкам)", default=dict, blank=True)
     source = models.JSONField("Источник", default=dict)
+    background = models.CharField("Фон блока", max_length=7, null=True, blank=True)
+    title_color = models.CharField("Цвет заголовка", max_length=7, null=True, blank=True)
     style = models.CharField(
         "Вид блока",
         max_length=32,
@@ -7327,8 +7529,20 @@ class ShowcaseOrder(models.Model):
     delivery_address = models.CharField("Адрес доставки", max_length=255, blank=True, default="")
     comment = models.TextField("Комментарий", blank=True, default="")
     total = models.DecimalField("Итоговая сумма", max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    delivery_fee = models.DecimalField("Стоимость доставки", max_digits=14, decimal_places=2, default=Decimal("0.00"))
     source = models.CharField("Источник", max_length=32, default="showcase", blank=True, db_index=True)
     idempotency_key = models.CharField(max_length=128, null=True, blank=True, db_index=True)
+    # Остаток зарезервирован (списан) при создании заказа; снимается при отмене
+    # или при выдаче через кассу (sale), т.к. продажа на кассе списывает сама.
+    stock_reserved = models.BooleanField("Остаток зарезервирован", default=False)
+    sale = models.ForeignKey(
+        "Sale",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Продажа на кассе",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -7357,6 +7571,14 @@ class ShowcaseOrderItem(models.Model):
         blank=True,
         related_name="+",
         verbose_name="Товар",
+    )
+    variant = models.ForeignKey(
+        "ProductVariant",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        verbose_name="Вариант товара",
     )
     product_name = models.CharField("Название товара", max_length=255)
     qty = models.DecimalField("Количество", max_digits=12, decimal_places=3, default=Decimal("1.000"))
@@ -7394,6 +7616,288 @@ class ShowcaseStats(models.Model):
 
     def __str__(self):
         return f"ShowcaseStats({self.company_id}, {self.date})"
+
+
+class ShowcasePage(models.Model):
+    """Текстовые страницы витрины («О нас», «Доставка»…) — ТЗ-BE-2026-05, п. 6.9. Черновое состояние."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="showcase_pages", verbose_name="Компания")
+    slug = models.SlugField("Адрес страницы", max_length=50)
+    title = models.JSONField("Заголовок (по языкам)", default=dict, blank=True)
+    body = models.JSONField("Текст (по языкам, ограниченная разметка)", default=dict, blank=True)
+    show_in_footer = models.BooleanField("Показывать в подвале", default=True)
+    position = models.PositiveIntegerField("Порядок", default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Страница витрины"
+        verbose_name_plural = "Страницы витрины"
+        ordering = ["position", "created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=("company", "slug"), name="uq_showcase_page_company_slug"),
+        ]
+
+    def __str__(self):
+        return f"ShowcasePage({self.company_id}, {self.slug})"
+
+
+class ShowcaseProductSettings(models.Model):
+    """Скрыть / закрепить / ручной порядок / бейдж товара на витрине (п. 6.4). Черновое состояние."""
+
+    class Badge(models.TextChoices):
+        HIT = "hit", "Хит"
+        SALE = "sale", "Скидка"
+        NEW = "new", "Новинка"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="showcase_product_settings", verbose_name="Компания")
+    product = models.ForeignKey("Product", on_delete=models.CASCADE, related_name="showcase_settings", verbose_name="Товар")
+    hidden = models.BooleanField("Скрыт на витрине", default=False)
+    pinned = models.BooleanField("Закреплён", default=False)
+    sort_order = models.PositiveIntegerField("Ручной порядок", null=True, blank=True)
+    badge = models.CharField("Бейдж", max_length=16, choices=Badge.choices, null=True, blank=True)
+    # Опубликованное состояние (копируется из полей выше при publish) — его читают публичные адреса.
+    published_hidden = models.BooleanField("Скрыт (опубликовано)", default=False, db_index=True)
+    published_pinned = models.BooleanField("Закреплён (опубликовано)", default=False)
+    published_sort_order = models.PositiveIntegerField("Порядок (опубликовано)", null=True, blank=True)
+    published_badge = models.CharField("Бейдж (опубликовано)", max_length=16, choices=Badge.choices, null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Настройка товара на витрине"
+        verbose_name_plural = "Настройки товаров на витрине"
+        constraints = [
+            models.UniqueConstraint(fields=("company", "product"), name="uq_showcase_product_settings"),
+        ]
+
+    def __str__(self):
+        return f"ShowcaseProductSettings({self.product_id})"
+
+
+class ShowcaseCategorySettings(models.Model):
+    """Порядок, видимость, картинка и своё название категории на витрине (п. 6.5). Черновое состояние."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="showcase_category_settings", verbose_name="Компания")
+    category = models.ForeignKey("ProductCategory", on_delete=models.CASCADE, related_name="showcase_settings", verbose_name="Категория")
+    hidden = models.BooleanField("Скрыта на витрине", default=False)
+    sort_order = models.PositiveIntegerField("Порядок", null=True, blank=True)
+    image = models.ForeignKey(
+        ShowcaseMedia, on_delete=models.SET_NULL, null=True, blank=True, related_name="+", verbose_name="Картинка",
+    )
+    title_override = models.JSONField("Своё название (по языкам)", null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Настройка категории на витрине"
+        verbose_name_plural = "Настройки категорий на витрине"
+        constraints = [
+            models.UniqueConstraint(fields=("company", "category"), name="uq_showcase_category_settings"),
+        ]
+
+    def __str__(self):
+        return f"ShowcaseCategorySettings({self.category_id})"
+
+
+class ShowcasePreviewToken(models.Model):
+    """Ссылка предпросмотра черновика (п. 3.2): живёт 24 ч, потом 410."""
+
+    token = models.CharField(primary_key=True, max_length=64)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="showcase_preview_tokens", verbose_name="Компания")
+    expires_at = models.DateTimeField("Действует до", db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Токен предпросмотра витрины"
+        verbose_name_plural = "Токены предпросмотра витрины"
+
+    def __str__(self):
+        return f"ShowcasePreviewToken({self.company_id})"
+
+
+class ShowcaseSlugRedirect(models.Model):
+    """Редирект со старого slug витрины на новый (п. 6.11), действует 90 дней."""
+
+    old_slug = models.CharField("Старый slug", max_length=80, unique=True)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="showcase_slug_redirects", verbose_name="Компания")
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField("Действует до", db_index=True)
+
+    class Meta:
+        verbose_name = "Редирект slug витрины"
+        verbose_name_plural = "Редиректы slug витрины"
+
+    def __str__(self):
+        return f"{self.old_slug} -> {self.company_id}"
+
+
+SHOWCASE_SLUG_REDIRECT_DAYS = 90
+
+
+def _showcase_slug_redirect_on_company_save(sender, instance, **kwargs):
+    """Смена Company.slug → старый slug ведёт на новый 90 дней (п. 6.11)."""
+    if not instance.pk or not instance.slug:
+        return
+    try:
+        old_slug = sender.objects.filter(pk=instance.pk).values_list("slug", flat=True).first()
+    except Exception:
+        return
+    if not old_slug or old_slug == instance.slug:
+        return
+    try:
+        # Новый slug больше не может быть чьим-то редиректом.
+        ShowcaseSlugRedirect.objects.filter(old_slug__iexact=instance.slug).delete()
+        ShowcaseSlugRedirect.objects.update_or_create(
+            old_slug=old_slug,
+            defaults={
+                "company_id": instance.pk,
+                "expires_at": timezone.now() + timedelta(days=SHOWCASE_SLUG_REDIRECT_DAYS),
+            },
+        )
+    except Exception:
+        logging.getLogger(__name__).exception("showcase slug redirect save failed")
+
+
+models.signals.pre_save.connect(
+    _showcase_slug_redirect_on_company_save,
+    sender=Company,
+    dispatch_uid="showcase_slug_redirect_on_company_save",
+)
+
+
+class RecommendationEvent(models.Model):
+    class EventType(models.TextChoices):
+        SHOWN = "shown", "Показано"
+        ACCEPTED = "accepted", "Принято"
+        SKIPPED = "skipped", "Пропущено"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="recommendation_events",
+        db_index=True,
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="recommendation_events",
+        verbose_name="Филиал",
+    )
+    client_event_id = models.UUIDField("ID события кассы")
+    event = models.CharField("Тип события", max_length=16, choices=EventType.choices)
+    product = models.ForeignKey(
+        "Product",
+        on_delete=models.CASCADE,
+        related_name="recommendation_events",
+        verbose_name="Рекомендованный товар",
+    )
+    trigger_product_ids = models.JSONField("Товары в чеке", default=list, blank=True)
+    cart_id = models.CharField("ID корзины", max_length=64, blank=True, null=True)
+    sale = models.ForeignKey(
+        "Sale",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="recommendation_events",
+        verbose_name="Продажа",
+    )
+    # id продажи от кассы — хранится всегда, даже если продажа (офлайн-чек) ещё не на сервере;
+    # FK `sale` проставляется, когда продажа появится (recommendations.resolve_pending_sales).
+    sale_ref = models.UUIDField("ID продажи от кассы", null=True, blank=True)
+    price = models.DecimalField("Цена предложения", max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    score = models.FloatField("Скор рекомендации", default=0.0)
+    cashier = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="recommendation_events",
+        verbose_name="Кассир",
+    )
+    device_id = models.CharField("ID кассы", max_length=128, blank=True, null=True)
+    occurred_at = models.DateTimeField("Время события на кассе", db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Событие рекомендации (допродажи)"
+        verbose_name_plural = "События рекомендаций (допродаж)"
+        unique_together = ("company", "client_event_id")
+        indexes = [
+            models.Index(fields=["company", "occurred_at"]),
+            models.Index(fields=["company", "sale"]),
+            models.Index(fields=["company", "cart_id"]),
+            models.Index(fields=["company", "sale_ref"]),
+        ]
+
+    def __str__(self):
+        return f"RecommendationEvent({self.company_id}, {self.event}, {self.product_id})"
+
+
+class RecommendationPairsCache(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="recommendation_pairs_cache",
+        verbose_name="Компания",
+    )
+    computed_at = models.DateTimeField("Время расчёта")
+    pairs_data = models.JSONField("Данные пар", default=list)
+    etag = models.CharField("ETag", max_length=64, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Кэш пар товаров для допродажи"
+        verbose_name_plural = "Кэши пар товаров для допродажи"
+
+
+class SalesTarget(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="sales_targets",
+        verbose_name="Компания",
+    )
+    branch = models.ForeignKey(
+        Branch,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="sales_targets",
+        verbose_name="Филиал",
+    )
+    month = models.CharField("Месяц (YYYY-MM)", max_length=7, db_index=True)
+    revenue_target = models.DecimalField("Целевая выручка", max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "План продаж"
+        verbose_name_plural = "Планы продаж"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "branch", "month"],
+                condition=Q(branch__isnull=False),
+                name="uniq_sales_target_company_branch_month",
+            ),
+            # NULL в unique не сравнивается — отдельное ограничение для плана на всю компанию.
+            models.UniqueConstraint(
+                fields=["company", "month"],
+                condition=Q(branch__isnull=True),
+                name="uniq_sales_target_company_month_no_branch",
+            ),
+        ]
+
+    def __str__(self):
+        return f"SalesTarget({self.company_id}, {self.month}: {self.revenue_target})"
 
 
 from apps.main.telegram_bot.models import (

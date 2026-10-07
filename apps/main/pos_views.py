@@ -2973,59 +2973,192 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
 
 class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     """
-    Оплатить ранее оформленную продажу "в долг".
+    Погасить долг конкретной продажи одним запросом (ТЗ ч.12, 2.3).
     POST /api/main/pos/sales/<sale_id>/pay-debt/
-    Body: { "payment_method": "cash|transfer|mbank|...", "cash_received": "..."(только для cash) }
+    Idempotency-Key: <строка>  (или поле idempotency_key; повтор с тем же ключом ничего не создаёт)
+    Body: {
+      "amount": "40.00",            # необязательно; по умолчанию — весь остаток
+      "payment_method": "cash",     # обязательно
+      "shift": "<id смены>",        # необязательно; по умолчанию — открытая смена кассира
+      "cashbox_id": "<id кассы>"    # необязательно
+    }
+    200 → {"paid": "40.00", "left": "0.00", "sale": {...}, "cashflows": [...]}
+    400 → {"detail": "Долг по продаже уже погашен", "code": "no_debt"}
+
+    Деньги гасят взносы сделки продажи по порядку; в кассу пишется один приход на всю сумму,
+    наличные попадают в смену один раз (debt_payments_cash / expected_cash).
     """
 
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request, pk, *args, **kwargs):
-        qs = (
-            Sale.objects.select_for_update()
-            .select_related("shift", "cashbox", "client", "user")
-            .prefetch_related("items")
-        )
-        qs = self._filter_qs_company_branch(qs)
-        sale = get_object_or_404(qs, id=pk)
-
-        if sale.status != Sale.Status.DEBT:
-            raise ValidationError({"detail": "Продажа не находится в статусе 'Долг'."})
-
-        ser = PayDebtSerializer(data=request.data, context={"sale": sale})
-        ser.is_valid(raise_exception=True)
-
-        sale.mark_paid(
-            payment_method=ser.validated_data["payment_method"],
-            cash_received=ser.validated_data.get("cash_received"),
-        )
-
-        cashbox_id = request.data.get("cashbox_id")
+        from uuid import NAMESPACE_URL, uuid5
         from apps.construction.auto_cashflow import create_auto_cashflow, serialize_auto_cashflows
         from apps.construction.models import CashFlow
+        from apps.main.models import ClientDeal, DealInstallment, DealPayment
+        from apps.main.services_debt import VALID_DEBT_PAYMENT_METHODS, normalize_debt_payment_method
+
+        qs = self._filter_qs_company_branch(Sale.objects.select_for_update(of=("self",)))
+        sale = get_object_or_404(qs, id=pk)
+
+        data = request.data if isinstance(request.data, dict) else {}
+        errors = {}
+        allowed_pm = set(VALID_DEBT_PAYMENT_METHODS)
+        raw_pm = (str(data.get("payment_method") or "")).strip().lower()
+        if not raw_pm:
+            errors["payment_method"] = ["Укажите способ оплаты."]
+        elif raw_pm not in allowed_pm:
+            errors["payment_method"] = [f"Неизвестный способ оплаты. Допустимо: {', '.join(sorted(allowed_pm))}."]
+        amount = None
+        if data.get("amount") not in (None, ""):
+            try:
+                amount = Decimal(str(data.get("amount"))).quantize(Decimal("0.01"))
+                if amount <= 0:
+                    errors["amount"] = ["Сумма должна быть больше 0."]
+            except Exception:
+                errors["amount"] = ["Некорректная сумма."]
+        if errors:
+            raise ValidationError(errors)
+
+        is_debt_sale = sale.status == Sale.Status.DEBT or sale.payment_method == Sale.PaymentMethod.DEBT
+        if not is_debt_sale or sale.status not in (Sale.Status.DEBT, Sale.Status.PAID):
+            return Response({"detail": "У продажи нет долга.", "code": "no_debt"}, status=status.HTTP_400_BAD_REQUEST)
+
+        deal = (
+            ClientDeal.objects.select_for_update()
+            .filter(sale=sale, kind=ClientDeal.Kind.DEBT)
+            .order_by("created_at")
+            .first()
+        )
+        if deal is None:
+            if sale.status == Sale.Status.PAID:
+                return Response({"detail": "Долг по продаже уже погашен", "code": "no_debt"}, status=status.HTTP_400_BAD_REQUEST)
+            if not sale.client_id:
+                return Response(
+                    {"detail": "У продажи в долг нет клиента — погасить её нельзя.", "code": "no_client"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            debt_left = sale.debt_remaining if (sale.debt_remaining or 0) > 0 else (sale.total or Decimal("0"))
+            deal = ClientDeal.objects.create(
+                company=sale.company,
+                branch=sale.branch,
+                client_id=sale.client_id,
+                sale=sale,
+                title=f"Продажа в долг №{sale.doc_number or sale.id}",
+                kind=ClientDeal.Kind.DEBT,
+                amount=sale.total,
+                prepayment=max(Decimal("0.00"), (sale.total or Decimal("0")) - debt_left),
+                debt_days=1,
+                first_due_date=timezone.localdate(),
+            )
+
+        installments = list(
+            DealInstallment.objects.select_for_update().filter(deal=deal).order_by("number")
+        )
+
+        raw_key = (request.headers.get("Idempotency-Key") or str(data.get("idempotency_key") or "")).strip()
+        base_key = uuid5(NAMESPACE_URL, f"sale-pay-debt:{sale.id}:{raw_key}") if raw_key else uuid.uuid4()
+        inst_keys = {inst.id: uuid5(base_key, str(inst.id)) for inst in installments}
+
+        if raw_key:
+            replay = DealPayment.objects.filter(deal=deal, idempotency_key__in=list(inst_keys.values()))
+            if replay.exists():
+                paid = replay.aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+                return self._response(request, sale, deal, paid, [], replayed=True)
+
+        remaining = deal.remaining_debt
+        if remaining <= 0:
+            return Response({"detail": "Долг по продаже уже погашен", "code": "no_debt"}, status=status.HTTP_400_BAD_REQUEST)
+        pay_total = remaining if amount is None else amount
+        if pay_total > remaining:
+            return Response(
+                {"amount": [f"Сумма больше остатка долга. Максимум: {remaining}."], "code": "amount_exceeds_debt"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        pm = normalize_debt_payment_method(raw_pm)
+
+        shift = None
+        shift_id = data.get("shift") or data.get("shift_id")
+        cashbox_id = data.get("cashbox_id")
+        if shift_id:
+            shift = _resolve_requested_open_shift(
+                company=sale.company, cashier=request.user, shift_id=shift_id, cashbox_id=cashbox_id
+            )
+        else:
+            shift = _find_open_shift_for_cashier(company=sale.company, cashier=request.user)
+        if shift is None and pm == "cash":
+            return Response(
+                {"detail": "Смена не открыта. Откройте смену на кассе, чтобы принять наличные.", "code": "shift_not_open"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        today = timezone.localdate()
+        left = pay_total
+        for inst in installments:
+            if left <= 0:
+                break
+            inst_left = ((inst.amount or Decimal("0")) - (inst.paid_amount or Decimal("0"))).quantize(Decimal("0.01"))
+            if inst_left <= 0:
+                continue
+            part = min(left, inst_left)
+            DealPayment.objects.create(
+                company=deal.company,
+                branch=deal.branch,
+                deal=deal,
+                installment=inst,
+                kind=DealPayment.Kind.PAY,
+                amount=part,
+                paid_date=today,
+                idempotency_key=inst_keys[inst.id],
+                created_by=request.user,
+                note=f"Погашение долга по продаже №{sale.doc_number or sale.id}",
+                payment_method=pm,
+            )
+            inst.paid_amount = ((inst.paid_amount or Decimal("0")) + part).quantize(Decimal("0.01"))
+            inst.paid_on = today if inst.paid_amount >= inst.amount else None
+            inst.save(update_fields=["paid_amount", "paid_on"])
+            left = (left - part).quantize(Decimal("0.01"))
 
         cf = create_auto_cashflow(
             company=sale.company,
             branch=sale.branch,
-            # Let resolve_cashbox select the debt cashbox when one is configured.
-            cashbox=None,
-            cashbox_id=cashbox_id,
+            cashbox=shift.cashbox if shift is not None else None,
+            cashbox_id=None if shift is not None else cashbox_id,
             user=request.user,
-            shift=sale.shift,
+            shift=shift,
             type=CashFlow.Type.INCOME,
-            amount=sale.total,
+            amount=pay_total,
             source_kind=CashFlow.SourceKind.DEBT_REPAYMENT,
-            source_id=str(sale.id),
-            name=f"Оплата долга по продаже №{sale.id}",
+            source_id=str(deal.id),
+            idempotency_key=f"sale-pay-debt:{base_key}",
+            name=f"Оплата долга по продаже №{sale.doc_number or sale.id}",
             source_business_operation_id="Оплата долга",
-            payment_method=ser.validated_data["payment_method"],
+            payment_method=pm,
+            affects_shift_drawer=(pm == "cash"),
         )
 
+        from apps.main.models import sync_sale_status_from_deal
+        sync_sale_status_from_deal(deal.id)  # статус и остаток продажи — сразу, не дожидаясь сигнала
+        return self._response(request, sale, deal, pay_total, [cf] if cf else [])
+
+    def _response(self, request, sale, deal, paid, cashflows, replayed=False):
+        from apps.construction.auto_cashflow import serialize_auto_cashflows
+
+        deal.refresh_from_db()
+        left = max(Decimal("0.00"), deal.remaining_debt)
         sale.refresh_from_db()
-        resp_data = SaleDetailSerializer(sale, context={"request": request}).data
-        resp_data["cashflows"] = serialize_auto_cashflows([cf]) if cf else []
-        return Response(resp_data, status=status.HTTP_200_OK)
+        return Response(
+            {
+                "paid": str(money(paid)),
+                "left": str(money(left)),
+                "replayed": replayed,
+                "sale": SaleDetailSerializer(sale, context={"request": request}).data,
+                "cashflows": serialize_auto_cashflows(cashflows),
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 def _parse_partial_return_items(data) -> Optional[List[tuple]]:
@@ -5530,6 +5663,10 @@ class AgentSaleCheckoutAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMi
                         int_days = request.data.get("interval_days") or debt_sched.get("interval_days") or 1
                         int_months = request.data.get("interval_months") or debt_sched.get("interval_months") or 1
                         custom_inst = request.data.get("installments") or debt_sched.get("installments")
+                        if not d_days and not d_months and not custom_inst and sch_version == "v2":
+                            # Без графика — один взнос через 30 дней, а не 30 ежедневных (ТЗ ч.12, 2.2).
+                            d_days = 1
+                            first_due = first_due or (timezone.localdate() + timedelta(days=30))
 
                         new_deal = ClientDeal(
                             company=sale.company,

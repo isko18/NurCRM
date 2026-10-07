@@ -61,6 +61,7 @@ apps_includes = [
     path('warehouse/', include("apps.warehouse.urls")),
     path('ekassa/', include('apps.ekassa.urls')),
     path('rentals/', include('apps.main.rental_urls')),
+    path('support/', include('apps.support.urls')),
     path('onec/', include('apps.onec.urls')),
     # path('crm/', include('apps.crm.urls')),
 ]
@@ -74,6 +75,7 @@ api_urlpatterns = [
     path("api/telegram/webhook/", TelegramWebhookPublicView.as_view(), name="telegram-bot-webhook-info"),
     path("telegram/webhook/<uuid:bot_uuid>/", TelegramWebhookPublicView.as_view(), name="telegram-bot-webhook-alt"),
     path("telegram/webhook/", TelegramWebhookPublicView.as_view(), name="telegram-bot-webhook-alt-info"),
+    path('api/v1/', include('apps.clientapp.urls')),  # приложение клиентов (покупателей)
     path('api/', include(apps_includes)),
     path('', include(apps_includes)),
 ]

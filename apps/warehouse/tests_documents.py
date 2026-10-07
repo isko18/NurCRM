@@ -88,7 +88,9 @@ class DocumentsTests(TestCase):
         self.assertEqual(money_doc.doc_type, models.MoneyDocument.DocType.MONEY_RECEIPT)
         self.assertEqual(money_doc.status, models.MoneyDocument.Status.POSTED)
         self.assertEqual(money_doc.cash_register_id, self.cash.id)
-        self.assertEqual(money_doc.payment_category_id, self.paycat.id)
+        # A2: категория не указана в документе → системная по типу документа («Продажа»),
+        # а не «первая попавшаяся» категория компании (self.paycat).
+        self.assertEqual(money_doc.payment_category.system_code, models.PaymentCategory.SystemCode.SALE)
         self.assertEqual(Decimal(money_doc.amount), Decimal("45.00"))
 
         services.unpost_document(doc)
@@ -206,7 +208,9 @@ class DocumentsTests(TestCase):
         self.assertEqual(money_doc.status, models.MoneyDocument.Status.POSTED)
         self.assertEqual(Decimal(money_doc.amount), Decimal("10.00"))
         self.assertEqual(money_doc.cash_register_id, self.cash.id)
-        self.assertEqual(money_doc.payment_category_id, self.paycat.id)
+        # A2: категория не указана в документе → системная по типу документа («Продажа»),
+        # а не «первая попавшаяся» категория компании (self.paycat).
+        self.assertEqual(money_doc.payment_category.system_code, models.PaymentCategory.SystemCode.SALE)
 
         services.unpost_document(doc)
         doc.refresh_from_db()

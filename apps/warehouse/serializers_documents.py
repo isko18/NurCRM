@@ -7,7 +7,11 @@ from django.contrib.auth import get_user_model
 from apps.users.models import Company
 from . import models
 from . import services as warehouse_services
-from .serializers import WarehouseProductCharacteristicsSerializer
+from .serializers import (
+    WarehouseProductCharacteristicsSerializer,
+    StockQuantityGuardMixin,
+    save_product_changed_fields,
+)
 from .utils import normalize_payment_kind, normalize_payment_method
 
 User = get_user_model()
@@ -143,6 +147,8 @@ class StockMoveSerializer(serializers.ModelSerializer):
             "product_article",
             "qty_delta",
             "move_kind",
+            "source_kind",
+            "source_id",
             "created_at",
         )
 
@@ -299,12 +305,20 @@ class DocumentSerializer(serializers.ModelSerializer):
         help_text="Агент по документу; при указании контрагент должен быть закреплён за этим агентом.",
     )
     agent_display = serializers.SerializerMethodField()
+    created_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    created_by_email = serializers.EmailField(source="created_by.email", read_only=True, allow_null=True)
+    initiator_company = serializers.PrimaryKeyRelatedField(read_only=True)
+    initiator_company_name = serializers.CharField(source="initiator_company.name", read_only=True, allow_null=True)
 
     class Meta:
         ref_name = "WarehouseDocumentSerializer"
         model = models.Document
         fields = (
             "id",
+            "created_by",
+            "created_by_email",
+            "initiator_company",
+            "initiator_company_name",
             "doc_type",
             "status",
             "number",
@@ -400,6 +414,8 @@ class DocumentSerializer(serializers.ModelSerializer):
         return attrs
 
     def validate(self, attrs):
+        if warehouse_services.is_document_date_in_future(attrs.get("date")):
+            raise serializers.ValidationError({"date": warehouse_services.DOCUMENT_FUTURE_DATE_ERROR})
         attrs = self._apply_multi_warehouse_defaults(attrs)
         return super().validate(attrs) if hasattr(super(), "validate") else attrs
 
@@ -535,6 +551,11 @@ class DocumentSerializer(serializers.ModelSerializer):
         )
         if anchor is not None:
             validated_data["warehouse_from"] = anchor
+
+        # Автор документа (stock-partnership §6.4) — во всех созданиях через API
+        request = self.context.get("request")
+        if request is not None and getattr(request.user, "is_authenticated", False):
+            validated_data.setdefault("created_by", request.user)
 
         # Валидация документа перед созданием
         doc = models.Document(**validated_data)
@@ -704,7 +725,7 @@ class TransferCreateSerializer(serializers.Serializer):
         return attrs
 
 
-class ProductSimpleSerializer(serializers.ModelSerializer):
+class ProductSimpleSerializer(StockQuantityGuardMixin, serializers.ModelSerializer):
     # NOTE: модельное поле называется product_group (поля `group` в модели нет).
     group = serializers.UUIDField(source="product_group.id", read_only=True)
     group_name = serializers.CharField(source="product_group.name", read_only=True)
@@ -713,6 +734,8 @@ class ProductSimpleSerializer(serializers.ModelSerializer):
     warehouse_name = serializers.CharField(source="warehouse.name", read_only=True, allow_null=True)
     alternate_barcodes = serializers.SerializerMethodField()
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, allow_null=True)
+    # Остаток: на update и create — проведённый документ INVENTORY (см. StockQuantityGuardMixin).
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=3, required=False, allow_null=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -756,6 +779,29 @@ class ProductSimpleSerializer(serializers.ModelSerializer):
             {"barcode": b.barcode, "name": b.name}
             for b in obj.alternate_barcodes.order_by("barcode")
         ]
+
+    def create(self, validated_data):
+        initial_qty = validated_data.pop("quantity", None)
+        validated_data["quantity"] = Decimal("0.000")
+        with transaction.atomic():
+            product = super().create(validated_data)
+            self._post_initial_stock(product, initial_qty)
+        return product
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        new_qty = validated_data.pop("quantity", None)  # проводится документом, см. _apply_quantity_change
+        new_wh = validated_data.pop("warehouse", None)
+        if new_wh is not None and new_wh.pk != instance.warehouse_id:
+            # Остаток живёт в регистре склада товара; смена склада карточкой его бы «потеряла».
+            raise serializers.ValidationError(
+                {"warehouse": "Склад товара менять нельзя. Используйте документ перемещения."}
+            )
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        save_product_changed_fields(instance, set(validated_data))
+        self._apply_quantity_change(instance, new_qty)
+        return instance
 
 
 class WarehouseSimpleSerializer(serializers.ModelSerializer):
@@ -895,3 +941,48 @@ class CompanyStockPartnershipRequestSerializer(serializers.ModelSerializer):
 class CompanyStockPartnershipRequestCreateSerializer(serializers.Serializer):
     to_company = serializers.PrimaryKeyRelatedField(queryset=Company.objects.all())
     note = serializers.CharField(required=False, allow_blank=True, max_length=512)
+
+
+
+class PartnerOperationSerializer(serializers.ModelSerializer):
+    """Операция «забрать у партнёра», ожидающая подтверждения (stock-partnership §7.10)."""
+
+    initiator_company_name = serializers.CharField(source="initiator_company.name", read_only=True)
+    source_company_name = serializers.CharField(source="source_company.name", read_only=True)
+    warehouse_from_name = serializers.CharField(source="warehouse_from.name", read_only=True, allow_null=True)
+    warehouse_to_name = serializers.CharField(source="warehouse_to.name", read_only=True, allow_null=True)
+    cash_register_from_name = serializers.CharField(source="cash_register_from.name", read_only=True, allow_null=True)
+    cash_register_to_name = serializers.CharField(source="cash_register_to.name", read_only=True, allow_null=True)
+    created_by_email = serializers.EmailField(source="created_by.email", read_only=True, allow_null=True)
+    decided_by_email = serializers.EmailField(source="decided_by.email", read_only=True, allow_null=True)
+    document_number = serializers.CharField(source="document.number", read_only=True, allow_null=True)
+    items = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.PartnerOperationRequest
+        fields = (
+            "id", "kind", "status",
+            "initiator_company", "initiator_company_name", "source_company", "source_company_name",
+            "warehouse_from", "warehouse_from_name", "warehouse_to", "warehouse_to_name", "items",
+            "cash_register_from", "cash_register_from_name", "cash_register_to", "cash_register_to_name",
+            "amount", "comment", "reject_reason", "error",
+            "created_by_email", "decided_by_email", "created_at", "decided_at",
+            "document", "document_number", "incassation",
+        )
+
+    def get_items(self, obj):
+        rows = obj.items or []
+        names = self.context.get("_product_names")
+        if names is None:
+            ids = [r.get("product") for r in rows]
+            names = {str(p.id): p for p in models.WarehouseProduct.objects.filter(id__in=ids).only("id", "name", "unit")}
+        out = []
+        for r in rows:
+            p = names.get(str(r.get("product")))
+            out.append({
+                "product": r.get("product"),
+                "product_name": p.name if p else None,
+                "unit": (p.unit if p else "") or "",
+                "qty": r.get("qty"),
+            })
+        return out

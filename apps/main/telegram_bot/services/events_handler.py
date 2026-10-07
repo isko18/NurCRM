@@ -3,17 +3,14 @@ from decimal import Decimal
 from django.core.cache import cache
 
 from apps.main.telegram_bot.services import telegram_api
+from apps.main.telegram_bot.services.photo_service import format_amount, format_qty
 
 logger = logging.getLogger("telegram_bot.events")
 
 
 def _fmt_money(val) -> str:
-    if val is None:
-        return "0.00"
-    try:
-        return f"{Decimal(str(val)):,.2f}".replace(",", " ")
-    except Exception:
-        return str(val)
+    # ТЗ ч.9, 1.1: без лишних нулей — 660 066, 45,50
+    return format_amount(val)
 
 
 def send_shift_closed_notification(company_id, shift_id) -> bool:
@@ -107,7 +104,7 @@ def send_low_stock_notification(company_id, product_data: dict) -> bool:
     text = (
         f"⚠️ <b>Заканчивается товар:</b>\n"
         f"«<b>{name}</b>»\n"
-        f"Текущий остаток: {qty:g} шт (минимум: {min_qty:g})\n"
+        f"Текущий остаток: {format_qty(qty)} шт (минимум: {format_qty(min_qty)})\n"
         f"<i>Рекомендуется заказать товар у поставщика (/zakaz).</i>"
     )
 

@@ -758,6 +758,75 @@ class ProductDetailView(ProtectedProductDeleteMixin, CompanyBranchRestrictedMixi
         serializer.save()
 
 
+class ProductStockAdjustmentView(CompanyBranchRestrictedMixin, APIView):
+    """
+    Корректировка остатка товара (§5.4 stock-single-source-of-truth).
+
+    POST /api/warehouse/products/{id}/stock-adjustment/
+    {"fact_qty": "50", "comment": "Пересчёт на полке"}
+
+    Создаёт и проводит документ INVENTORY по складу товара с одной строкой
+    (qty = fact_qty). 201: {document_id, document_number, qty_before, qty_after, delta}.
+    400 — fact_qty < 0 / не число; 403 — нет права на документы склада;
+    404 — товар другой компании (или недоступного склада).
+    """
+
+    def _check_permission(self, product):
+        user = self._user()
+        if _is_owner_like(user):
+            return
+        # Сотрудник своей компании — как для складских документов. Внешний агент
+        # (без company) работает только со своими документами и инвентаризацию
+        # проводить не может (Agent documents cannot be INVENTORY).
+        if getattr(user, "company_id", None) and user.company_id == product.company_id:
+            return
+        raise PermissionDenied("Нет права на документы склада.")
+
+    def post(self, request, product_uuid=None, *args, **kwargs):
+        from decimal import InvalidOperation
+        from apps.warehouse import stock as stock_service
+
+        qs = self._filter_qs_company_branch(m.WarehouseProduct.objects.select_related("warehouse"))
+        product = get_object_or_404(qs, id=product_uuid)
+        self._check_permission(product)
+
+        raw = request.data.get("fact_qty")
+        if raw is None or (isinstance(raw, str) and not raw.strip()) or isinstance(raw, bool):
+            raise ValidationError({"fact_qty": ["Укажите фактический остаток."]})
+        try:
+            fact = Decimal(str(raw).strip().replace(",", "."))
+        except (InvalidOperation, ValueError, TypeError):
+            raise ValidationError({"fact_qty": ["Фактический остаток должен быть числом."]})
+        if not fact.is_finite():
+            raise ValidationError({"fact_qty": ["Фактический остаток должен быть числом."]})
+        if fact < 0:
+            raise ValidationError({"fact_qty": ["Фактический остаток не может быть отрицательным."]})
+        if fact != m.q_qty(fact):
+            raise ValidationError({"fact_qty": ["Не более 3 знаков после запятой."]})
+        if not product.is_weight and fact % 1 != 0:
+            raise ValidationError({"fact_qty": ["Для штучного товара остаток должен быть целым числом."]})
+        comment = str(request.data.get("comment") or "").strip()[:1000]
+
+        try:
+            result = stock_service.post_inventory_adjustment(
+                product=product, fact_qty=fact, comment=comment, user=request.user,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        doc = result["document"]
+        return Response(
+            {
+                "document_id": str(doc.id),
+                "document_number": doc.number,
+                "qty_before": str(m.q_qty(result["qty_before"])),
+                "qty_after": str(m.q_qty(result["qty_after"])),
+                "delta": str(m.q_qty(result["delta"])),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
 class WarehouseProductCatalogListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     """
     Глобальный каталог товаров по всем складам компании (страница создания документа,
@@ -972,6 +1041,7 @@ class WarehouseMassIncomingAPIView(CompanyBranchRestrictedMixin, APIView):
 
         with transaction.atomic():
             doc = m.Document.objects.create(
+                created_by=request.user,
                 doc_type=m.Document.DocType.RECEIPT,
                 status=m.Document.Status.DRAFT,
                 warehouse_from=warehouse,
@@ -1356,6 +1426,7 @@ class AgentRequestCartCreateSaleAPIView(CompanyBranchRestrictedMixin, APIView):
                 company=cart.company,
             )
             doc = m.Document.objects.create(
+                created_by=request.user,
                 doc_type=m.Document.DocType.SALE,
                 status=m.Document.Status.DRAFT,
                 warehouse_from=cart.warehouse,
@@ -1765,6 +1836,9 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
     Остатки агента:
     - при включённом общем доступе (common_access_enabled=true) — остатки общего склада (WarehouseProduct.quantity)
     - иначе — его персональные остатки (AgentStockBalance)
+    ?source=personal — всегда личный остаток агента (выданный товар), даже при общем доступе;
+    ?source=common — всегда каталог складов общего доступа (пустой, если доступа нет).
+    Без параметра — как раньше (совместимость с текущим фронтом).
     Поддерживает:
       - ?search=<text> по названию/артикулу/штрихкоду товара
       - пагинацию PageNumberPagination (?page=, ?page_size=)
@@ -1801,6 +1875,9 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
                 warehouse_id = UUID(warehouse_raw)
             except Exception:
                 raise ValidationError({"warehouse": "Неверный UUID."})
+        source = (request.query_params.get("source") or "").strip().lower()
+        if source not in ("", "personal", "common"):
+            raise ValidationError({"source": "Допустимо: personal, common."})
         # Пытаемся найти настройку общего доступа к складу для агента.
         # Не ограничиваемся только "текущей" компанией, чтобы работать
         # даже если у пользователя несколько компаний/ролей.
@@ -1817,8 +1894,10 @@ class AgentMyProductsListAPIView(CompanyBranchRestrictedMixin, APIView):
         if company is not None:
             membership_qs = membership_qs.filter(company=company)
 
-        membership = membership_qs.first()
+        membership = None if source == "personal" else membership_qs.first()
         common_wh_ids = membership.common_warehouse_ids() if membership else []
+        if source == "common" and not common_wh_ids:
+            return self._paginate_and_respond([], CommonWarehouseBalanceSerializer, context=ser_context)
         if common_wh_ids:
             # Остатки со всех складов общего доступа агента.
             prod_qs = (
@@ -1981,10 +2060,14 @@ class CompaniesSearchForAgentsAPIView(APIView):
     def get(self, request, *args, **kwargs):
         from apps.users.models import Company
         search = (request.query_params.get("search") or "").strip()[:128]
-        qs = Company.objects.all().order_by("name")
-        if search:
-            qs = qs.filter(name__icontains=search)
-        qs = qs[:50]
+        # stock-partnership §7.5: не раскрывать всю клиентскую базу — от 3 символов, до 20 результатов
+        if len(search) < 3:
+            raise ValidationError({"search": ["Минимум 3 символа."]})
+        qs = Company.objects.filter(name__icontains=search).order_by("name")
+        own = getattr(request.user, "owned_company", None) or getattr(request.user, "company", None)
+        if own is not None:
+            qs = qs.exclude(id=own.id)
+        qs = qs[:20]
         data = [{"id": str(c.id), "name": c.name, "slug": getattr(c, "slug", "") or ""} for c in qs]
         return Response(data)
 

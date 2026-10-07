@@ -455,6 +455,15 @@ class ProductWarehouseBarcodeAPITestCase(TestCase):
         self.assertEqual(resp.data["matched_barcode"], "0693123456789")
         self.assertEqual(resp.data["product"]["barcode"], "0693123456789")
 
+    def test_lookup_by_upc_equivalent_ean13(self):
+        self.product.barcode = "0762497741537"
+        self.product.save(update_fields=["barcode"])
+
+        resp = self._get("762497741537")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["product"]["id"], str(self.product.id))
+        self.assertEqual(resp.data["matched_barcode"], "762497741537")
+
     def test_lookup_by_alternate_barcode(self):
         resp = self._get("0693999999999")
         self.assertEqual(resp.status_code, 200)

@@ -109,10 +109,11 @@ class ShowcaseEditorTests(TestCase):
         res = self.client.patch("/api/main/showcase/design/draft/", payload, format="json")
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         draft = res.data["draft"]
-        self.assertEqual(draft["theme"]["background"], "#FFFFFF")
-        self.assertEqual(draft["theme"]["text"], "#888888")
+        # ТЗ-BE-2026-05: старый плоский theme переводится в theme.colors (документ нового формата).
+        self.assertEqual(draft["theme"]["colors"]["background"], "#FFFFFF")
+        self.assertEqual(draft["theme"]["colors"]["text"], "#888888")
         warnings = res.data.get("warnings", [])
-        self.assertTrue(any(w["field"] == "text" and w["code"] == "low_contrast" for w in warnings))
+        self.assertTrue(any(w["field"] == "theme.colors.text" and w["code"] == "low_contrast" for w in warnings))
 
     def test_sc_01_theme_invalid_color_returns_400(self):
         self.client.force_authenticate(user=self.owner)
@@ -172,7 +173,7 @@ class ShowcaseEditorTests(TestCase):
             format="json",
         )
         self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data["draft"]["cards"]["template"], "compact")
+        self.assertEqual(res.data["draft"]["card"]["template"], "compact")  # cards → card (ТЗ-BE-2026-05)
 
         # Invalid template
         res_inv = self.client.patch(
@@ -238,7 +239,7 @@ class ShowcaseEditorTests(TestCase):
 
         res_get = self.client.get(f"/api/main/showcase/promo-blocks/{block_id}/")
         self.assertEqual(res_get.status_code, status.HTTP_200_OK)
-        self.assertEqual(res_get.data["title"], "Акция недели")
+        self.assertEqual(res_get.data["title"], {"ru": "Акция недели"})  # тексты по языкам (3.11)
 
     # ------------------------------------------------------------------
     # SC-06: Preview Link, Publish, Discard, Versions, Restore
@@ -283,7 +284,7 @@ class ShowcaseEditorTests(TestCase):
         # 6. Discard -> resets to published (#000000)
         res_disc = self.client.post("/api/main/showcase/design/discard/")
         self.assertEqual(res_disc.status_code, status.HTTP_200_OK)
-        self.assertEqual(res_disc.data["draft"]["theme"]["background"], "#000000")
+        self.assertEqual(res_disc.data["draft"]["theme"]["colors"]["background"], "#000000")
 
         # 7. Restore version 2
         res_rest = self.client.post(f"/api/main/showcase/design/versions/{v}/restore/")

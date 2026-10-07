@@ -127,6 +127,8 @@ class AgentSalaryPayoutSerializer(serializers.ModelSerializer):
     agent_name = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     amount = serializers.SerializerMethodField()
+    cash_register = serializers.SerializerMethodField()
+    cash_register_name = serializers.SerializerMethodField()
 
     class Meta:
         model = m.AgentSalaryPayout
@@ -135,6 +137,7 @@ class AgentSalaryPayoutSerializer(serializers.ModelSerializer):
             "agent", "agent_name",
             "amount", "comment",
             "created_by", "created_by_name",
+            "money_document", "cash_register", "cash_register_name",
         )
 
     def get_agent_name(self, obj):
@@ -146,11 +149,22 @@ class AgentSalaryPayoutSerializer(serializers.ModelSerializer):
     def get_amount(self, obj):
         return _money2(obj.amount)
 
+    def get_cash_register(self, obj):
+        money = getattr(obj, "money_document", None)
+        return str(money.cash_register_id) if money is not None and money.cash_register_id else None
+
+    def get_cash_register_name(self, obj):
+        money = getattr(obj, "money_document", None)
+        reg = getattr(money, "cash_register", None) if money is not None else None
+        return reg.name if reg is not None else None
+
 
 class AgentSalaryPayoutCreateSerializer(serializers.Serializer):
     agent = serializers.UUIDField()
     amount = serializers.DecimalField(max_digits=12, decimal_places=2)
     comment = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
+    # Необязательно: выплата из кассы (проведённый расход «Зарплата»). Без кассы — вне кассы.
+    cash_register = serializers.UUIDField(required=False, allow_null=True)
 
     def validate_amount(self, value):
         if value is None or value <= Decimal("0"):

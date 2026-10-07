@@ -7,7 +7,9 @@ from django.db.models.signals import pre_delete
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
-from apps.main.models import Product, ProductImage, Notification, ManufactureSubreal, ReturnFromAgent
+from decimal import Decimal
+from django.db.models import Sum
+from apps.main.models import Product, ProductImage, Notification, ManufactureSubreal, ReturnFromAgent, ProductVariant
 from apps.main.models import Debt, DebtPayment
 
 logger = logging.getLogger("crm.webhooks")
@@ -363,3 +365,44 @@ def deal_payment_syncs_sale_status(sender, instance: DealPayment, **kwargs):
     """После оплаты или возврата платежа по сделке — пересчитать статус связанной продажи."""
     deal_id = instance.deal_id
     transaction.on_commit(lambda: sync_sale_status_from_deal(deal_id))
+
+
+# --- ТЗ часть 10: синхронизация остатка товара с суммой остатков размеров и сброс кеша ИИ-бота ---
+
+@receiver(post_save, sender=Product)
+@receiver(post_delete, sender=Product)
+def product_bot_cache_invalidation(sender, instance: Product, **kwargs):
+    company_id = getattr(instance, "company_id", None)
+    if company_id:
+        try:
+            from django.core.cache import cache
+            cache.delete(f"tg_catalog_data:{company_id}")
+        except Exception:
+            pass
+
+
+@receiver(post_save, sender=ProductVariant)
+@receiver(post_delete, sender=ProductVariant)
+def product_variant_sync_product_stock_and_cache(sender, instance: ProductVariant, **kwargs):
+    """
+    ТЗ часть 10, п. 3.5: остаток товара равен сумме остатков активных вариантов.
+    ТЗ часть 10, п. 3.6: сброс кеша каталога для ИИ-бота при изменении варианта.
+    """
+    product_id = getattr(instance, "product_id", None)
+    company_id = getattr(instance, "company_id", None)
+    if product_id:
+        try:
+            variants_qs = ProductVariant.objects.filter(product_id=product_id)
+            if variants_qs.filter(is_active=True).exists():
+                total = variants_qs.filter(is_active=True).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
+                Product.objects.filter(pk=product_id).update(quantity=total)
+        except Exception:
+            logger.exception("Failed to sync product stock from variants for product %s", product_id)
+
+    if company_id:
+        try:
+            from django.core.cache import cache
+            cache.delete(f"tg_catalog_data:{company_id}")
+        except Exception:
+            pass
+

@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from datetime import date, timedelta, datetime
+from functools import wraps
 from decimal import Decimal
 
 from django.conf import settings
-from django.db.models import Sum, Count, Value as V, F, DecimalField, Q, ExpressionWrapper
+from django.db.models import Sum, Count, Value as V, F, DecimalField, Q, ExpressionWrapper, OuterRef, Subquery
 from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth
 from django.utils import timezone
 
 from apps.main.cache_utils import cached_result
 from apps.users.models import User, Company, Branch
 from apps.warehouse import models as wm
+from apps.warehouse.analytics_cache import analytics_version
 
 
 # typed zeros
@@ -19,6 +21,11 @@ ZERO_MONEY = V(Decimal("0.00"), output_field=MONEY_FIELD)
 
 QTY_FIELD = DecimalField(max_digits=18, decimal_places=3)
 ZERO_QTY = V(Decimal("0.000"), output_field=QTY_FIELD)
+
+# Себестоимость единицы в строке документа (C5): зафиксированная при проведении,
+# для строк, проведённых до появления поля, — текущая закупочная цена (оценка).
+ITEM_UNIT_COST = Coalesce(F("cost_price"), F("product__purchase_price"), ZERO_MONEY, output_field=MONEY_FIELD)
+ITEM_LINE_COST = ExpressionWrapper(F("qty") * ITEM_UNIT_COST, output_field=MONEY_FIELD)
 
 
 def _parse_period(request):
@@ -319,33 +326,374 @@ def _build_agent_counterparty_debts(*, company, branch, agent, limit: int = 200)
     }
 
 
-def _build_sales_by_group(*, sales_items_qs, limit: int = 100):
+SOLD_STATUSES = (wm.Document.Status.POSTED, wm.Document.Status.CASH_PENDING)
+_CENT = Decimal("0.01")
+
+
+def _company_docs_qs(*, company, branch, all_branches: bool, doc_types, statuses, dt_from, dt_to_excl):
+    """
+    Документы компании за период (A13).
+    Обычные — по warehouse_from (компания/филиал склада). Мультискладские продажи/возвраты
+    без warehouse_from — по компании/филиалу товаров в строках (иначе они не попадали никуда).
+    Документы без warehouse_from и без строк компании приписать нельзя — их разбирает
+    команда cleanup_empty_posted_documents.
+    """
+    item_qs = _apply_branch_scope(
+        wm.DocumentItem.objects.filter(product__company=company),
+        branch,
+        path="product__branch",
+        all_branches=all_branches,
+    )
+    wh_q = Q(warehouse_from__company=company)
+    if not all_branches:
+        wh_q &= Q(warehouse_from__branch=branch) if branch is not None else Q(warehouse_from__branch__isnull=True)
+    no_wh_q = Q(warehouse_from__isnull=True, id__in=item_qs.values("document_id"))
+    if all_branches:
+        # Document.company (A13): мультискладской документ без строк своей компании,
+        # но с компанией в документе, тоже учитывается.
+        no_wh_q |= Q(warehouse_from__isnull=True, company=company)
+    return wm.Document.objects.filter(
+        wh_q | no_wh_q,
+        status__in=tuple(statuses),
+        doc_type__in=tuple(doc_types),
+        date__gte=dt_from,
+        date__lt=dt_to_excl,
+    )
+
+
+def _line_amount(net_amount, line_total) -> Decimal:
+    """Чистая сумма строки (A8); для строк без backfill net_amount — line_total."""
+    net = Decimal(str(net_amount or "0"))
+    if net != 0:
+        return net
+    return Decimal(str(line_total or "0"))
+
+
+def _amounts_by_line_warehouse(docs_qs) -> dict:
+    """
+    Сумма документов по складам (A13): {warehouse_id: {"count": int, "amount": Decimal}}.
+
+    Если все строки документа со склада warehouse_from — весь Document.total идёт на него
+    (агрегация в БД). Если warehouse_from пуст или строки с других складов (мультисклад) —
+    Document.total разносится по складу строки (product.warehouse, иначе warehouse_from)
+    пропорционально net_amount строк. Σ по складам == Σ Document.total, т.е. сходится с KPI.
+    """
+    from django.db.models import Exists, OuterRef
+
+    out: dict = {}
+
+    def _bucket(wid):
+        return out.setdefault(wid, {"count": 0, "amount": Decimal("0.00")})
+
+    foreign_line = wm.DocumentItem.objects.filter(
+        document_id=OuterRef("pk"), product__warehouse_id__isnull=False
+    ).exclude(product__warehouse_id=OuterRef("warehouse_from_id"))
+    qs = docs_qs.annotate(_split=Exists(foreign_line))
+
+    simple = qs.filter(_split=False, warehouse_from__isnull=False)
+    for r in simple.values("warehouse_from_id").annotate(n=Count("id"), s=Coalesce(Sum("total"), ZERO_MONEY)):
+        b = _bucket(r["warehouse_from_id"])
+        b["count"] += r["n"]
+        b["amount"] += Decimal(r["s"] or 0)
+
+    split = qs.filter(Q(_split=True) | Q(warehouse_from__isnull=True))
+    docs = {pk: (Decimal(total or 0), wh_from) for pk, total, wh_from in split.values_list("id", "total", "warehouse_from_id")}
+    if not docs:
+        return out
+
+    weights: dict = {}
+    for doc_id, prod_wh, net, line_total in wm.DocumentItem.objects.filter(
+        document__in=split.values("id")
+    ).values_list("document_id", "product__warehouse_id", "net_amount", "line_total"):
+        wid = prod_wh or docs[doc_id][1]
+        if wid is None:
+            continue
+        per_doc = weights.setdefault(doc_id, {})
+        per_doc[wid] = per_doc.get(wid, Decimal("0.00")) + _line_amount(net, line_total)
+
+    for doc_id, (total, wh_from) in docs.items():
+        per_doc = weights.get(doc_id) or {}
+        weight_sum = sum(per_doc.values(), Decimal("0.00"))
+        if weight_sum <= 0:
+            if wh_from is None and per_doc:
+                # строки есть, но суммы нулевые — делим поровну между складами строк
+                per_doc = {wid: Decimal("1") for wid in per_doc}
+                weight_sum = Decimal(len(per_doc))
+            elif wh_from is not None:
+                per_doc, weight_sum = {wh_from: Decimal("1")}, Decimal("1")
+            else:
+                continue
+        shares = {wid: (total * w / weight_sum).quantize(_CENT) for wid, w in per_doc.items()}
+        diff = total - sum(shares.values(), Decimal("0.00"))
+        if diff:
+            biggest = max(per_doc, key=lambda k: per_doc[k])
+            shares[biggest] += diff
+        for wid, amount in shares.items():
+            b = _bucket(wid)
+            b["count"] += 1
+            b["amount"] += amount
+    return out
+
+
+def _net_by_warehouse(sales_qs, returns_qs) -> dict:
+    """{warehouse_id: {"sales_count", "sales_amount" (нетто), "gross_sales_amount", "returns_amount"}} (A9, A13)."""
+    sold = _amounts_by_line_warehouse(sales_qs)
+    returned = _amounts_by_line_warehouse(returns_qs)
+    out = {}
+    for wid in set(sold) | set(returned):
+        gross = (sold.get(wid) or {}).get("amount", Decimal("0.00"))
+        ret = (returned.get(wid) or {}).get("amount", Decimal("0.00"))
+        out[wid] = {
+            "sales_count": (sold.get(wid) or {}).get("count", 0),
+            "sales_amount": gross - ret,
+            "gross_sales_amount": gross,
+            "returns_amount": ret,
+        }
+    return out
+
+
+def _sales_by_date_net(sales_qs, returns_qs, group_by: str) -> list:
+    """График продаж: нетто (продажи − возвраты по дате документа возврата) + gross/returns (A9)."""
+    trunc = _trunc_by_group("date", group_by)
+
+    def _by_date(qs):
+        return {
+            row["period"]: row
+            for row in qs.annotate(period=trunc).values("period").annotate(
+                n=Count("id"), amount=Coalesce(Sum("total"), ZERO_MONEY)
+            )
+        }
+
+    sold, returned = _by_date(sales_qs), _by_date(returns_qs)
+    rows = []
+    for key in sorted(set(sold) | set(returned), key=lambda k: (k is None, k)):
+        gross = Decimal((sold.get(key) or {}).get("amount") or 0)
+        ret = Decimal((returned.get(key) or {}).get("amount") or 0)
+        rows.append(
+            {
+                "date": _period_iso(key),
+                "sales_count": (sold.get(key) or {}).get("n", 0),
+                "sales_amount": _money_str(gross - ret),
+                "gross_sales_amount": _money_str(gross),
+                "returns_amount": _money_str(ret),
+            }
+        )
+    return rows
+
+
+def _lines_by_product_with_cost(items_qs) -> dict:
+    """{product_id: {"name", "qty", "revenue" (Σ net_amount), "cogs" (qty × себестоимость строки)}}."""
+    out = {}
+    for pid, name, qty, net, line_total, pp in items_qs.annotate(_unit_cost=ITEM_UNIT_COST).values_list(
+        "product_id", "product__name", "qty", "net_amount", "line_total", "_unit_cost"
+    ):
+        b = out.setdefault(pid, {"name": name, "qty": Decimal("0.000"), "revenue": Decimal("0.00"), "cogs": Decimal("0.00")})
+        q = Decimal(str(qty or "0"))
+        b["qty"] += q
+        b["revenue"] += _line_amount(net, line_total)
+        b["cogs"] += q * Decimal(str(pp or "0"))
+    return out
+
+
+def _build_stock_movement(*, company, branch, all_branches: bool, dt_from, dt_to_excl) -> dict:
+    """
+    «Движение товара» за период (C2, analytics-coverage §4.2), агрегатами по StockMove.
+
+    Движения проведённых документов — по дате документа (у распроведённых движения
+    отвязаны от документа и сюда не попадают); выдача/возврат агента — по created_at.
+    cost = qty × себестоимость строки документа (cost_price, иначе закупочная цена товара).
+    Ключи с «_» — для расчёта прибыли, в ответ не отдаются.
+    """
+    moves = _apply_branch_scope(
+        wm.StockMove.objects.filter(warehouse__company=company),
+        branch,
+        path="warehouse__branch",
+        all_branches=all_branches,
+    )
+    DT = wm.Document.DocType
+    item_cost_sq = (
+        wm.DocumentItem.objects.filter(document_id=OuterRef("document_id"), product_id=OuterRef("product_id"))
+        .annotate(_c=ITEM_UNIT_COST)
+        .values("_c")[:1]
+    )
+    item_cost_known_sq = (
+        wm.DocumentItem.objects.filter(
+            document_id=OuterRef("document_id"), product_id=OuterRef("product_id"), cost_price__isnull=False,
+        ).values("cost_price")[:1]
+    )
+    doc_moves = moves.filter(
+        document__isnull=False,
+        document__status__in=SOLD_STATUSES,
+        document__date__gte=dt_from,
+        document__date__lt=dt_to_excl,
+    ).annotate(
+        _unit_cost=Coalesce(
+            Subquery(item_cost_sq, output_field=MONEY_FIELD),
+            F("product__purchase_price"),
+            ZERO_MONEY,
+            output_field=MONEY_FIELD,
+        ),
+    )
+    abs_qty = ExpressionWrapper(F("qty_delta") * V(Decimal("-1")), output_field=QTY_FIELD)
+    abs_cost = ExpressionWrapper(F("qty_delta") * V(Decimal("-1")) * F("_unit_cost"), output_field=MONEY_FIELD)
+    pos_cost = ExpressionWrapper(F("qty_delta") * F("_unit_cost"), output_field=MONEY_FIELD)
+    plus = Q(qty_delta__gt=0)
+    minus = Q(qty_delta__lt=0)
+    agg = doc_moves.aggregate(
+        received_qty=Coalesce(Sum("qty_delta", filter=plus & Q(document__doc_type__in=(DT.PURCHASE, DT.RECEIPT))), ZERO_QTY),
+        received_cost=Coalesce(Sum(pos_cost, filter=plus & Q(document__doc_type__in=(DT.PURCHASE, DT.RECEIPT))), ZERO_MONEY),
+        shipped_qty=Coalesce(Sum(abs_qty, filter=minus & Q(document__doc_type=DT.SALE)), ZERO_QTY),
+        written_off_qty=Coalesce(Sum(abs_qty, filter=minus & Q(document__doc_type=DT.WRITE_OFF)), ZERO_QTY),
+        written_off_cost=Coalesce(Sum(abs_cost, filter=minus & Q(document__doc_type=DT.WRITE_OFF)), ZERO_MONEY),
+        inventory_surplus_qty=Coalesce(Sum("qty_delta", filter=plus & Q(document__doc_type=DT.INVENTORY)), ZERO_QTY),
+        inventory_surplus_cost=Coalesce(Sum(pos_cost, filter=plus & Q(document__doc_type=DT.INVENTORY)), ZERO_MONEY),
+        inventory_shortage_qty=Coalesce(Sum(abs_qty, filter=minus & Q(document__doc_type=DT.INVENTORY)), ZERO_QTY),
+        inventory_shortage_cost=Coalesce(Sum(abs_cost, filter=minus & Q(document__doc_type=DT.INVENTORY)), ZERO_MONEY),
+        transferred_qty=Coalesce(Sum(abs_qty, filter=minus & Q(document__doc_type=DT.TRANSFER)), ZERO_QTY),
+    )
+    estimated = doc_moves.filter(
+        document__doc_type__in=(DT.WRITE_OFF, DT.INVENTORY),
+    ).annotate(
+        _known=Subquery(item_cost_known_sq, output_field=MONEY_FIELD),
+    ).filter(_known__isnull=True).exists()
+
+    agent_moves = moves.filter(created_at__gte=dt_from, created_at__lt=dt_to_excl)
+    agent_agg = agent_moves.aggregate(
+        issued=Coalesce(
+            Sum(abs_qty, filter=Q(source_kind=wm.StockMove.SourceKind.AGENT_ISSUE)), ZERO_QTY
+        ),
+        returned=Coalesce(
+            Sum("qty_delta", filter=Q(source_kind=wm.StockMove.SourceKind.AGENT_RETURN)), ZERO_QTY
+        ),
+    )
+
+    def _q(x):
+        return str(Decimal(x or 0).quantize(Decimal("0.001")))
+
+    return {
+        "received_qty": _q(agg["received_qty"]),
+        "received_cost": _money_str(agg["received_cost"]),
+        "shipped_qty": _q(agg["shipped_qty"]),
+        "written_off_qty": _q(agg["written_off_qty"]),
+        "written_off_cost": _money_str(agg["written_off_cost"]),
+        "inventory_surplus_qty": _q(agg["inventory_surplus_qty"]),
+        "inventory_surplus_cost": _money_str(agg["inventory_surplus_cost"]),
+        "inventory_shortage_qty": _q(agg["inventory_shortage_qty"]),
+        "inventory_shortage_cost": _money_str(agg["inventory_shortage_cost"]),
+        "transferred_qty": _q(agg["transferred_qty"]),
+        "issued_to_agents_qty": _q(agent_agg["issued"]),
+        "returned_from_agents_qty": _q(agent_agg["returned"]),
+        "_written_off_cost": Decimal(agg["written_off_cost"] or 0),
+        "_inventory_surplus_cost": Decimal(agg["inventory_surplus_cost"] or 0),
+        "_inventory_shortage_cost": Decimal(agg["inventory_shortage_cost"] or 0),
+        "_cost_is_estimated": estimated,
+    }
+
+
+def _build_sales_by_product(*, sales_items_qs, returns_items_qs=None, limit: int = 100):
+    """amount = Σ net_amount продаж − Σ net_amount возвратов (по товару); qty — нетто."""
+    def _amount_for(row):
+        raw = row.get("net_amount")
+        if raw is not None and Decimal(str(raw)) != Decimal("0.00"):
+            return Decimal(str(raw))
+        line_total = row.get("line_total")
+        return Decimal(str(line_total or "0")) if line_total is not None else Decimal("0.00")
+
+    def _agg(qs):
+        result = {}
+        for row in qs.values("product_id", "product__name", "qty", "net_amount", "line_total"):
+            pid = row["product_id"]
+            bucket = result.setdefault(pid, {
+                "product_id": pid,
+                "product__name": row["product__name"],
+                "qty_sum": Decimal("0.000"),
+                "amount": Decimal("0.00"),
+            })
+            qty = Decimal(str(row["qty"] or "0"))
+            bucket["qty_sum"] += qty
+            bucket["amount"] += _amount_for(row)
+        return result
+
+    sold = _agg(sales_items_qs)
+    returned = _agg(returns_items_qs) if returns_items_qs is not None else {}
+    rows = []
+    for pid in set(sold) | set(returned):
+        sr, rr = sold.get(pid), returned.get(pid)
+        amount = Decimal((sr or {}).get("amount") or 0) - Decimal((rr or {}).get("amount") or 0)
+        qty = Decimal((sr or {}).get("qty_sum") or 0) - Decimal((rr or {}).get("qty_sum") or 0)
+        rows.append((amount, qty, {
+            "product_id": str(pid),
+            "product_name": (sr or rr)["product__name"],
+            "qty": str(qty),
+            "amount": _money_str(amount),
+        }))
+    rows.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return [r[2] for r in rows[:limit]]
+
+
+def _build_sales_by_group(*, sales_items_qs, returns_items_qs=None, limit: int = 100):
     """
     Сводка продаж по "группам товаров внутри склада" (WarehouseProductGroup).
-    amount считаем по line_total (учитывает скидку строки), qty — по qty.
+    amount = Σ net_amount строк продаж (скидка строки и доля скидки документа)
+    минус Σ net_amount строк возвратов; qty — аналогично нетто.
     """
-    qs = (
-        sales_items_qs.values("product__product_group_id", "product__product_group__name")
-        .annotate(
-            docs_count=Count("document_id", distinct=True),
-            qty_sum=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
-            amount=Coalesce(Sum("line_total", output_field=MONEY_FIELD), ZERO_MONEY),
-        )
-        .order_by("-amount", "-qty_sum")[:limit]
-    )
+    def _amount_for(row):
+        raw = row.get("net_amount")
+        if raw is not None and Decimal(str(raw)) != Decimal("0.00"):
+            return Decimal(str(raw))
+        line_total = row.get("line_total")
+        return Decimal(str(line_total or "0")) if line_total is not None else Decimal("0.00")
+
+    def _agg(qs):
+        result = {}
+        for row in qs.values(
+            "product__product_group_id",
+            "product__product_group__name",
+            "document_id",
+            "qty",
+            "net_amount",
+            "line_total",
+        ):
+            gid = row["product__product_group_id"]
+            bucket = result.setdefault(gid, {
+                "product__product_group__name": row["product__product_group__name"],
+                "docs_count": set(),
+                "qty_sum": Decimal("0.000"),
+                "amount": Decimal("0.00"),
+            })
+            bucket["docs_count"].add(row["document_id"])
+            bucket["qty_sum"] += Decimal(str(row["qty"] or "0"))
+            bucket["amount"] += _amount_for(row)
+        for gid, bucket in result.items():
+            bucket["docs_count"] = len(bucket["docs_count"])
+        return result
+
+    sold = _agg(sales_items_qs)
+    returned = _agg(returns_items_qs) if returns_items_qs is not None else {}
     rows = []
-    for r in qs:
-        gid = r["product__product_group_id"]
-        name = r["product__product_group__name"] or "Без группы"
+    for gid in set(sold) | set(returned):
+        sr = sold.get(gid)
+        rr = returned.get(gid)
+        src = sr or rr
+        amount = Decimal((sr or {}).get("amount") or 0) - Decimal((rr or {}).get("amount") or 0)
+        qty = Decimal((sr or {}).get("qty_sum") or 0) - Decimal((rr or {}).get("qty_sum") or 0)
         rows.append(
             {
                 "group_id": str(gid) if gid else None,
-                "group_name": name,
-                "docs_count": r["docs_count"],
-                "qty": str(r["qty_sum"]),
-                "amount": _money_str(r["amount"]),
+                "group_name": (src["product__product_group__name"] if src and src.get("product__product_group__name") else "Без группы"),
+                "docs_count": (sr or {}).get("docs_count", 0),
+                "qty": str(qty),
+                "amount": _money_str(amount),
+                "_sort": amount,
             }
         )
+    rows.sort(
+        key=lambda r: (r["_sort"], 1 if r["group_name"] == "Без группы" else 0),
+        reverse=True,
+    )
+    rows = rows[:limit]
+    for r in rows:
+        r.pop("_sort")
     top = rows[0] if rows else None
     return rows, top
 
@@ -373,8 +721,11 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
     # по сальдо (оплата контрагенту / приход от контрагента). Они НЕ должны попадать в обычный
     # приход/расход кассы (иначе сальдо кассы искажается), а учитываются отдельной графой
     # «операции с контрагентами».
-    is_cp = Q(counterparty_id__isnull=False) & ~is_debt
-    # Обычный приход/расход (формирует сальдо кассы): без контрагента и не «долг».
+    # Авто-оплаты товарных документов (source_document задан: продажа, закупка, возвраты,
+    # предоплата) — обычное движение кассы, даже если у документа есть контрагент.
+    is_cp = Q(counterparty_id__isnull=False) & Q(source_document__isnull=True) & ~is_debt
+    # Обычный приход/расход (формирует сальдо кассы): ручные документы без контрагента
+    # и авто-оплаты товарных документов; не «долг».
     is_regular = ~is_cp & ~is_debt
     RECEIPT = wm.MoneyDocument.DocType.MONEY_RECEIPT
     EXPENSE = wm.MoneyDocument.DocType.MONEY_EXPENSE
@@ -566,7 +917,7 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
     }
 
 
-@cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_agent", version="v2")
+@cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_agent", version="v4")
 def build_agent_warehouse_analytics_payload(
     *,
     company_id: str,
@@ -576,6 +927,7 @@ def build_agent_warehouse_analytics_payload(
     date_from: date,
     date_to: date,
     group_by: str = "day",
+    cache_ver: int = 0,  # часть ключа кэша; см. analytics_cache
 ):
     company = Company.objects.get(id=company_id)
     branch = Branch.objects.get(id=branch_id) if branch_id else None
@@ -605,102 +957,65 @@ def build_agent_warehouse_analytics_payload(
         s=Coalesce(Sum("quantity_requested", output_field=QTY_FIELD), ZERO_QTY)
     )["s"] or Decimal("0.000")
 
-    sales_qs = wm.Document.objects.filter(
-        warehouse_from__company=company,
-        agent=agent,
-        status=wm.Document.Status.POSTED,
-        doc_type=wm.Document.DocType.SALE,
-        date__gte=dt_from,
-        date__lt=dt_to_excl,
-    )
-    if branch is not None:
-        sales_qs = sales_qs.filter(warehouse_from__branch=branch)
-    else:
-        sales_qs = sales_qs.filter(warehouse_from__branch__isnull=True)
-    sales_count = sales_qs.count()
-    sales_amount = sales_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
+    def _agent_docs(doc_type, statuses):
+        return _company_docs_qs(
+            company=company,
+            branch=branch,
+            all_branches=False,
+            doc_types=(doc_type,),
+            statuses=statuses,
+            dt_from=dt_from,
+            dt_to_excl=dt_to_excl,
+        ).filter(agent=agent)
+
+    # Продажи агента: проведённые и «ожидают кассы» (A7), в т.ч. мультискладские без warehouse_from (A13).
+    sales_qs = _agent_docs(wm.Document.DocType.SALE, SOLD_STATUSES)
+    summary_sales_qs = sales_qs.filter(total__gt=0)
+    sales_count = summary_sales_qs.count()
+    sales_amount = summary_sales_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
 
     sales_items_qs = wm.DocumentItem.objects.filter(document__in=sales_qs)
     sales_qty = sales_items_qs.aggregate(
         s=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY)
     )["s"] or Decimal("0.000")
-    sales_by_product_qs = (
-        sales_items_qs
-        .values("product_id", "product__name")
-        .annotate(
-            qty_sum=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
-            amount=Coalesce(
-                Sum(
-                    ExpressionWrapper(F("qty") * F("price"), output_field=MONEY_FIELD),
-                ),
-                ZERO_MONEY,
-            ),
-        )
-        .order_by("-amount", "-qty_sum")[:100]
-    )
-    sales_by_product = [
-        {
-            "product_id": str(r["product_id"]),
-            "product_name": r["product__name"],
-            "qty": str(r["qty_sum"]),
-            "amount": _money_str(r["amount"]),
-        }
-        for r in sales_by_product_qs
-    ]
+    returns_qs = _agent_docs(wm.Document.DocType.SALE_RETURN, (wm.Document.Status.POSTED,))
 
-    sales_by_group, top_sales_group = _build_sales_by_group(sales_items_qs=sales_items_qs, limit=100)
-
-    sales_by_warehouse_qs = (
-        sales_qs
-        .values("warehouse_from_id", "warehouse_from__name")
-        .annotate(
-            sales_count=Count("id"),
-            sales_amount=Coalesce(Sum("total"), ZERO_MONEY),
-        )
-        .order_by("-sales_amount", "-sales_count")
+    # По складам: сумма по складу строки, нетто возвратов (A9, A13).
+    by_wh = _net_by_warehouse(sales_qs, returns_qs)
+    wh_names = dict(wm.Warehouse.objects.filter(id__in=[w for w in by_wh if w]).values_list("id", "name"))
+    sales_by_warehouse = sorted(
+        (
+            {
+                "warehouse_id": str(wid),
+                "warehouse_name": wh_names.get(wid),
+                "sales_count": r["sales_count"],
+                "sales_amount": _money_str(r["sales_amount"]),
+                "gross_sales_amount": _money_str(r["gross_sales_amount"]),
+                "returns_amount": _money_str(r["returns_amount"]),
+            }
+            for wid, r in by_wh.items()
+        ),
+        key=lambda row: (Decimal(row["sales_amount"]), row["sales_count"]),
+        reverse=True,
     )
-    sales_by_warehouse = [
-        {
-            "warehouse_id": str(r["warehouse_from_id"]),
-            "warehouse_name": r["warehouse_from__name"],
-            "sales_count": r["sales_count"],
-            "sales_amount": _money_str(r["sales_amount"]),
-        }
-        for r in sales_by_warehouse_qs
-    ]
 
-    returns_qs = wm.Document.objects.filter(
-        warehouse_from__company=company,
-        agent=agent,
-        status=wm.Document.Status.POSTED,
-        doc_type=wm.Document.DocType.SALE_RETURN,
-        date__gte=dt_from,
-        date__lt=dt_to_excl,
+    summary_returns_qs = returns_qs.filter(total__gt=0)
+    returns_items_qs = wm.DocumentItem.objects.filter(document__in=returns_qs)
+    sales_by_product = _build_sales_by_product(
+        sales_items_qs=sales_items_qs, returns_items_qs=returns_items_qs, limit=100
     )
-    if branch is not None:
-        returns_qs = returns_qs.filter(warehouse_from__branch=branch)
-    else:
-        returns_qs = returns_qs.filter(warehouse_from__branch__isnull=True)
-    returns_count = returns_qs.count()
-    returns_amount = returns_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
-    returns_qty = wm.DocumentItem.objects.filter(document__in=returns_qs).aggregate(
+    sales_by_group, top_sales_group = _build_sales_by_group(
+        sales_items_qs=sales_items_qs, returns_items_qs=returns_items_qs, limit=100
+    )
+    returns_count = summary_returns_qs.count()
+    returns_amount = summary_returns_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
+    returns_qty = wm.DocumentItem.objects.filter(document__in=summary_returns_qs).aggregate(
         s=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY)
     )["s"] or Decimal("0.000")
     net_sales_amount = (sales_amount - returns_amount).quantize(Decimal("0.01"))
     net_sales_qty = (sales_qty - returns_qty).quantize(Decimal("0.000"))
 
-    write_off_qs = wm.Document.objects.filter(
-        warehouse_from__company=company,
-        agent=agent,
-        status=wm.Document.Status.POSTED,
-        doc_type=wm.Document.DocType.WRITE_OFF,
-        date__gte=dt_from,
-        date__lt=dt_to_excl,
-    )
-    if branch is not None:
-        write_off_qs = write_off_qs.filter(warehouse_from__branch=branch)
-    else:
-        write_off_qs = write_off_qs.filter(warehouse_from__branch__isnull=True)
+    write_off_qs = _agent_docs(wm.Document.DocType.WRITE_OFF, (wm.Document.Status.POSTED,))
     write_off_count = write_off_qs.count()
     write_off_qty = wm.DocumentItem.objects.filter(document__in=write_off_qs).aggregate(
         s=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY)
@@ -742,25 +1057,7 @@ def build_agent_warehouse_analytics_payload(
         for row in requests_by_date_qs
     ]
 
-    trunc_sales = _trunc_by_group("date", group_by)
-    sales_by_date_qs = (
-        sales_qs
-        .annotate(period=trunc_sales)
-        .values("period")
-        .annotate(
-            sales_count=Count("id"),
-            sales_amount=Coalesce(Sum("total"), ZERO_MONEY),
-        )
-        .order_by("period")
-    )
-    sales_by_date = [
-        {
-            "date": _period_iso(row["period"]),
-            "sales_count": row["sales_count"],
-            "sales_amount": _money_str(row["sales_amount"]),
-        }
-        for row in sales_by_date_qs
-    ]
+    sales_by_date = _sales_by_date_net(sales_qs, returns_qs, group_by)
 
     cp_debts = _build_agent_counterparty_debts(company=company, branch=branch, agent=agent)
 
@@ -811,7 +1108,7 @@ def build_agent_warehouse_analytics_payload(
     }
 
 
-@cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_owner", version="v2")
+@cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_owner", version="v6")
 def build_owner_warehouse_analytics_payload(
     *,
     company_id: str,
@@ -821,6 +1118,7 @@ def build_owner_warehouse_analytics_payload(
     date_to: date,
     group_by: str = "day",
     all_branches: bool = False,
+    cache_ver: int = 0,  # часть ключа кэша; см. analytics_cache
 ):
     company = Company.objects.get(id=company_id)
     branch = Branch.objects.get(id=branch_id) if branch_id else None
@@ -840,101 +1138,117 @@ def build_owner_warehouse_analytics_payload(
         s=Coalesce(Sum("quantity_requested", output_field=QTY_FIELD), ZERO_QTY)
     )["s"] or Decimal("0.000")
 
-    sales_qs = wm.Document.objects.filter(
-        warehouse_from__company=company,
-        agent__isnull=False,
-        status=wm.Document.Status.POSTED,
-        doc_type=wm.Document.DocType.SALE,
-        date__gte=dt_from,
-        date__lt=dt_to_excl,
-    )
-    sales_qs = _apply_branch_scope(
-        sales_qs, branch, path="warehouse_from__branch", all_branches=all_branches
-    )
-    sales_count = sales_qs.count()
-    sales_amount = sales_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
+    def _company_docs(doc_type, statuses):
+        """Документы компании. Мультискладские без warehouse_from — по компании/филиалу товара."""
+        return _company_docs_qs(
+            company=company,
+            branch=branch,
+            all_branches=all_branches,
+            doc_types=(doc_type,),
+            statuses=statuses,
+            dt_from=dt_from,
+            dt_to_excl=dt_to_excl,
+        )
 
-    returns_qs = wm.Document.objects.filter(
-        warehouse_from__company=company,
-        agent__isnull=False,
-        status=wm.Document.Status.POSTED,
-        doc_type=wm.Document.DocType.SALE_RETURN,
-        date__gte=dt_from,
-        date__lt=dt_to_excl,
+    # Продажи — ВСЕ продажи компании (с агентом и без), отгруженные: проведённые и «ожидают кассы».
+    sales_qs = _company_docs(wm.Document.DocType.SALE, SOLD_STATUSES)
+    summary_sales_qs = sales_qs.filter(total__gt=0)
+    sales_count = summary_sales_qs.count()
+    sales_amount = summary_sales_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
+
+    agent_sales_qs = summary_sales_qs.filter(agent__isnull=False)
+    agent_sales = agent_sales_qs.aggregate(c=Count("id"), s=Coalesce(Sum("total"), ZERO_MONEY))
+    own_sales = summary_sales_qs.filter(agent__isnull=True).aggregate(c=Count("id"), s=Coalesce(Sum("total"), ZERO_MONEY))
+    pending_cash = summary_sales_qs.filter(status=wm.Document.Status.CASH_PENDING).aggregate(
+        c=Count("id"), s=Coalesce(Sum("total"), ZERO_MONEY)
     )
-    returns_qs = _apply_branch_scope(
-        returns_qs, branch, path="warehouse_from__branch", all_branches=all_branches
-    )
-    returns_count = returns_qs.count()
-    returns_amount = returns_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
+
+    kind_totals = {
+        r["payment_kind"]: r["s"]
+        for r in summary_sales_qs.values("payment_kind").annotate(s=Coalesce(Sum("total"), ZERO_MONEY))
+    }
+    revenue_by_payment_kind = {
+        "cash": _money_str(kind_totals.get("cash", 0) + kind_totals.get(None, 0) + kind_totals.get("", 0)),
+        "credit": _money_str(kind_totals.get("credit", 0)),
+        "external": _money_str(kind_totals.get("external", 0)),
+    }
+
+    returns_qs = _company_docs(wm.Document.DocType.SALE_RETURN, (wm.Document.Status.POSTED,))
+    summary_returns_qs = returns_qs.filter(total__gt=0)
+    returns_count = summary_returns_qs.count()
+    returns_amount = summary_returns_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
     net_sales_amount = (sales_amount - returns_amount).quantize(Decimal("0.01"))
+
+    # Остатки: на складах (StockBalance) и у агентов (AgentStockBalance) — раздельно.
+    wh_stock_qs = wm.StockBalance.objects.filter(warehouse__company=company)
+    if not all_branches:
+        if branch is not None:
+            wh_stock_qs = wh_stock_qs.filter(warehouse__branch=branch)
+        else:
+            wh_stock_qs = wh_stock_qs.filter(warehouse__branch__isnull=True)
+    wh_stock_qs = wh_stock_qs.filter(qty__gt=0)
+    wh_stock_totals = {
+        "qty": Decimal("0.000"),
+        "amount": Decimal("0.00"),
+        "purchase_amount": Decimal("0.00"),
+    }
+    for row in wh_stock_qs.values_list("qty", "product__price", "product__purchase_price"):
+        qty = Decimal(str(row[0] or "0"))
+        price = Decimal(str(row[1] or "0"))
+        purchase_price = Decimal(str(row[2] or "0"))
+        wh_stock_totals["qty"] += qty
+        wh_stock_totals["amount"] += qty * price
+        wh_stock_totals["purchase_amount"] += qty * purchase_price
+    warehouse_on_hand_qty = wh_stock_totals["qty"]
+    warehouse_on_hand_amount = wh_stock_totals["amount"]
+    warehouse_on_hand_purchase_amount = wh_stock_totals["purchase_amount"]
 
     on_hand_qs = wm.AgentStockBalance.objects.select_related("product", "agent").filter(company=company)
     on_hand_qs = _apply_branch_scope(on_hand_qs, branch, all_branches=all_branches)
 
-    on_hand_qty = on_hand_qs.aggregate(
-        s=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY)
-    )["s"] or Decimal("0.000")
-    on_hand_amount = on_hand_qs.aggregate(
-        s=Coalesce(Sum(F("qty") * F("product__price"), output_field=MONEY_FIELD), ZERO_MONEY)
-    )["s"] or Decimal("0.00")
+    on_hand_totals = {
+        "qty": Decimal("0.000"),
+        "amount": Decimal("0.00"),
+        "purchase_amount": Decimal("0.00"),
+    }
+    for row in on_hand_qs.values_list("qty", "product__price", "product__purchase_price"):
+        qty = Decimal(str(row[0] or "0"))
+        price = Decimal(str(row[1] or "0"))
+        purchase_price = Decimal(str(row[2] or "0"))
+        on_hand_totals["qty"] += qty
+        on_hand_totals["amount"] += qty * price
+        on_hand_totals["purchase_amount"] += qty * purchase_price
+    on_hand_qty = on_hand_totals["qty"]
+    on_hand_amount = on_hand_totals["amount"]
+    on_hand_purchase_amount = on_hand_totals["purchase_amount"]
 
+    # График: продажи минус возвраты по датам.
     trunc_sales = _trunc_by_group("date", group_by)
-    sales_by_date_qs = (
-        sales_qs
-        .annotate(period=trunc_sales)
-        .values("period")
-        .annotate(
-            sales_count=Count("id"),
-            sales_amount=Coalesce(Sum("total"), ZERO_MONEY),
-        )
-        .order_by("period")
-    )
-    sales_by_date = [
-        {
-            "date": _period_iso(row["period"]),
-            "sales_count": row["sales_count"],
-            "sales_amount": _money_str(row["sales_amount"]),
-        }
-        for row in sales_by_date_qs
-    ]
+    sales_by_date = _sales_by_date_net(sales_qs, returns_qs, group_by)
 
     sales_items_qs = wm.DocumentItem.objects.filter(document__in=sales_qs)
-    sales_by_product_qs = (
-        sales_items_qs
-        .values("product_id", "product__name")
-        .annotate(
-            qty_sum=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
-            amount=Coalesce(
-                Sum(
-                    ExpressionWrapper(F("qty") * F("price"), output_field=MONEY_FIELD),
-                ),
-                ZERO_MONEY,
-            ),
-        )
-        .order_by("-amount", "-qty_sum")[:100]
+    returns_items_qs = wm.DocumentItem.objects.filter(document__in=returns_qs)
+    sales_by_product = _build_sales_by_product(
+        sales_items_qs=sales_items_qs, returns_items_qs=returns_items_qs, limit=100
     )
-    sales_by_product = [
-        {
-            "product_id": str(r["product_id"]),
-            "product_name": r["product__name"],
-            "qty": str(r["qty_sum"]),
-            "amount": _money_str(r["amount"]),
-        }
-        for r in sales_by_product_qs
-    ]
-
-    sales_by_group, top_sales_group = _build_sales_by_group(sales_items_qs=sales_items_qs, limit=100)
-
-    top_agents_by_sales_qs = (
-        sales_qs
-        .values("agent_id", "agent__first_name", "agent__last_name")
-        .annotate(
-            sales_count=Count("id"),
-            sales_amount=Coalesce(Sum("total"), ZERO_MONEY),
-        )
-        .order_by("-sales_amount")[:10]
+    sales_by_group, top_sales_group = _build_sales_by_group(
+        sales_items_qs=sales_items_qs, returns_items_qs=returns_items_qs, limit=100
     )
+
+    # Топ агентов: нетто по агенту, доля — от ВСЕХ продаж агентов за период.
+    agent_returns_qs = returns_qs.filter(agent__isnull=False)
+    agent_returned = {
+        r["agent_id"]: Decimal(r["s"] or 0)
+        for r in agent_returns_qs.values("agent_id").annotate(s=Coalesce(Sum("total"), ZERO_MONEY))
+    }
+    agent_rows = []
+    for r in agent_sales_qs.values("agent_id", "agent__first_name", "agent__last_name").annotate(
+        sales_count=Count("id"), sales_amount=Coalesce(Sum("total"), ZERO_MONEY)
+    ):
+        net = Decimal(r["sales_amount"] or 0) - agent_returned.get(r["agent_id"], Decimal("0"))
+        agent_rows.append((net, r))
+    agent_rows.sort(key=lambda t: t[0], reverse=True)
+    agents_total = sum((t[0] for t in agent_rows), Decimal("0.00"))
     top_agents_by_sales = [
         {
             "agent_id": str(r["agent_id"]),
@@ -943,9 +1257,12 @@ def build_owner_warehouse_analytics_payload(
                 or "Агент"
             ),
             "sales_count": r["sales_count"],
-            "sales_amount": _money_str(r["sales_amount"]),
+            "sales_amount": _money_str(net),
+            "share_percent": (
+                str((net * 100 / agents_total).quantize(Decimal("0.01"))) if agents_total > 0 else "0.00"
+            ),
         }
-        for r in top_agents_by_sales_qs
+        for net, r in agent_rows[:10]
     ]
 
     top_agents_by_received_qs = (
@@ -984,38 +1301,36 @@ def build_owner_warehouse_analytics_payload(
         )
     }
 
-    sales_by_wh = {
-        r["warehouse_from_id"]: {
-            "sales_count": r["sales_count"],
-            "sales_amount": r["sales_amount"],
-        }
-        for r in (
-            sales_qs
-            .values("warehouse_from_id")
-            .annotate(
-                sales_count=Count("id"),
-                sales_amount=Coalesce(Sum("total"), ZERO_MONEY),
-            )
-        )
-    }
+    # Продажи по складам: по складу строки (мультисклад, без warehouse_from), нетто возвратов.
+    sales_by_wh = _net_by_warehouse(sales_qs, returns_qs)
 
-    on_hand_by_wh = {
-        r["warehouse_id"]: {
-            "on_hand_qty": r["on_hand_qty"],
-            "on_hand_amount": r["on_hand_amount"],
-        }
-        for r in (
-            on_hand_qs
-            .values("warehouse_id")
-            .annotate(
-                on_hand_qty=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY),
-                on_hand_amount=Coalesce(
-                    Sum(F("qty") * F("product__price"), output_field=MONEY_FIELD),
-                    ZERO_MONEY,
-                ),
-            )
+    wh_on_hand_by_wh = {}
+    for row in wh_stock_qs.values_list("warehouse_id", "qty", "product__price", "product__purchase_price"):
+        warehouse_id = row[0]
+        qty = Decimal(str(row[1] or "0"))
+        price = Decimal(str(row[2] or "0"))
+        purchase_price = Decimal(str(row[3] or "0"))
+        bucket = wh_on_hand_by_wh.setdefault(
+            warehouse_id,
+            {"qty": Decimal("0.000"), "amount": Decimal("0.00"), "purchase_amount": Decimal("0.00")},
         )
-    }
+        bucket["qty"] += qty
+        bucket["amount"] += qty * price
+        bucket["purchase_amount"] += qty * purchase_price
+
+    on_hand_by_wh = {}
+    for row in on_hand_qs.values_list("warehouse_id", "qty", "product__price", "product__purchase_price"):
+        warehouse_id = row[0]
+        qty = Decimal(str(row[1] or "0"))
+        price = Decimal(str(row[2] or "0"))
+        purchase_price = Decimal(str(row[3] or "0"))
+        bucket = on_hand_by_wh.setdefault(
+            warehouse_id,
+            {"on_hand_qty": Decimal("0.000"), "on_hand_amount": Decimal("0.00"), "on_hand_purchase_amount": Decimal("0.00")},
+        )
+        bucket["on_hand_qty"] += qty
+        bucket["on_hand_amount"] += qty * price
+        bucket["on_hand_purchase_amount"] += qty * purchase_price
 
     warehouses_qs = wm.Warehouse.objects.filter(company=company)
     warehouses_qs = _apply_branch_scope(warehouses_qs, branch, all_branches=all_branches)
@@ -1025,6 +1340,10 @@ def build_owner_warehouse_analytics_payload(
         approved = approved_by_wh.get(wh.id, {})
         sales = sales_by_wh.get(wh.id, {})
         on_hand = on_hand_by_wh.get(wh.id, {})
+        stock = wh_on_hand_by_wh.get(wh.id, {})
+        agent_qty = str(on_hand.get("on_hand_qty", Decimal("0.000")))
+        agent_amount = _money_str(on_hand.get("on_hand_amount", Decimal("0.00")))
+        stock_purchase = _money_str(stock.get("purchase_amount", Decimal("0.00")))
         warehouses.append({
             "warehouse_id": str(wh.id),
             "warehouse_name": wh.name,
@@ -1032,9 +1351,272 @@ def build_owner_warehouse_analytics_payload(
             "items_approved": str(approved.get("items_approved", Decimal("0.000"))),
             "sales_count": sales.get("sales_count", 0),
             "sales_amount": _money_str(sales.get("sales_amount", Decimal("0.00"))),
-            "on_hand_qty": str(on_hand.get("on_hand_qty", Decimal("0.000"))),
-            "on_hand_amount": _money_str(on_hand.get("on_hand_amount", Decimal("0.00"))),
+            "gross_sales_amount": _money_str(sales.get("gross_sales_amount", Decimal("0.00"))),
+            "returns_amount": _money_str(sales.get("returns_amount", Decimal("0.00"))),
+            "warehouse_on_hand_qty": str(stock.get("qty", Decimal("0.000"))),
+            "warehouse_on_hand_amount": _money_str(stock.get("amount", Decimal("0.00"))),
+            "warehouse_on_hand_purchase_amount": stock_purchase,
+            "on_hand_purchase_amount": stock_purchase,
+            "agent_on_hand_qty": agent_qty,
+            "agent_on_hand_amount": agent_amount,
+            # DEPRECATED: алиасы agent_on_hand_*
+            "on_hand_qty": agent_qty,
+            "on_hand_amount": agent_amount,
         })
+
+    purchases_qs = wm.Document.objects.filter(
+        warehouse_from__company=company,
+        status=wm.Document.Status.POSTED,
+        doc_type__in=(wm.Document.DocType.PURCHASE, wm.Document.DocType.RECEIPT),
+        date__gte=dt_from,
+        date__lt=dt_to_excl,
+    )
+    purchases_qs = _apply_branch_scope(
+        purchases_qs, branch, path="warehouse_from__branch", all_branches=all_branches
+    ).filter(total__gt=0)
+    purchase_returns_qs = wm.Document.objects.filter(
+        warehouse_from__company=company,
+        status=wm.Document.Status.POSTED,
+        doc_type=wm.Document.DocType.PURCHASE_RETURN,
+        date__gte=dt_from,
+        date__lt=dt_to_excl,
+    )
+    purchase_returns_qs = _apply_branch_scope(
+        purchase_returns_qs, branch, path="warehouse_from__branch", all_branches=all_branches
+    ).filter(total__gt=0)
+
+    purchases_count = purchases_qs.count()
+    purchases_amount = purchases_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
+    purchase_returns_amount = purchase_returns_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
+    net_purchases_amount = (purchases_amount - purchase_returns_amount).quantize(Decimal("0.01"))
+
+    purchases_by_payment_kind = {
+        "cash": "0.00",
+        "credit": "0.00",
+        "external": "0.00",
+    }
+    for r in purchases_qs.values("payment_kind").annotate(total=Coalesce(Sum("total"), ZERO_MONEY)):
+        kind = (r["payment_kind"] or "cash").lower()
+        if kind not in purchases_by_payment_kind:
+            continue
+        purchases_by_payment_kind[kind] = _money_str(r["total"] or Decimal("0.00"))
+
+    purchases_by_supplier = [
+        {
+            "counterparty_id": str(r["counterparty_id"] or ""),
+            "name": r["counterparty__name"] or "Поставщик",
+            "docs_count": r["docs_count"],
+            "amount": _money_str(r["amount"] or Decimal("0.00")),
+        }
+        for r in (
+            purchases_qs
+            .values("counterparty_id", "counterparty__name")
+            .annotate(
+                docs_count=Count("id"),
+                amount=Coalesce(Sum("total"), ZERO_MONEY),
+            )
+            .order_by("-amount")[:100]
+        )
+    ]
+
+    purchases_by_date_qs = (
+        purchases_qs
+        .annotate(period=trunc_sales)
+        .values("period")
+        .annotate(amount=Coalesce(Sum("total"), ZERO_MONEY))
+        .order_by("period")
+    )
+    purchases_by_date = [
+        {"date": _period_iso(row["period"]), "amount": _money_str(row["amount"])}
+        for row in purchases_by_date_qs
+    ]
+
+    salary_accrual_qs = wm.AgentSalaryAccrual.objects.filter(
+        company=company,
+        created_at__gte=dt_from,
+        created_at__lt=dt_to_excl,
+    )
+    salary_accrual_qs = _apply_branch_scope(salary_accrual_qs, branch, path="warehouse__branch", all_branches=all_branches)
+    salary_accrued_amount = salary_accrual_qs.filter(
+        status__in=(wm.AgentSalaryAccrual.Status.ACCRUED, wm.AgentSalaryAccrual.Status.PAID)
+    ).aggregate(s=Coalesce(Sum("amount"), ZERO_MONEY))["s"] or Decimal("0.00")
+    salary_paid_amount = wm.AgentSalaryPayout.objects.filter(
+        company=company,
+        created_at__gte=dt_from,
+        created_at__lt=dt_to_excl,
+    ).aggregate(s=Coalesce(Sum("amount"), ZERO_MONEY))["s"] or Decimal("0.00")
+    salary_payable_amount = salary_accrual_qs.filter(status=wm.AgentSalaryAccrual.Status.ACCRUED).aggregate(
+        s=Coalesce(Sum("amount"), ZERO_MONEY)
+    )["s"] or Decimal("0.00")
+
+    salary_by_agent = [
+        {
+            "agent_id": str(r["agent_id"]),
+            "agent_name": (
+                f"{(r['agent__first_name'] or '').strip()} {(r['agent__last_name'] or '').strip()}".strip()
+                or "Агент"
+            ),
+            "accrued": _money_str(r["accrued"]),
+            "paid": "0.00",
+            "payable": "0.00",
+        }
+        for r in (
+            salary_accrual_qs.values("agent_id", "agent__first_name", "agent__last_name")
+            .annotate(
+                accrued=Coalesce(Sum("amount"), ZERO_MONEY),
+            )
+            .order_by("-accrued")
+        )
+    ]
+    if salary_by_agent:
+        salary_paid_by_agent = {
+            str(r["agent_id"]): r["paid"]
+            for r in wm.AgentSalaryPayout.objects.filter(
+                company=company,
+                created_at__gte=dt_from,
+                created_at__lt=dt_to_excl,
+            ).values("agent_id").annotate(paid=Coalesce(Sum("amount"), ZERO_MONEY))
+        }
+        for row in salary_by_agent:
+            paid = salary_paid_by_agent.get(row["agent_id"], Decimal("0.00"))
+            row["paid"] = _money_str(paid)
+            row["payable"] = _money_str((Decimal(row["accrued"]) - paid).quantize(Decimal("0.01")))
+
+    sales_items_cost_agg = wm.DocumentItem.objects.filter(document__in=summary_sales_qs).aggregate(
+        cogs=Coalesce(
+            Sum(
+                ITEM_LINE_COST
+            ),
+            ZERO_MONEY,
+        )
+    )
+    sales_cogs_amount = sales_items_cost_agg["cogs"] or Decimal("0.00")
+    return_items_cost_agg = wm.DocumentItem.objects.filter(document__in=summary_returns_qs).aggregate(
+        cogs=Coalesce(
+            Sum(
+                ITEM_LINE_COST
+            ),
+            ZERO_MONEY,
+        )
+    )
+    return_cogs_amount = return_items_cost_agg["cogs"] or Decimal("0.00")
+    cogs_amount = (sales_cogs_amount - return_cogs_amount).quantize(Decimal("0.01"))
+    revenue_amount = net_sales_amount
+    gross_profit_amount = (revenue_amount - cogs_amount).quantize(Decimal("0.01"))
+    gross_margin_percent = (
+        (gross_profit_amount * Decimal("100") / revenue_amount).quantize(Decimal("0.01"))
+        if revenue_amount > 0
+        else Decimal("0.00")
+    )
+    salary_expense_amount = salary_accrued_amount
+
+    stock_movement = _build_stock_movement(
+        company=company, branch=branch, all_branches=all_branches, dt_from=dt_from, dt_to_excl=dt_to_excl,
+    )
+    # D4: списание — убыток по себестоимости, не деньги. Излишки инвентаризации его уменьшают.
+    writeoff_loss_amount = (
+        stock_movement["_written_off_cost"]
+        + stock_movement["_inventory_shortage_cost"]
+        - stock_movement["_inventory_surplus_cost"]
+    ).quantize(Decimal("0.01"))
+    operating_profit_amount = (
+        gross_profit_amount - writeoff_loss_amount - salary_expense_amount
+    ).quantize(Decimal("0.01"))
+    cost_is_estimated = (
+        wm.DocumentItem.objects.filter(
+            Q(document__in=summary_sales_qs) | Q(document__in=summary_returns_qs),
+            cost_price__isnull=True,
+        ).exists()
+        or stock_movement["_cost_is_estimated"]
+    )
+
+    # Прибыль по товарам: выручка = Σ net_amount строк (как «по товарам», A8) минус возвраты (A9).
+    sold_lines = _lines_by_product_with_cost(sales_items_qs.filter(document__in=summary_sales_qs))
+    returned_lines = _lines_by_product_with_cost(returns_items_qs.filter(document__in=summary_returns_qs))
+    profit_rows = []
+    for pid in set(sold_lines) | set(returned_lines):
+        s_row = sold_lines.get(pid) or {}
+        r_row = returned_lines.get(pid) or {}
+        qty = s_row.get("qty", Decimal("0.000")) - r_row.get("qty", Decimal("0.000"))
+        revenue = s_row.get("revenue", Decimal("0.00")) - r_row.get("revenue", Decimal("0.00"))
+        cogs = s_row.get("cogs", Decimal("0.00")) - r_row.get("cogs", Decimal("0.00"))
+        profit = revenue - cogs
+        profit_rows.append((revenue, {
+            "product_id": str(pid),
+            "product_name": s_row.get("name") or r_row.get("name"),
+            "qty": str(qty),
+            "revenue": _money_str(revenue),
+            "cogs": _money_str(cogs),
+            "profit": _money_str(profit),
+            "margin_percent": _money_str((profit * 100 / revenue).quantize(_CENT) if revenue > 0 else Decimal("0.00")),
+        }))
+    profit_rows.sort(key=lambda t: t[0], reverse=True)
+    profit_by_product = [row for _, row in profit_rows[:100]]
+
+    # Прибыль по агентам: выручка — Σ Document.total (нетто возвратов), себестоимость — отдельно
+    # по строкам (раньше Sum(total) шёл через JOIN со строками и умножался на число строк).
+    def _cogs_by(items_qs, key):
+        return {
+            r[key]: Decimal(r["cogs"] or 0)
+            for r in items_qs.values(key).annotate(
+                cogs=Coalesce(
+                    Sum(
+                        ITEM_LINE_COST
+                    ),
+                    ZERO_MONEY,
+                )
+            )
+        }
+
+    summary_sales_items_qs = wm.DocumentItem.objects.filter(document__in=summary_sales_qs)
+    summary_return_items_qs = wm.DocumentItem.objects.filter(document__in=summary_returns_qs)
+    agent_cogs = _cogs_by(summary_sales_items_qs, "document__agent_id")
+    agent_ret_cogs = _cogs_by(summary_return_items_qs, "document__agent_id")
+    agent_ret_rev = {
+        r["agent_id"]: Decimal(r["s"] or 0)
+        for r in summary_returns_qs.values("agent_id").annotate(s=Coalesce(Sum("total"), ZERO_MONEY))
+    }
+    profit_agent_rows = []
+    for r in summary_sales_qs.values("agent_id", "agent__first_name", "agent__last_name").annotate(
+        revenue=Coalesce(Sum("total"), ZERO_MONEY)
+    ):
+        aid = r["agent_id"]
+        revenue = Decimal(r["revenue"] or 0) - agent_ret_rev.get(aid, Decimal("0.00"))
+        cogs = agent_cogs.get(aid, Decimal("0.00")) - agent_ret_cogs.get(aid, Decimal("0.00"))
+        if aid is None:
+            name = "Без агента"
+        else:
+            name = (
+                f"{(r['agent__first_name'] or '').strip()} {(r['agent__last_name'] or '').strip()}".strip()
+                or "Агент"
+            )
+        profit_agent_rows.append((revenue, {
+            "agent_id": str(aid) if aid else None,
+            "agent_name": name,
+            "revenue": _money_str(revenue),
+            "cogs": _money_str(cogs),
+            "profit": _money_str(revenue - cogs),
+        }))
+    profit_agent_rows.sort(key=lambda t: t[0], reverse=True)
+    profit_by_agent = [row for _, row in profit_agent_rows[:100]]
+
+    # Прибыль по датам: нетто-выручка и себестоимость по дате документа.
+    date_cogs = _cogs_by(summary_sales_items_qs.annotate(period=_trunc_by_group("document__date", group_by)), "period")
+    date_ret_cogs = _cogs_by(summary_return_items_qs.annotate(period=_trunc_by_group("document__date", group_by)), "period")
+    date_key_cogs = {}
+    for k, v in date_cogs.items():
+        date_key_cogs[_period_iso(k)] = date_key_cogs.get(_period_iso(k), Decimal("0.00")) + v
+    for k, v in date_ret_cogs.items():
+        date_key_cogs[_period_iso(k)] = date_key_cogs.get(_period_iso(k), Decimal("0.00")) - v
+    profit_by_date = [
+        {
+            "date": row["date"],
+            "revenue": row["sales_amount"],
+            "cogs": _money_str(date_key_cogs.get(row["date"], Decimal("0.00"))),
+            "gross_profit": _money_str(Decimal(row["sales_amount"]) - date_key_cogs.get(row["date"], Decimal("0.00"))),
+        }
+        for row in _sales_by_date_net(summary_sales_qs, summary_returns_qs, group_by)
+    ]
 
     cash = _build_owner_cash_analytics(
         company=company,
@@ -1059,15 +1641,52 @@ def build_owner_warehouse_analytics_payload(
             "gross_sales_amount": _money_str(sales_amount),
             "returns_count": returns_count,
             "returns_amount": _money_str(returns_amount),
+            "agent_sales_count": agent_sales["c"],
+            "agent_sales_amount": _money_str(agent_sales["s"]),
+            "own_sales_count": own_sales["c"],
+            "own_sales_amount": _money_str(own_sales["s"]),
+            "pending_cash_sales_count": pending_cash["c"],
+            "pending_cash_sales_amount": _money_str(pending_cash["s"]),
+            "revenue_by_payment_kind": revenue_by_payment_kind,
+            "purchases_count": purchases_count,
+            "purchases_amount": _money_str(purchases_amount),
+            "purchase_returns_amount": _money_str(purchase_returns_amount),
+            "net_purchases_amount": _money_str(net_purchases_amount),
+            "purchases_by_payment_kind": purchases_by_payment_kind,
+            "salary_accrued_amount": _money_str(salary_accrued_amount),
+            "salary_paid_amount": _money_str(salary_paid_amount),
+            "salary_payable_amount": _money_str(salary_payable_amount),
+            "revenue_amount": _money_str(revenue_amount),
+            "cogs_amount": _money_str(cogs_amount),
+            "gross_profit_amount": _money_str(gross_profit_amount),
+            "gross_margin_percent": _money_str(gross_margin_percent),
+            "writeoff_loss_amount": _money_str(writeoff_loss_amount),
+            "salary_expense_amount": _money_str(salary_expense_amount),
+            "operating_profit_amount": _money_str(operating_profit_amount),
+            "warehouse_on_hand_qty": str(warehouse_on_hand_qty),
+            "warehouse_on_hand_amount": _money_str(warehouse_on_hand_amount),
+            "warehouse_on_hand_purchase_amount": _money_str(warehouse_on_hand_purchase_amount),
+            "agent_on_hand_qty": str(on_hand_qty),
+            "agent_on_hand_amount": _money_str(on_hand_amount),
+            "agent_on_hand_purchase_amount": _money_str(on_hand_purchase_amount),
+            "cost_is_estimated": cost_is_estimated,
+            **{k: v for k, v in stock_movement.items() if not k.startswith("_")},
+            # DEPRECATED: алиасы agent_on_hand_*
             "on_hand_qty": str(on_hand_qty),
             "on_hand_amount": _money_str(on_hand_amount),
+            # = warehouse_on_hand_purchase_amount, как и в details.warehouses[] (поле новое,
+            # раньше не отдавалось — поэтому не алиас агентского остатка).
+            "on_hand_purchase_amount": _money_str(warehouse_on_hand_purchase_amount),
             **cash["summary"],
         },
         "charts": {
             "sales_by_date": sales_by_date,
+            "purchases_by_date": purchases_by_date,
+            "profit_by_date": profit_by_date,
             **cash["charts"],
         },
         "top_agents": {
+            "total_sales_amount": _money_str(agents_total),
             "by_sales": top_agents_by_sales,
             "by_received": top_agents_by_received,
         },
@@ -1076,12 +1695,16 @@ def build_owner_warehouse_analytics_payload(
             "sales_by_product": sales_by_product,
             "sales_by_group": sales_by_group,
             "top_sales_group": top_sales_group,
+            "purchases_by_supplier": purchases_by_supplier,
+            "salary_by_agent": salary_by_agent,
+            "profit_by_product": profit_by_product,
+            "profit_by_agent": profit_by_agent,
             **cash["details"],
         },
     }
 
 
-@cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_owner_agents_sales", version="v2")
+@cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_owner_agents_sales", version="v4")
 def build_owner_agents_sales_analytics_payload(
     *,
     company_id: str,
@@ -1094,26 +1717,28 @@ def build_owner_agents_sales_analytics_payload(
     offset: int = 0,
     order_by: str = "sales_amount",
     all_branches: bool = False,
+    cache_ver: int = 0,  # часть ключа кэша; см. analytics_cache
 ):
     """
     Агентская аналитика для владельца: список агентов с продажами за период.
-    Считаем только проведённые продажи (Document.POSTED, doc_type=SALE) где agent != null.
+    Продажи агентов (agent != null): проведённые и «ожидают кассы», нетто возвратов.
     """
     company = Company.objects.get(id=company_id)
     branch = Branch.objects.get(id=branch_id) if branch_id else None
     dt_from, dt_to_excl = _dt_range(date_from, date_to)
 
-    sales_qs = wm.Document.objects.filter(
-        warehouse_from__company=company,
-        agent__isnull=False,
-        status=wm.Document.Status.POSTED,
-        doc_type=wm.Document.DocType.SALE,
-        date__gte=dt_from,
-        date__lt=dt_to_excl,
-    )
-    sales_qs = _apply_branch_scope(
-        sales_qs, branch, path="warehouse_from__branch", all_branches=all_branches
-    )
+    def _agents_docs(doc_type, statuses):
+        return _company_docs_qs(
+            company=company,
+            branch=branch,
+            all_branches=all_branches,
+            doc_types=(doc_type,),
+            statuses=statuses,
+            dt_from=dt_from,
+            dt_to_excl=dt_to_excl,
+        ).filter(agent__isnull=False)
+
+    sales_qs = _agents_docs(wm.Document.DocType.SALE, SOLD_STATUSES)
 
     summary_sales_count = sales_qs.count()
     summary_sales_amount = sales_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
@@ -1121,17 +1746,7 @@ def build_owner_agents_sales_analytics_payload(
         s=Coalesce(Sum("qty", output_field=QTY_FIELD), ZERO_QTY)
     )["s"] or Decimal("0.000")
 
-    returns_qs = wm.Document.objects.filter(
-        warehouse_from__company=company,
-        agent__isnull=False,
-        status=wm.Document.Status.POSTED,
-        doc_type=wm.Document.DocType.SALE_RETURN,
-        date__gte=dt_from,
-        date__lt=dt_to_excl,
-    )
-    returns_qs = _apply_branch_scope(
-        returns_qs, branch, path="warehouse_from__branch", all_branches=all_branches
-    )
+    returns_qs = _agents_docs(wm.Document.DocType.SALE_RETURN, (wm.Document.Status.POSTED,))
     summary_returns_count = returns_qs.count()
     summary_returns_amount = returns_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal("0.00")
     summary_returns_qty = wm.DocumentItem.objects.filter(document__in=returns_qs).aggregate(
@@ -1143,7 +1758,6 @@ def build_owner_agents_sales_analytics_payload(
             "agent_id",
             "agent__first_name",
             "agent__last_name",
-            "agent__username",
             "agent__email",
         )
         .annotate(
@@ -1177,7 +1791,6 @@ def build_owner_agents_sales_analytics_payload(
     for r in agents_qs:
         name = (
             f"{(r['agent__first_name'] or '').strip()} {(r['agent__last_name'] or '').strip()}".strip()
-            or (r.get("agent__username") or "").strip()
             or (r.get("agent__email") or "").strip()
             or "Агент"
         )
@@ -1234,7 +1847,9 @@ def build_owner_agents_sales_analytics_payload(
     }
 
 
-@cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_owner_partners_list", version="v2")
+# Без собственного кэша: внутри вызывается build_owner_warehouse_analytics_payload, который
+# кэшируется с версией КАЖДОЙ компании-партнёра (A11). Отдельный кэш здесь держал бы
+# устаревшие цифры до 10 минут после продажи у партнёра.
 def build_owner_partners_warehouse_analytics_list_payload(
     *,
     owner_company_id: str,
@@ -1276,7 +1891,6 @@ def build_owner_partners_warehouse_analytics_list_payload(
     }
 
 
-@cached_result(timeout=settings.CACHE_TIMEOUT_ANALYTICS, key_prefix="warehouse_analytics_owner_partner", version="v2")
 def build_owner_partner_warehouse_analytics_payload(
     *,
     owner_company_id: str,
@@ -1306,3 +1920,19 @@ def build_owner_partner_warehouse_analytics_payload(
         },
         **analytics,
     }
+
+
+
+def _versioned(cached_fn):
+    """Подмешивает версию кэша компании в ключ: после изменений данных кэш не используется."""
+    @wraps(cached_fn)
+    def wrapper(**kwargs):
+        kwargs["cache_ver"] = analytics_version(kwargs["company_id"])
+        return cached_fn(**kwargs)
+
+    return wrapper
+
+
+build_agent_warehouse_analytics_payload = _versioned(build_agent_warehouse_analytics_payload)
+build_owner_warehouse_analytics_payload = _versioned(build_owner_warehouse_analytics_payload)
+build_owner_agents_sales_analytics_payload = _versioned(build_owner_agents_sales_analytics_payload)

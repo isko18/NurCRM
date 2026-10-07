@@ -1,6 +1,8 @@
+from datetime import timedelta
 from decimal import Decimal
 
-from django.db.models import Q, F, Value, ExpressionWrapper, DecimalField, Case, When
+from django.db.models import Q, F, Value, ExpressionWrapper, DecimalField, Case, When, Prefetch, OuterRef, Subquery, Exists
+from django.utils import timezone
 from django.db.models.functions import Coalesce, Lower
 from rest_framework import generics
 from rest_framework.permissions import AllowAny
@@ -9,8 +11,10 @@ from rest_framework.filters import SearchFilter, OrderingFilter
 from django_filters.rest_framework import DjangoFilterBackend
 
 from apps.users.models import Company
-from ..models import Product
-from .serializers_public import PublicCompanySerializer, PublicProductSerializer
+from ..models import Product, ProductVariant, ProductPromotionTier, ShowcaseProductSettings
+from .serializers_public import PublicCompanySerializer, PublicProductListSerializer, PublicProductSerializer
+from . import services as showcase_svc
+from .services import ShowcaseErrorMixin, resolve_public_company
 
 
 class ShowcaseOrderingFilter(OrderingFilter):
@@ -30,8 +34,26 @@ class ShowcaseOrderingFilter(OrderingFilter):
         "created_at",
     }
 
+    # Коды сортировки из документа вида (products.sort_options / default_sort) → поля.
+    ALIASES = {
+        "name_asc": "name", "name_desc": "-name", "price_asc": "final_price", "price_desc": "-final_price",
+        "discount_desc": "-discount_percent", "discount_asc": "discount_percent", "new": "-created_at",
+    }
+
     def filter_queryset(self, request, queryset, view):
         ordering_param = request.query_params.get(self.ordering_param)
+        catalog = getattr(view, "_catalog", None)
+        if not ordering_param and catalog is not None:
+            ordering_param = catalog.default_sort
+        if ordering_param in ("default", None, ""):
+            ordering_param = None
+        if ordering_param == "manual":
+            # Ручной порядок: закреплённые первыми, затем sort_order, новые товары — в конце.
+            return queryset.order_by(
+                F("sc_pinned").desc(nulls_last=True), F("sc_sort").asc(nulls_last=True), F("created_at").desc(), F("id").asc()
+            )
+        if ordering_param in self.ALIASES:
+            ordering_param = self.ALIASES[ordering_param]
         if ordering_param:
             fields = [p.strip() for p in ordering_param.split(",") if p.strip()]
             for f in fields:
@@ -64,7 +86,9 @@ class ShowcaseOrderingFilter(OrderingFilter):
             ordering_clauses.extend([F("created_at").desc(), F("id").asc()])
             return queryset.order_by(*ordering_clauses)
 
-        # Сортировка по умолчанию: сначала новые, затем по id для детерминированности
+        # Сортировка по умолчанию: закреплённые первыми, затем новые, затем по id
+        if catalog is not None:
+            return queryset.order_by(F("sc_pinned").desc(nulls_last=True), F("created_at").desc(), F("id").asc())
         default_ordering = getattr(view, "ordering", ["-created_at", "id"])
         return queryset.order_by(*default_ordering)
 
@@ -78,16 +102,60 @@ class ShowcasePagination(PageNumberPagination):
     max_page_size = 500
 
 
-class PublicCompanyAPIView(generics.RetrieveAPIView):
+class PublicCompanyAPIView(ShowcaseErrorMixin, generics.RetrieveAPIView):
     permission_classes = [AllowAny]
     serializer_class = PublicCompanySerializer
     lookup_field = "slug"
     queryset = Company.objects.all()
 
+    def get_object(self):
+        return resolve_public_company(self.kwargs.get("slug"), self.request)
 
-class PublicCompanyShowcaseAPIView(generics.ListAPIView):
+
+def _bool_qp(request, name):
+    v = request.query_params.get(name)
+    if v is None or v == "":
+        return None
+    return str(v).lower() in ("1", "true", "yes")
+
+
+def annotate_showcase_settings(qs, company, catalog):
+    """sc_hidden / sc_pinned / sc_sort / sc_badge — опубликованные (или черновые в предпросмотре) настройки."""
+    pre = catalog.field_prefix
+    sub = ShowcaseProductSettings.objects.filter(company=company, product=OuterRef("pk"))
+    return qs.annotate(
+        sc_pinned=Subquery(sub.values(f"{pre}pinned")[:1]),
+        sc_sort=Subquery(sub.values(f"{pre}sort_order")[:1]),
+        sc_badge=Subquery(sub.values(f"{pre}badge")[:1]),
+    )
+
+
+def on_sale_q():
+    return Q(discount_percent__gt=0) | Q(stock=True) & Exists(ProductPromotionTier.objects.filter(product=OuterRef("pk")))
+
+
+class _CatalogMixin(ShowcaseErrorMixin):
+    def get_company(self) -> Company:
+        if not hasattr(self, "_company"):
+            self._company = resolve_public_company(self.kwargs.get("slug"), self.request)
+        return self._company
+
+    def get_catalog(self):
+        if not hasattr(self, "_catalog"):
+            self._catalog = showcase_svc.get_public_catalog(self.get_company(), self.request.query_params.get("preview"))
+        return self._catalog
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        catalog = self.get_catalog()
+        ctx["new_badge_days"] = catalog.new_badge_days
+        ctx["showcase_company"] = self.get_company()
+        return ctx
+
+
+class PublicCompanyShowcaseAPIView(_CatalogMixin, generics.ListAPIView):
     permission_classes = [AllowAny]
-    serializer_class = PublicProductSerializer
+    serializer_class = PublicProductListSerializer
     pagination_class = ShowcasePagination
 
     filter_backends = [DjangoFilterBackend, SearchFilter, ShowcaseOrderingFilter]
@@ -97,15 +165,9 @@ class PublicCompanyShowcaseAPIView(generics.ListAPIView):
     ordering = ["-created_at", "id"]
 
 
-    def get_company(self) -> Company:
-        slug = self.kwargs.get("slug")
-        try:
-            return Company.objects.get(slug=slug)
-        except Company.DoesNotExist:
-            raise NotFound("Компания не найдена")
-
     def get_queryset(self):
         company = self.get_company()
+        catalog = self.get_catalog()
 
         # Аннотация final_price:
         # Если discount_percent > 0: price * (1 - discount_percent/100)
@@ -135,7 +197,10 @@ class PublicCompanyShowcaseAPIView(generics.ListAPIView):
             Product.objects
             .filter(company=company)  # ✅ без status фильтра
             .select_related("brand", "category")
-            .prefetch_related("images", "packages", "characteristics")
+            .prefetch_related(
+                "images", "packages", "characteristics", "promotion_tiers",
+                Prefetch("variants", queryset=ProductVariant.objects.filter(is_active=True)),
+            )
             .annotate(
                 final_price=final_price_expr,
                 clean_discount_percent=clean_discount_expr,
@@ -147,76 +212,47 @@ class PublicCompanyShowcaseAPIView(generics.ListAPIView):
         if branch_id:
             qs = qs.filter(Q(branch_id=branch_id) | Q(branch__isnull=True))
 
-        design = getattr(company, "showcase_design", None)
-        if design and design.published:
-            layout = design.published.get("layout") or {}
-            hidden_products = [str(x) for x in layout.get("hidden_products", []) if x]
-            if hidden_products:
-                qs = qs.exclude(id__in=hidden_products)
-            hidden_categories = [str(x) for x in layout.get("hidden_categories", []) if x]
-            if hidden_categories:
-                qs = qs.exclude(category_id__in=hidden_categories)
+        # Видимость и порядок витрины (ТЗ-BE-2026-05, п. 6.4/6.5/6.13): только опубликованное состояние.
+        qs = showcase_svc.apply_catalog_visibility(qs, catalog)
+        qs = annotate_showcase_settings(qs, company, catalog)
+        if catalog.hide_zero_price:
+            qs = qs.filter(price__gt=0)
+        if catalog.hide_out_of_stock:
+            qs = qs.exclude(kind=Product.Kind.PRODUCT, quantity__lte=0)
 
-            # Если явная сортировка в запросе не передана, применяем настройки витрины
-            if not self.request.query_params.get("ordering"):
-                ordering_clauses = []
-                pinned_products = [str(x) for x in layout.get("pinned_products", []) if x]
-                if pinned_products:
-                    ordering_clauses.append(
-                        Case(
-                            When(id__in=pinned_products, then=Value(0)),
-                            default=Value(1),
-                        )
-                    )
-
-                default_sort = layout.get("default_sort", "new")
-                if default_sort == "price_asc":
-                    ordering_clauses.append(F("final_price").asc(nulls_last=True))
-                elif default_sort == "price_desc":
-                    ordering_clauses.append(F("final_price").desc(nulls_last=True))
-                elif default_sort == "manual":
-                    product_order = [str(x) for x in layout.get("product_order", []) if x]
-                    if product_order:
-                        cases = [When(id=pid, then=Value(i)) for i, pid in enumerate(product_order)]
-                        ordering_clauses.append(
-                            Case(*cases, default=Value(len(product_order) + 100))
-                        )
-
-                ordering_clauses.extend([F("created_at").desc(), F("id").asc()])
-                qs = qs.order_by(*ordering_clauses)
-
+        on_sale = _bool_qp(self.request, "on_sale")
+        if on_sale is True:
+            qs = qs.filter(on_sale_q())
+        elif on_sale is False:
+            qs = qs.exclude(on_sale_q())
+        is_new = _bool_qp(self.request, "is_new")
+        if is_new is not None:
+            border = timezone.now() - timedelta(days=catalog.new_badge_days or 0)
+            qs = qs.filter(created_at__gte=border) if is_new else qs.exclude(created_at__gte=border)
+        pinned = _bool_qp(self.request, "pinned")
+        if pinned is True:
+            qs = qs.filter(sc_pinned=True)
         return qs
 
 
 
-class PublicCompanyProductDetailAPIView(generics.RetrieveAPIView):
+class PublicCompanyProductDetailAPIView(_CatalogMixin, generics.RetrieveAPIView):
     permission_classes = [AllowAny]
     serializer_class = PublicProductSerializer
     lookup_url_kwarg = "product_id"
 
-    def get_company(self) -> Company:
-        slug = self.kwargs.get("slug")
-        try:
-            return Company.objects.get(slug=slug)
-        except Company.DoesNotExist:
-            raise NotFound("Компания не найдена")
-
     def get_queryset(self):
         company = self.get_company()
+        catalog = self.get_catalog()
         qs = (
             Product.objects
             .filter(company=company)  # ✅ без status фильтра
             .select_related("brand", "category")
-            .prefetch_related("images", "packages", "characteristics")
+            .prefetch_related(
+                "images", "packages", "characteristics", "promotion_tiers",
+                Prefetch("variants", queryset=ProductVariant.objects.filter(is_active=True)),
+            )
         )
-        design = getattr(company, "showcase_design", None)
-        if design and design.published:
-            layout = design.published.get("layout") or {}
-            hidden_products = [str(x) for x in layout.get("hidden_products", []) if x]
-            if hidden_products:
-                qs = qs.exclude(id__in=hidden_products)
-            hidden_categories = [str(x) for x in layout.get("hidden_categories", []) if x]
-            if hidden_categories:
-                qs = qs.exclude(category_id__in=hidden_categories)
-        return qs
+        qs = showcase_svc.apply_catalog_visibility(qs, catalog)
+        return annotate_showcase_settings(qs, company, catalog)
 

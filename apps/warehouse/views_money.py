@@ -41,6 +41,28 @@ def _cash_registers_visible_qs(view):
     return qs
 
 
+def _hidden_partner_register_ids(view, register_ids):
+    """
+    stock-partnership §7.14 (D8): сальдо и обороты кассы партнёра видны, только если партнёр
+    разрешил забирать у него без подтверждения. → id чужих касс, чьи суммы надо скрыть.
+    """
+    company = view._company()
+    if company is None:
+        return set()
+    foreign = dict(
+        models.CashRegister.objects.filter(id__in=register_ids).exclude(company=company).values_list("id", "company_id")
+    )
+    hidden = set()
+    allowed_cache = {}
+    for rid, cid in foreign.items():
+        if cid not in allowed_cache:
+            p = models.get_stock_partnership(company.id, cid)
+            allowed_cache[cid] = bool(p and p.allows_direct_pull_from(cid))
+        if not allowed_cache[cid]:
+            hidden.add(rid)
+    return hidden
+
+
 class MoneyDocumentFilter(django_filters.FilterSet):
     """Параметр ?agent= — агент контрагента (у MoneyDocument нет поля agent)."""
 
@@ -67,7 +89,33 @@ class CashRegisterListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
     search_fields = ["name", "location"]
 
     def get_queryset(self):
-        return _cash_registers_visible_qs(self).order_by("name")
+        qs = _cash_registers_visible_qs(self).order_by("name")
+        wh_raw = (self.request.query_params.get("for_warehouse") or "").strip()
+        if wh_raw:
+            qs = self._for_warehouse(qs, wh_raw)
+        return qs
+
+    def _for_warehouse(self, qs, wh_raw):
+        """
+        ?for_warehouse=<uuid> — кассы, которые подойдут для денег документа этого склада
+        (как при проведении: кассы филиала склада, иначе кассы компании без филиала).
+        Пустой список — фронт заранее предупреждает «Создайте кассу».
+        """
+        import uuid as _uuid
+
+        try:
+            wh_id = _uuid.UUID(wh_raw)
+        except ValueError:
+            raise ValidationError({"for_warehouse": "Неверный UUID."})
+        wh = self._filter_qs_company_branch(models.Warehouse.objects.all()).filter(id=wh_id).first()
+        if wh is None:
+            raise ValidationError({"for_warehouse": "Склад не найден или недоступен."})
+        qs = qs.filter(company_id=wh.company_id)
+        if wh.branch_id is not None:
+            branch_qs = qs.filter(branch_id=wh.branch_id)
+            if branch_qs.exists():
+                return branch_qs
+        return qs.filter(branch__isnull=True)
 
     def perform_create(self, serializer):
         company = self._company()
@@ -81,6 +129,8 @@ class CashRegisterListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
         response = super().list(request, *args, **kwargs)
         qs = self.filter_queryset(self.get_queryset())
         register_ids = list(qs.values_list("pk", flat=True))
+        hidden = _hidden_partner_register_ids(self, register_ids)
+        register_ids = [rid for rid in register_ids if rid not in hidden]
         if register_ids:
             agg = models.MoneyDocument.objects.filter(
                 cash_register_id__in=register_ids,
@@ -140,6 +190,10 @@ class CashRegisterOperationsView(CompanyBranchRestrictedMixin, generics.Retrieve
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
+        if instance.id in _hidden_partner_register_ids(self, [instance.id]):
+            data = serializers_money.CashRegisterSerializer(instance).data
+            data.update({"balance": None, "receipts": [], "expenses": [], "receipts_total": None, "expenses_total": None})
+            return Response(data)
         docs = list(
             models.MoneyDocument.objects.filter(
                 cash_register=instance,

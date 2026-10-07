@@ -382,3 +382,46 @@ def _notify_shift(shift, *, actor=None, opened: bool) -> None:
         )
     except Exception:
         logger.error("_notify_shift failed for shift=%s", getattr(shift, "id", None), exc_info=True)
+
+
+def notify_debt_overdue(installment) -> None:
+    """Уведомление о просрочке взноса (market.debt.overdue)."""
+    try:
+        deal = installment.deal
+        company = deal.company
+        branch = deal.branch
+        recipients = owner_like_users(company)
+        if not recipients:
+            return
+
+        client_name = deal.client.full_name if deal.client else "Клиент"
+        overdue_amt = installment.remaining_for_period
+        days = installment.overdue_days
+
+        publish_event(
+            company=company,
+            branch=branch,
+            recipients=recipients,
+            event_type=DEBT_OVERDUE,
+            title="Просрочен платёж по долгу",
+            message=f"{client_name}: взнос №{installment.number} просрочен на {days} дн. (остаток {fmt_money(overdue_amt)} сом)",
+            level="warning",
+            url=f"/crm/clients/{deal.client_id}" if deal.client_id else "/crm/debts",
+            cta_label="Открыть долг",
+            source_kind="deal_installment",
+            source_id=f"installment:{installment.id}",
+            meta={
+                "deal_id": str(deal.id),
+                "installment_id": str(installment.id),
+                "installment_number": installment.number,
+                "due_date": str(installment.due_date),
+                "promised_date": str(installment.promised_date) if installment.promised_date else None,
+                "overdue_days": days,
+                "overdue_amount": f"{overdue_amt:.2f}",
+                "client_id": str(deal.client_id) if deal.client_id else None,
+                "client_name": client_name,
+            },
+        )
+    except Exception:
+        logger.error("notify_debt_overdue failed for installment=%s", getattr(installment, "id", None), exc_info=True)
+

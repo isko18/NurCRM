@@ -19,6 +19,7 @@ from apps.main.telegram_bot.tasks import (
     send_telegram_debt_reminders,
     send_telegram_notification,
 )
+from apps.main.notifications_market import notify_debt_overdue
 
 
 @shared_task
@@ -166,3 +167,36 @@ def send_tariff_notifications():
     created = check_and_create_tariff_notifications()
     logger.info("send_tariff_notifications finished: created %d notifications", len(created))
     return {"created_notifications_count": len(created)}
+
+
+@shared_task(name="apps.main.tasks.check_overdue_debts")
+def check_overdue_debts():
+    """
+    Периодический / ночной cron для проверки просроченных взносов.
+    Ищет взносы, где paid_on IS NULL, due_date < today, paid_amount < amount.
+    Если promised_date >= today, уведомление подавляется (согласно §3/Q3).
+    Отправляет событие market.debt.overdue.
+    """
+    from django.db.models import F
+    from django.utils import timezone
+    from apps.main.models import DealInstallment, ClientDeal
+
+    today = timezone.localdate()
+    qs = (
+        DealInstallment.objects
+        .filter(
+            deal__kind=ClientDeal.Kind.DEBT,
+            paid_on__isnull=True,
+            due_date__lt=today,
+            paid_amount__lt=F("amount"),
+        )
+        .select_related("deal", "deal__company", "deal__branch", "deal__client")
+    )
+    sent_count = 0
+    for inst in qs:
+        # Если клиент обещал оплатить к дате >= today, уведомление о просрочке пока не шлём
+        if inst.promised_date and inst.promised_date >= today:
+            continue
+        notify_debt_overdue(inst)
+        sent_count += 1
+    return {"checked_overdue_installments": sent_count}

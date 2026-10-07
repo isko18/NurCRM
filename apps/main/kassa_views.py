@@ -76,6 +76,7 @@ class QuickCheckoutItemSerializer(serializers.Serializer):
     qty = QtyField()
     price = MoneyField(required=False, allow_null=True)
     discount = MoneyField(required=False, allow_null=True, default=ZERO)
+    is_wholesale = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
         if attrs["qty"] <= 0:
@@ -124,6 +125,10 @@ class QuickCheckoutSerializer(serializers.Serializer):
     # BE2-10: продажа, сделанная без связи и досланная позже.
     offline = serializers.BooleanField(required=False, default=False)
     offline_created_at = serializers.DateTimeField(required=False, allow_null=True)
+    # ТЗ ч.12, 2.4: время продажи на кассе. Если смена к моменту отправки закрыта или неизвестна
+    # серверу — продажа идёт в смену этой кассы, открытую в это время, иначе в техническую смену дня.
+    sold_at = serializers.DateTimeField(required=False, allow_null=True)
+    cashbox = serializers.UUIDField(required=False, allow_null=True)
 
     def to_internal_value(self, data):
         items = data.get("items")
@@ -135,6 +140,10 @@ class QuickCheckoutSerializer(serializers.Serializer):
         items = attrs.get("items")
         if not items:
             raise serializers.ValidationError({"code": "empty_sale", "detail": "В чеке нет позиций"})
+        if attrs.get("sold_at") and not attrs.get("offline_created_at"):
+            attrs["offline_created_at"] = attrs["sold_at"]
+        if attrs.get("sold_at") and attrs["sold_at"] < timezone.now() - OFFLINE_CLOCK_SKEW:
+            attrs["offline"] = True
         if attrs.get("offline"):
             at = attrs.get("offline_created_at")
             if at is None:
@@ -233,6 +242,79 @@ def _resolve_offline_shift(*, company, shift_id, at):
     return shift
 
 
+TECHNICAL_SHIFT_REASON = "technical_offline"
+
+
+def _find_offline_shift(*, company, cashier, at, shift_id=None, cashbox_id=None):
+    """
+    Смена для продажи без связи (ТЗ ч.12, 2.4):
+    1) переданная кассой смена, если сервер её знает и время продажи в её пределах;
+    2) смена этого кассира (на этой кассе, если она указана), открытая в момент продажи — даже закрытая;
+    3) техническая смена дня этого кассира на этой кассе (создаётся закрытой).
+    """
+    from apps.construction.models import Cashbox
+
+    def _covers(sh):
+        start = (sh.opened_at or at) - OFFLINE_CLOCK_SKEW
+        return start <= at and (sh.closed_at is None or at <= sh.closed_at + OFFLINE_CLOCK_SKEW)
+
+    if shift_id:
+        sh = CashShift.objects.select_related("cashbox").filter(id=shift_id, company=company).first()
+        if sh is not None and _covers(sh):
+            return sh
+        if sh is not None and not cashbox_id:
+            cashbox_id = sh.cashbox_id
+
+    qs = CashShift.objects.select_related("cashbox").filter(
+        company=company, cashier=cashier, opened_at__lte=at + OFFLINE_CLOCK_SKEW
+    )
+    if cashbox_id:
+        qs = qs.filter(cashbox_id=cashbox_id)
+    for sh in qs.order_by("-opened_at")[:10]:
+        if _covers(sh):
+            return sh
+
+    cashbox = None
+    if cashbox_id:
+        cashbox = Cashbox.objects.filter(id=cashbox_id, company=company).first()
+        if cashbox is None:
+            raise ValidationError({"cashbox": "Касса не найдена."})
+    if cashbox is None:
+        last = CashShift.objects.filter(company=company, cashier=cashier).order_by("-opened_at").first()
+        cashbox = last.cashbox if last else None
+    if cashbox is None:
+        cashbox = (
+            Cashbox.objects.filter(company=company, is_active=True)
+            .order_by("created_at")
+            .first()
+        )
+    if cashbox is None:
+        raise ValidationError({"detail": "Нет кассы для продажи без связи.", "code": "no_cashbox"})
+
+    local = timezone.localtime(at)
+    day_start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1) - timedelta(microseconds=1)
+    sh = (
+        CashShift.objects.select_for_update()
+        .filter(cashbox=cashbox, cashier=cashier, close_reason=TECHNICAL_SHIFT_REASON, opened_at=day_start)
+        .first()
+    )
+    if sh is None:
+        sh = CashShift.objects.create(
+            company=company,
+            cashbox=cashbox,
+            cashier=cashier,
+            status=CashShift.Status.CLOSED,
+            closed_at=day_end,
+            close_reason=TECHNICAL_SHIFT_REASON,
+            opening_cash=ZERO,
+            closing_cash=None,
+        )
+        CashShift.objects.filter(pk=sh.pk).update(opened_at=day_start)
+        sh.opened_at = day_start
+    return sh
+
+
 def _backdate_offline_sale(sale, at):
     """
     Продажа без связи попадает в отчёты своего дня и своей смены: переносим время
@@ -285,7 +367,14 @@ class PosQuickCheckoutAPIView(APIView):
         try:
             with transaction.atomic():
                 offline_at = data.get("offline_created_at") if data.get("offline") else None
-                if data.get("shift") and offline_at:
+                if offline_at and data.get("sold_at"):
+                    shift = _find_offline_shift(
+                        company=company, cashier=user, at=offline_at,
+                        shift_id=data.get("shift"), cashbox_id=data.get("cashbox"),
+                    )
+                    if shift.cashier_id != user.id and not _is_owner_like(user):
+                        raise ValidationError({"shift": "Это не ваша смена."})
+                elif data.get("shift") and offline_at:
                     shift = _resolve_offline_shift(company=company, shift_id=data["shift"], at=offline_at)
                     if shift.cashier_id != user.id and not _is_owner_like(user):
                         raise ValidationError({"shift": "Это не ваша смена."})
@@ -414,14 +503,23 @@ class PosQuickCheckoutAPIView(APIView):
                 ).first()
                 if variant is None:
                     raise ValidationError({"items": {idx: "Вариант не найден."}})
+            else:
+                if product.variants.filter(is_active=True).exists():
+                    raise ValidationError({"items": {idx: f"Товар «{product.name}» имеет размеры/цвета. Выберите размер/цвет."}})
             default_price = _q2(variant.effective_price) if variant else _q2(default_unit_price_for_package(product, pkg))
             price = _q2(it["price"]) if it.get("price") is not None else default_price
+            wholesale_price = _q2(Decimal(str(getattr(product, "wholesale_price", None) or 0)))
+            is_wholesale = bool(
+                getattr(cart, "is_wholesale", False)
+                or it.get("is_wholesale")
+                or (wholesale_price > 0 and price == wholesale_price)
+            )
             base = money(price * qty)
             if discount > base:
                 raise ValidationError({"items": {idx: "Скидка больше суммы позиции."}})
-            if limit_discounts and discount > money(base * Decimal(str(max_dp)) / Decimal("100")):
+            if limit_discounts and not (is_wholesale and wholesale_price > 0 and price == wholesale_price) and discount > money(base * Decimal(str(max_dp)) / Decimal("100")):
                 raise ValidationError({"_discount_limit": True})
-            if discount <= 0:
+            if discount <= 0 and not (is_wholesale and wholesale_price > 0 and price == wholesale_price):
                 min_price = _q2(Decimal(str(getattr(product, "purchase_price", None) or 0)))
                 if pkg:
                     ipp = Decimal(str(pkg.quantity_in_package or 0))
@@ -443,6 +541,7 @@ class PosQuickCheckoutAPIView(APIView):
                 line_discount=discount,
                 manual_discount=discount,
                 price_manually_edited=price != default_price,
+                is_wholesale=is_wholesale,
             ).save(skip_full_clean=True)
         cart.recalc()
 
@@ -964,16 +1063,19 @@ class ClientDirectDebtAPIView(CompanyBranchRestrictedMixin, APIView):
             raise ValidationError({"amount": "Укажите сумму долга."})
         try:
             amount = money(Decimal(str(raw_amount)))
-            if amount <= 0:
-                raise ValidationError({"amount": "Сумма долга должна быть больше 0."})
         except Exception:
             raise ValidationError({"amount": "Некорректная сумма долга."})
+        if amount <= 0:
+            raise ValidationError({"amount": "Сумма долга должна быть больше 0."})
 
         comment = (request.data.get("comment") or "").strip()
         due_date_raw = request.data.get("due_date")
-        due_date = parse_date(due_date_raw) if due_date_raw else timezone.localdate()
+        due_date = parse_date(str(due_date_raw)) if due_date_raw else timezone.localdate() + timedelta(days=30)
+        if due_date is None:
+            raise ValidationError({"due_date": "Ожидается дата YYYY-MM-DD."})
 
         with transaction.atomic():
+            # ТЗ ч.12, 3.2: долг без продажи — сделка с одним взносом, без выручки
             deal = ClientDeal.objects.create(
                 company=company,
                 branch=branch or client.branch,
@@ -982,22 +1084,16 @@ class ClientDirectDebtAPIView(CompanyBranchRestrictedMixin, APIView):
                 amount=amount,
                 prepayment=Decimal("0.00"),
                 note=comment,
-                title=comment or f"Прямой долг: {amount}",
-            )
-            DealInstallment.objects.create(
-                company=company,
-                branch=branch or client.branch,
-                deal=deal,
-                order=1,
-                amount=amount,
-                due_date=due_date,
+                title=(comment or f"Долг без продажи: {amount}")[:255],
+                debt_days=1,
+                first_due_date=due_date,
             )
 
         return Response(
             {
                 "id": str(deal.id),
                 "client": str(client.id),
-                "client_name": client.name,
+                "client_name": client.full_name,
                 "amount": str(amount),
                 "prepayment": "0.00",
                 "debt_remaining": str(amount),

@@ -1216,6 +1216,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         allow_null=True,
         allow_blank=True,
     )
+    # Без default: не переданное поле не сбрасывается при PUT; при создании — default модели.
+    upsell_priority = serializers.IntegerField(required=False, min_value=0, max_value=100)
+    upsell_excluded = serializers.BooleanField(required=False)
     cashflows = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
@@ -1224,6 +1227,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "id", "company", "branch",
             "kind",
             "hotkey_group",
+            "upsell_priority",
+            "upsell_excluded",
             "code", "article",
             "name", "description", "barcode",
             "brand", "brand_name",
@@ -1816,8 +1821,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         if item_make_data is not None:
             instance.item_make.set(item_make_data)
 
-        # Products in main are company-level catalog items; keep them visible company-wide.
-        instance.branch = branch
+        # Филиал товара при редактировании не меняем: раньше здесь был сброс
+        # instance.branch = None, из-за которого товар филиала «переезжал» на главный
+        # склад и падал с IntegrityError (uq_company_main_barcode_not_empty).
 
         # ===== цены: двусторонняя логика =====
         has_purchase = "purchase_price" in validated_data
@@ -2210,6 +2216,13 @@ class DealInstallmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSer
         decimal_places=2,
         read_only=True,
     )
+    is_overdue = serializers.BooleanField(read_only=True)
+    overdue_days = serializers.IntegerField(read_only=True)
+    overdue_amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+    )
 
     class Meta:
         model = DealInstallment
@@ -2220,11 +2233,15 @@ class DealInstallmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSer
             "deal",
             "number",
             "due_date",
+            "promised_date",
             "amount",
             "balance_after",
             "paid_on",
             "paid_amount",
             "remaining_for_period",
+            "is_overdue",
+            "overdue_days",
+            "overdue_amount",
         )
         read_only_fields = fields
 
@@ -2513,6 +2530,13 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
 
 
 # ===== Inputs for pay/refund endpoints =====
+class DealInstallmentRescheduleSerializer(serializers.Serializer):
+    idempotency_key = serializers.UUIDField(required=False, allow_null=True)
+    due_date = serializers.DateField(required=False, allow_null=True)
+    promised_date = serializers.DateField(required=False, allow_null=True)
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+
 class DealPayInputSerializer(serializers.Serializer):
     installment_id = serializers.UUIDField(required=False)  # если нет — возьмём первый не полностью оплаченный
     amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
@@ -2524,6 +2548,11 @@ class DealPayInputSerializer(serializers.Serializer):
     branch_id = serializers.UUIDField(required=False, allow_null=True)
     cashbox_role = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     shift_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate_date(self, value):
+        if value and value > timezone.localdate():
+            raise serializers.ValidationError("Дата оплаты не может быть в будущем.")
+        return value
 
 
 class DealPayAnyInputSerializer(serializers.Serializer):
@@ -2537,6 +2566,11 @@ class DealPayAnyInputSerializer(serializers.Serializer):
     branch_id = serializers.UUIDField(required=False, allow_null=True)
     cashbox_role = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     shift_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate_date(self, value):
+        if value and value > timezone.localdate():
+            raise serializers.ValidationError("Дата оплаты не может быть в будущем.")
+        return value
 
 
 class DealRefundInputSerializer(serializers.Serializer):
@@ -2776,6 +2810,7 @@ class ProductListSerializer(serializers.ModelSerializer):
             "price", "wholesale_price", "purchase_price",
             "quantity", "brand", "category",
             "hotkey_group",
+            "upsell_priority", "upsell_excluded",
             "image_url", "is_favorite",
             "expiration_date",
             "shelf_life_days",
@@ -4280,6 +4315,7 @@ class MarketSaleEmployeePayProfileSerializer(CompanyBranchReadOnlyMixin, seriali
             "pay_scheme",
             "monthly_base_salary",
             "sales_percent",
+            "per_item_amount",
         ]
         read_only_fields = ["id", "company"]
 
@@ -4318,6 +4354,20 @@ class MarketSaleEmployeePayProfileSerializer(CompanyBranchReadOnlyMixin, seriali
                 raise serializers.ValidationError(
                     "Для схемы «Оклад + процент» задайте и оклад, и процент больше 0."
                 )
+        # ТЗ ч.13, 3: схемы «за проданный товар»
+        per_item = data.get("per_item_amount")
+        if per_item is None and self.instance:
+            per_item = self.instance.per_item_amount
+        per_item = per_item or Decimal("0")
+        PS = MarketSaleEmployeePayProfile.PayScheme
+        if scheme in (PS.PER_ITEM, PS.SALARY_PLUS_PER_ITEM, PS.PERCENT_PLUS_PER_ITEM) and per_item <= 0:
+            raise serializers.ValidationError(
+                {"per_item_amount": "Для этой схемы укажите сумму за проданный товар больше 0."}
+            )
+        if scheme == PS.SALARY_PLUS_PER_ITEM and base <= 0:
+            raise serializers.ValidationError({"monthly_base_salary": "Укажите оклад больше 0."})
+        if scheme == PS.PERCENT_PLUS_PER_ITEM and pct <= 0:
+            raise serializers.ValidationError({"sales_percent": "Укажите процент больше 0."})
         return data
 
 

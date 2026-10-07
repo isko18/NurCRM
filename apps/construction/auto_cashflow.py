@@ -581,7 +581,37 @@ def handle_cashflow_reject(cashflow: CashFlow, user=None):
 
     elif source_kind in (CashFlow.SourceKind.DEBT_REPAYMENT, CashFlow.SourceKind.SUPPLIER_DEBT_PAYMENT):
         from apps.main.models import ClientDeal, DealPayment, Debt, DebtPayment
-        if source_id:
+        key = cashflow.idempotency_key or ""
+        if key.startswith("deal-pay:"):
+            pay = DealPayment.objects.filter(company=company, id=key.split(":", 1)[1]).first()
+            if pay:
+                inst = pay.installment
+                if inst:
+                    new_paid = max(Decimal("0.00"), (inst.paid_amount or Decimal("0.00")) - pay.amount)
+                    inst.paid_amount = new_paid
+                    if new_paid < inst.amount:
+                        inst.paid_on = None
+                    inst.save(update_fields=["paid_amount", "paid_on"])
+                pay.delete()
+        elif key.startswith("sale-pay-debt:") and source_id:
+            # pos/sales/{id}/pay-debt/: один приход гасил несколько взносов сделки
+            from uuid import UUID, uuid5
+            from apps.main.models import DealInstallment
+            base = UUID(key.split(":", 1)[1])
+            inst_ids = list(DealInstallment.objects.filter(deal_id=source_id).values_list("id", flat=True))
+            keys = [uuid5(base, str(i)) for i in inst_ids]
+            for pay in DealPayment.objects.filter(deal_id=source_id, idempotency_key__in=keys).select_related("installment"):
+                inst = pay.installment
+                if inst:
+                    new_paid = max(Decimal("0.00"), (inst.paid_amount or Decimal("0.00")) - pay.amount)
+                    inst.paid_amount = new_paid
+                    if new_paid < inst.amount:
+                        inst.paid_on = None
+                    inst.save(update_fields=["paid_amount", "paid_on"])
+                pay.delete()
+        elif key.startswith("debt-pay:"):
+            DebtPayment.objects.filter(company=company, id=key.split(":", 1)[1]).delete()
+        elif source_id:
             deal = ClientDeal.objects.filter(company=company, id=source_id).first()
             if deal:
                 pay = (

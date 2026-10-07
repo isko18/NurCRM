@@ -1022,3 +1022,104 @@ class UserUiPreferences(models.Model):
 
     def __str__(self):
         return f"UiPreferences ({self.user_id})"
+
+
+# ---------------------------------------------------------------------------
+# ТЗ ч.13, 1: настройки программ (касса, программа владельца) на сервере
+# ---------------------------------------------------------------------------
+
+class UserAppSettings(models.Model):
+    """Личные настройки пользователя для программы app (nurmarket-kassa, nurmarket-owner, …)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey("users.User", on_delete=models.CASCADE, related_name="app_settings")
+    app = models.CharField("Программа", max_length=64)
+    settings = models.JSONField("Настройки", default=dict, blank=True)
+    secrets = models.JSONField("Секреты (зашифрованы)", default=dict, blank=True)
+    version = models.PositiveIntegerField("Версия", default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Настройки программы пользователя"
+        verbose_name_plural = "Настройки программ пользователей"
+        constraints = [
+            models.UniqueConstraint(fields=["user", "app"], name="uniq_user_app_settings"),
+        ]
+
+    def __str__(self):
+        return f"{self.app} ({self.user_id})"
+
+
+class CompanyAppSettings(models.Model):
+    """Общие настройки программы app для компании (branch пусто) или филиала."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="app_settings")
+    branch = models.ForeignKey(
+        "users.Branch", on_delete=models.CASCADE, null=True, blank=True, related_name="app_settings"
+    )
+    app = models.CharField("Программа", max_length=64)
+    settings = models.JSONField("Настройки", default=dict, blank=True)
+    secrets = models.JSONField("Секреты (зашифрованы)", default=dict, blank=True)
+    version = models.PositiveIntegerField("Версия", default=0)
+    updated_by = models.ForeignKey(
+        "users.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Настройки программы компании"
+        verbose_name_plural = "Настройки программ компаний"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "app"], condition=Q(branch__isnull=True), name="uniq_company_app_settings"
+            ),
+            models.UniqueConstraint(
+                fields=["company", "branch", "app"], condition=Q(branch__isnull=False),
+                name="uniq_company_branch_app_settings",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.app} ({self.company_id}{'/' + str(self.branch_id) if self.branch_id else ''})"
+
+
+# ---------------------------------------------------------------------------
+# ТЗ ч.13, 2: купленные функции — ключи активации
+# ---------------------------------------------------------------------------
+
+def _new_activation_key():
+    import secrets as _s
+    raw = _s.token_hex(8).upper()
+    return "-".join(raw[i:i + 4] for i in range(0, 16, 4))
+
+
+class FeatureActivationKey(models.Model):
+    """
+    Ключ, который владелец вводит на кассе: включает функцию (code) компании на days дней
+    (пусто — бессрочно). Ключ одноразовый — запоминается, какая компания его использовала.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    key = models.CharField("Ключ", max_length=64, unique=True, default=_new_activation_key)
+    code = models.SlugField("Код функции", max_length=64,
+                            help_text="ai, clients, sales_analytics, restock, salary, debts, service, …")
+    days = models.PositiveIntegerField("Дней", null=True, blank=True, help_text="Пусто — бессрочно")
+    note = models.CharField(max_length=255, blank=True, default="")
+    used_by_company = models.ForeignKey(
+        Company, on_delete=models.SET_NULL, null=True, blank=True, related_name="used_activation_keys"
+    )
+    used_by_user = models.ForeignKey(
+        "users.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Ключ активации функции"
+        verbose_name_plural = "Ключи активации функций"
+
+    def __str__(self):
+        return f"{self.key} → {self.code}"

@@ -86,6 +86,8 @@ class TelegramBotTestCase(TestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         data = resp.data
         self.assertEqual(data["mode"], "server")
+        self.assertTrue(data["ai_enabled"])
+        self.assertEqual(data["ai_source"], "shared")
         self.assertFalse(data["token_set"])
         self.assertFalse(data["ai_key_set"])
         self.assertNotIn("token", data)
@@ -132,6 +134,16 @@ class TelegramBotTestCase(TestCase):
         resp = self.client.patch(url, {"token": "bad_token"}, format="json")
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("token", resp.data)
+
+    @patch("apps.main.telegram_bot.services.ai_service.generate_chat_response")
+    def test_ai_empty_response_is_rejected(self, mock_generate):
+        """Пустой ответ Gemini не должен считаться успешным ответом покупателю."""
+        mock_generate.return_value = ("", "gemini-2.5-flash")
+
+        res = __import__("apps.main.telegram_bot.services.ai_service", fromlist=["test_ai"]).test_ai("test-key")
+
+        self.assertFalse(res["ok"])
+        self.assertIn("пуст", res["error"].lower())
 
     def test_detect_owner_chat(self):
         """POST /api/main/telegram-bot/detect-owner-chat/ сохраняет последний чат с /start."""

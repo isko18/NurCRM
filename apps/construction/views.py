@@ -314,14 +314,19 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
                     .annotate(
                         income=Sum(
                             "amount",
-                            filter=Q(type=CashFlow.Type.INCOME) & ~Q(
+                            # Только движения ящика смены (как CashShift._live_totals):
+                            # безнал (например, залог переводом) в ожидаемые наличные не входит.
+                            filter=Q(type=CashFlow.Type.INCOME) & Q(affects_shift_drawer=True) & ~Q(
                                 source_kind__in=[
                                     CashFlow.SourceKind.POS_SALE,
                                     CashFlow.SourceKind.POS_PREPAYMENT,
                                 ]
                             ),
                         ),
-                        expense=Sum("amount", filter=Q(type=CashFlow.Type.EXPENSE)),
+                        expense=Sum(
+                            "amount",
+                            filter=Q(type=CashFlow.Type.EXPENSE) & Q(affects_shift_drawer=True),
+                        ),
                     )
                 )
                 sf_map = {r["shift_id"]: r for r in shift_flows}

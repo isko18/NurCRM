@@ -17,6 +17,8 @@ from django.db.models import (
     DecimalField,
     ExpressionWrapper,
     IntegerField,
+    Case,
+    When,
 )
 from django.db.models.functions import TruncDate, ExtractHour, ExtractWeekDay, Coalesce
 from django.utils import timezone
@@ -62,6 +64,49 @@ def _qty_str(x) -> str:
         return str(Decimal(str(x or 0)).quantize(Decimal("0.001")))
     except Exception:
         return "0.000"
+
+
+def _dedupe_cashflow_raw_duplicates(qs, *, canonical_kinds, legacy_kinds=()):
+    """
+    Removes raw/legacy duplicate cashflow rows that point to the same business source,
+    while leaving the canonical record in place.
+
+    Examples:
+    - canonical: source_kind='pos_sale', source_id='sale-42'
+    - duplicate raw: source_kind=None, source_cashbox_flow_id='sale-42'
+    - legacy duplicate: source_kind='sale', source_id='sale-42'
+    """
+    rows = list(qs.values("id", "source_kind", "source_id", "source_cashbox_flow_id"))
+    if not rows:
+        return qs
+
+    by_id = {row["id"]: row for row in rows}
+    key_to_ids = defaultdict(list)
+    for row in rows:
+        for field_name in ("source_id", "source_cashbox_flow_id"):
+            key = (row.get(field_name) or "").strip()
+            if key:
+                key_to_ids[key].append(row["id"])
+
+    drop_ids = set()
+    for ids in key_to_ids.values():
+        if len(ids) <= 1:
+            continue
+        preferred_id = None
+        for row_id in ids:
+            row = by_id.get(row_id)
+            if row and row.get("source_kind") in canonical_kinds:
+                preferred_id = row_id
+                break
+        if preferred_id is None:
+            preferred_id = ids[0]
+        for row_id in ids:
+            if row_id != preferred_id:
+                drop_ids.add(row_id)
+
+    if not drop_ids:
+        return qs
+    return qs.exclude(id__in=drop_ids)
 
 
 def _format_shift_dt(dt) -> str | None:
@@ -259,7 +304,10 @@ class Period:
     end: datetime  # exclusive
 
 
-def _get_period(request) -> Period:
+def _get_period(request, *, strict: bool = False) -> Period:
+    """
+    strict=True (ТЗ ч.12, 2.7): даты наоборот → 400, период никогда не подменяется молча.
+    """
     tz = timezone.get_current_timezone()
     now = timezone.now().astimezone(tz)
 
@@ -271,6 +319,13 @@ def _get_period(request) -> Period:
     raw_to = qp.get("date_to") or qp.get("period_end")
 
     start, end = _parse_bounds(raw_from, raw_to, param_hint="period")
+
+    if strict and start and end:
+        if start >= end:
+            raise ValidationError({
+                "detail": "Дата начала позже даты конца периода.", "code": "bad_period",
+            })
+        return Period(start=start, end=end)
 
     if start and end:
         user = getattr(request, "user", None)
@@ -1093,10 +1148,20 @@ class AnalyticsView(APIView):
                 )
                 returns_count = returns_agg["count"] or 0
                 returns_amount = returns_agg["amount"] or Z_MONEY
+                partial_returns_amount = (
+                    returns_qs.filter(is_full=False).aggregate(
+                        amount=Coalesce(
+                            Sum("returned_amount"),
+                            Value(Z_MONEY, output_field=MONEY_FIELD),
+                            output_field=MONEY_FIELD,
+                        )
+                    )["amount"]
+                    or Z_MONEY
+                )
             except Exception:
                 # Аналитика остаётся доступна в старых инсталляциях без модели
                 # возврата; в актуальной схеме этот блок всегда отрабатывает.
-                pass
+                partial_returns_amount = Z_MONEY
 
         avg_check = _safe_div(_money(revenue), tx)
 
@@ -1117,10 +1182,10 @@ class AnalyticsView(APIView):
             "cards": {
                 "revenue": str(_money(revenue)),
                 "gross_revenue": str(_money(revenue)),
-                "revenue_before_returns": str(_money(revenue)),
+                "revenue_before_returns": str(_money(Decimal(revenue) + Decimal(partial_returns_amount))),
                 "returns_total": str(_money(returns_amount)),
                 "returns_count": returns_count,
-                "net_revenue": str(_money(Decimal(revenue) - Decimal(returns_amount))),
+                "net_revenue": str(_money(revenue)),
                 "transactions": tx,
                 "avg_check": str(_money(avg_check)),
                 "clients": clients,
@@ -2278,6 +2343,24 @@ class AnalyticsView(APIView):
             # При фильтре по поставщику не смешиваем с «призраками» без product.client
             if _model_has_field(SaleItem, "name_snapshot") and supplier_ids is None:
                 ghost_base = SaleItem.objects.filter(sale__in=sqs, product__isnull=True)
+                # AN-10: авто-связка непривязанных строк чеков с товарами компании по barcode_snapshot
+                unlinked = list(ghost_base.filter(barcode_snapshot__isnull=False)[:300])
+                if unlinked:
+                    barcodes = [it.barcode_snapshot for it in unlinked if it.barcode_snapshot]
+                    bc_map = {
+                        p.barcode: p
+                        for p in Product.objects.filter(company=company, barcode__in=barcodes).exclude(status=Product.Status.ARCHIVED)
+                    }
+                    to_update = []
+                    for it in unlinked:
+                        p = bc_map.get(it.barcode_snapshot)
+                        if p:
+                            it.product = p
+                            to_update.append(it)
+                    if to_update:
+                        SaleItem.objects.bulk_update(to_update, ["product"])
+                        ghost_base = SaleItem.objects.filter(sale__in=sqs, product__isnull=True)
+
                 sales_without_product_line_count = int(ghost_base.count() or 0)
                 gvals = ("name_snapshot", "barcode_snapshot")
                 ghost_rev = _sale_item_net_line_revenue_expr(SaleItem)
@@ -2344,8 +2427,17 @@ class AnalyticsView(APIView):
                 inv_expr = ExpressionWrapper(F(qty_field) * F(pp_field), output_field=MONEY_FIELD)
                 stock_value = pqs.aggregate(v=Coalesce(Sum(inv_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["v"] or Z_MONEY
                 
-                # Товары с низким остатком - ВСЕ 71 товар! (или сколько их есть)
-                low_stock_qs = pqs.filter(**{f"{qty_field}__lte": 5}).order_by(qty_field)
+                # Товары с низким остатком (AN-09): синхронно с правилом minimum_quantity / low_stock_rule
+                min_field = None
+                for f in ("min_quantity", "min_stock", "reorder_level", "minimum_quantity"):
+                    if _model_has_field(Product, f):
+                        min_field = f
+                        break
+
+                if min_field:
+                    low_stock_qs = pqs.filter(**{f"{qty_field}__lte": F(min_field)}).order_by(qty_field)
+                else:
+                    low_stock_qs = pqs.filter(**{f"{qty_field}__lte": 5}).order_by(qty_field)
                 low_stock_count = low_stock_qs.count()
                 
                 # Применяем лимит только если он задан
@@ -2463,6 +2555,7 @@ class AnalyticsView(APIView):
             "cards": {
                 "stock_value": str(_money(stock_value)),
                 "low_stock_count": low_stock_count,
+                "low_stock_rule": "current_stock <= minimum_stock (default 5)",
                 "catalog_products_count": catalog_products_count,
                 "sales_lines_missing_product_count": sales_without_product_line_count,
                 "rejected_products_count": rejected_products_count,
@@ -3136,17 +3229,18 @@ class AnalyticsView(APIView):
             cfqs = cfqs.filter(Q(branch=branch) | Q(branch__isnull=True))
         cfqs = cfqs.filter(created_at__gte=period.start, created_at__lt=period.end)
 
-        # Исключаем дублирующие записи расходов по оприходованию склада,
-        # когда на одну закупку создана и warehouse_purchase, и сырая запись с source_cashbox_flow_id
-        dup_pids = set(
-            cfqs.filter(source_kind="warehouse_purchase", source_id__isnull=False)
-            .values_list("source_id", flat=True)
+        # Исключаем дублирующие сырые записи, которые указывают на тот же business source,
+        # но были созданы из другого кассового потока / legacy source_kind.
+        cfqs = _dedupe_cashflow_raw_duplicates(
+            cfqs,
+            canonical_kinds=("warehouse_purchase",),
+            legacy_kinds=(),
         )
-        if dup_pids:
-            cfqs = cfqs.exclude(
-                source_kind__isnull=True,
-                source_cashbox_flow_id__in=dup_pids,
-            )
+        cfqs = _dedupe_cashflow_raw_duplicates(
+            cfqs,
+            canonical_kinds=("pos_sale", "pos_prepayment"),
+            legacy_kinds=("sale",),
+        )
 
         income_total = (
             cfqs.filter(type=CashFlow.Type.INCOME)
@@ -3340,6 +3434,46 @@ class AnalyticsView(APIView):
             ):
                 performer_rows[r["performer_id"]] = r
         performer_user_ids = set(performer_rows)
+
+        # ТЗ ч.13, 3: проданные единицы для «за проданный товар». Чеки — как у процента (кассир пробил,
+        # без комиссии консультанта), включая частично возвращённые: возврат уже уменьшил quantity строки,
+        # полностью возвращённая строка удалена. Весовой товар — 1 за строку.
+        partial_ret_value = _choice_value(Sale, "Status", "PARTIALLY_RETURNED", "partially_returned")
+        units_by_user = {}
+        if _sale_item is not None:
+            unit_sales = _apply_sale_branch(
+                Sale.objects.filter(
+                    company=company,
+                    status__in=(paid_value, partial_ret_value),
+                    **{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end},
+                )
+            ).filter(
+                Q(consultant__isnull=True)
+                | Q(consultant_commission_enabled=False)
+                | Q(consultant_commission_amount=Decimal("0.00"))
+                | Q(consultant_commission_amount__isnull=True)
+            )
+            qty_f = DecimalField(max_digits=18, decimal_places=3)
+            for r in (
+                _sale_item.objects.filter(sale__in=unit_sales.values("id"), quantity__gt=0)
+                .values("sale__user_id")
+                .annotate(
+                    units=Coalesce(
+                        Sum(
+                            Case(
+                                When(product__is_weight=True, then=Value(Decimal("1"), output_field=qty_f)),
+                                default=F("quantity"),
+                                output_field=qty_f,
+                            )
+                        ),
+                        Value(Decimal("0"), output_field=qty_f),
+                        output_field=qty_f,
+                    )
+                )
+            ):
+                if r["sale__user_id"]:
+                    units_by_user[r["sale__user_id"]] = r["units"] or Decimal("0")
+
         profile_user_ids = set(effective_profiles.keys())
         all_user_ids = list(profile_user_ids | cashier_user_ids | consultant_user_ids | performer_user_ids)
         payroll_user_ids = all_user_ids
@@ -3393,8 +3527,9 @@ class AnalyticsView(APIView):
 
             base_part = ((monthly_base_salary or Z_MONEY) * Decimal(days) / Decimal("30")).quantize(Decimal("0.01"))
 
+            PS = MarketSaleEmployeePayProfile.PayScheme
             pct = (sales_percent or Z_MONEY) / Decimal("100")
-            if pay_scheme in (MarketSaleEmployeePayProfile.PayScheme.PERCENT, MarketSaleEmployeePayProfile.PayScheme.SALARY_PLUS_PERCENT):
+            if pay_scheme in (PS.PERCENT, PS.SALARY_PLUS_PERCENT, PS.PERCENT_PLUS_PER_ITEM):
                 cashier_bonus = (employee_sales_period * pct).quantize(Decimal("0.01"))
             else:
                 cashier_bonus = Z_MONEY
@@ -3403,12 +3538,15 @@ class AnalyticsView(APIView):
             performer_services_count = int((performer_rows.get(uid) or {}).get("cnt") or 0)
             percent_bonus = (cashier_bonus + consultant_commission_period + performer_commission_period).quantize(Decimal("0.01"))
 
-            if pay_scheme == MarketSaleEmployeePayProfile.PayScheme.SALARY:
-                total_pay = (base_part + consultant_commission_period + performer_commission_period).quantize(Decimal("0.01"))
-            elif pay_scheme == MarketSaleEmployeePayProfile.PayScheme.PERCENT:
-                total_pay = percent_bonus
-            else:
-                total_pay = (base_part + percent_bonus).quantize(Decimal("0.01"))
+            # ТЗ ч.13, 3: за каждый проданный товар — к любой схеме, если сумма > 0
+            per_item_amount = (prof.per_item_amount if prof else Z_MONEY) or Z_MONEY
+            items_sold_period = units_by_user.get(uid, Decimal("0"))
+            per_item_bonus = (
+                (items_sold_period * per_item_amount).quantize(Decimal("0.01")) if per_item_amount > 0 else Z_MONEY
+            )
+
+            has_base = pay_scheme in (PS.SALARY, PS.SALARY_PLUS_PERCENT, PS.SALARY_PLUS_PER_ITEM)
+            total_pay = ((base_part if has_base else Z_MONEY) + percent_bonus + per_item_bonus).quantize(Decimal("0.01"))
 
             rows.append(
                 {
@@ -3426,6 +3564,9 @@ class AnalyticsView(APIView):
                     "consultant_commission_period": str(_money(consultant_commission_period)),
                     "employee_sales_period": str(_money(employee_sales_period)),
                     "percent_bonus": str(_money(percent_bonus)),
+                    "per_item_amount": str(_money(per_item_amount)),
+                    "items_sold_period": (f"{items_sold_period:f}".rstrip("0").rstrip(".") if "." in f"{items_sold_period:f}" else f"{items_sold_period:f}"),
+                    "per_item_bonus": str(_money(per_item_bonus)),
                     "total": str(_money(total_pay)),
                     "sales_count": cashier_sales_count,
                     "cashier_sales_count": cashier_sales_count,
@@ -3440,9 +3581,11 @@ class AnalyticsView(APIView):
         total_payroll = Z_MONEY
         total_base_prorated = Z_MONEY
         total_percent_bonus = Z_MONEY
+        total_per_item_bonus = Z_MONEY
         total_staff_sales = Z_MONEY
         total_sales_count = 0
         for r in rows:
+            total_per_item_bonus += Decimal(r["per_item_bonus"])
             total_payroll += Decimal(r["total"])
             total_base_prorated += Decimal(r["base_prorated"])
             total_percent_bonus += Decimal(r["percent_bonus"])
@@ -3548,6 +3691,7 @@ class AnalyticsView(APIView):
                 "total_payroll": str(total_payroll),
                 "total_base_prorated": str(total_base_prorated),
                 "total_percent_bonus": str(total_percent_bonus),
+                "total_per_item_bonus": str(_money(total_per_item_bonus)),
                 "total_employee_sales": str(total_staff_sales),
                 "sales_count": total_sales_count,
                 "avg_payroll_per_employee": str(_money(avg_per_employee)),
@@ -3683,13 +3827,26 @@ class AnalyticsView(APIView):
         )
         if branch is not None:
             cf_in = cf_in.filter(Q(branch=branch) | Q(branch__isnull=True))
+
+        cf_in = _dedupe_cashflow_raw_duplicates(
+            cf_in,
+            canonical_kinds=("pos_sale", "pos_prepayment"),
+            legacy_kinds=("sale",),
+        )
+        cf_in = _dedupe_cashflow_raw_duplicates(
+            cf_in,
+            canonical_kinds=("debt_repayment",),
+            legacy_kinds=("debt_payment",),
+        )
+
         dups_in = (
             cf_in.values("source_kind", "source_id", "amount")
             .annotate(cnt=Count("id"))
             .filter(cnt__gt=1, source_id__isnull=False)
             .count()
         )
-        c6_ok = dups_in == 0
+        total_dups_in = dups_in
+        c6_ok = total_dups_in == 0
 
         # 7. Финансовый расход = уникальные выплаты
         cf_out = CashFlow.objects.filter(
@@ -3701,11 +3858,11 @@ class AnalyticsView(APIView):
         )
         if branch is not None:
             cf_out = cf_out.filter(Q(branch=branch) | Q(branch__isnull=True))
-        dup_pids = set(
-            cf_out.filter(source_kind="warehouse_purchase", source_id__isnull=False)
-            .values_list("source_id", flat=True)
+        cf_out_dedup = _dedupe_cashflow_raw_duplicates(
+            cf_out,
+            canonical_kinds=("warehouse_purchase",),
+            legacy_kinds=(),
         )
-        cf_out_dedup = cf_out.exclude(source_kind__isnull=True, source_cashbox_flow_id__in=dup_pids) if dup_pids else cf_out
         dups_out = (
             cf_out_dedup.values("source_kind", "source_id", "amount")
             .annotate(cnt=Count("id"))
@@ -3720,7 +3877,7 @@ class AnalyticsView(APIView):
             {"id": 3, "name": "Возвраты: документы = позиции", "ok": c3_ok, "diff": str(_money(diff3))},
             {"id": 4, "name": "Остаток = начальный + движения", "ok": c4_ok, "diff": str(_money(c4_diff))},
             {"id": 5, "name": "Продажи товара = сумма строк", "ok": c5_ok, "diff": str(_money(diff5))},
-            {"id": 6, "name": "Финансовый доход = уникальные платежи", "ok": c6_ok, "diff": "0.00" if c6_ok else f"{dups_in} дублей"},
+            {"id": 6, "name": "Финансовый доход = уникальные платежи", "ok": c6_ok, "diff": "0.00" if c6_ok else f"{total_dups_in} дублей"},
             {"id": 7, "name": "Финансовый расход = уникальные выплаты", "ok": c7_ok, "diff": "0.00" if c7_ok else f"{dups_out} дублей"},
         ]
 
@@ -3782,11 +3939,31 @@ class AnalyticsView(APIView):
         if branch is not None:
             cf_in = cf_in.filter(Q(branch=branch) | Q(branch__isnull=True))
 
-        debt_repayments = cf_in.filter(source_kind="debt_payment").aggregate(
+        # Исключаем дублирующие записи pos_sale и сырых записей
+        cf_in_dedup = _dedupe_cashflow_raw_duplicates(
+            cf_in,
+            canonical_kinds=("pos_sale", "pos_prepayment"),
+            legacy_kinds=("sale",),
+        )
+        cf_in_dedup = _dedupe_cashflow_raw_duplicates(
+            cf_in_dedup,
+            canonical_kinds=("debt_repayment",),
+            legacy_kinds=("debt_payment",),
+        )
+
+        debt_repayments = cf_in_dedup.filter(
+            Q(source_kind="debt_repayment") | Q(source_kind="debt_payment")
+        ).aggregate(
             s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD)
         )["s"] or Z_MONEY
 
-        other_in = cf_in.exclude(source_kind__in=["sale", "debt_payment"]).aggregate(
+        # other_in: только прочие доходы вне продаж, предоплат и погашений долгов (AN-05)
+        other_in = cf_in_dedup.exclude(
+            Q(source_kind__in=["sale", "pos_sale", "pos_prepayment", "debt_payment", "debt_repayment"])
+            | Q(source_business_operation_id__in=["Продажа", "Предоплата", "Оплата долга", "Погашение долга"])
+            | Q(name__istartswith="Продажа")
+            | Q(category__title__istartswith="Продажа")
+        ).aggregate(
             s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD)
         )["s"] or Z_MONEY
 
@@ -3803,12 +3980,11 @@ class AnalyticsView(APIView):
         if branch is not None:
             cf_out = cf_out.filter(Q(branch=branch) | Q(branch__isnull=True))
 
-        dup_pids = set(
-            cf_out.filter(source_kind="warehouse_purchase", source_id__isnull=False)
-            .values_list("source_id", flat=True)
+        cf_out = _dedupe_cashflow_raw_duplicates(
+            cf_out,
+            canonical_kinds=("warehouse_purchase",),
+            legacy_kinds=(),
         )
-        if dup_pids:
-            cf_out = cf_out.exclude(source_kind__isnull=True, source_cashbox_flow_id__in=dup_pids)
 
         suppliers = cf_out.filter(
             Q(source_kind="warehouse_purchase") | Q(name__icontains="закупка") | Q(name__icontains="поставщик")
@@ -3931,12 +4107,11 @@ class AnalyticsView(APIView):
         if branch is not None:
             cf_out = cf_out.filter(Q(branch=branch) | Q(branch__isnull=True))
 
-        dup_pids = set(
-            cf_out.filter(source_kind="warehouse_purchase", source_id__isnull=False)
-            .values_list("source_id", flat=True)
+        cf_out = _dedupe_cashflow_raw_duplicates(
+            cf_out,
+            canonical_kinds=("warehouse_purchase",),
+            legacy_kinds=(),
         )
-        if dup_pids:
-            cf_out = cf_out.exclude(source_kind__isnull=True, source_cashbox_flow_id__in=dup_pids)
 
         opex_cf = cf_out.exclude(
             Q(source_kind="warehouse_purchase") | Q(name__icontains="закупка") | Q(name__icontains="поставщик")
@@ -3965,6 +4140,31 @@ class AnalyticsView(APIView):
             Q(name__icontains="коммун") | Q(category__title__icontains="коммун") | Q(name__icontains="свет") | Q(name__icontains="интернет")
         ).aggregate(s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["s"] or Z_MONEY
 
+        # ТЗ-08 п.7: Строки продаж «без товара» (доп. услуга) отдельной группой, а не смешивать с товарами
+        items_qs = SaleItem.objects.filter(sale__in=sales_qs)
+        custom_filter = Q(is_custom=True) | Q(product__isnull=True)
+
+        line_rev_expr = ExpressionWrapper(
+            (F("unit_price") * F("quantity")) - Coalesce(F("line_discount"), Value(Z_MONEY, output_field=MONEY_FIELD)) - Coalesce(F("manual_discount"), Value(Z_MONEY, output_field=MONEY_FIELD)),
+            output_field=MONEY_FIELD,
+        )
+
+        custom_items_agg = items_qs.filter(custom_filter).aggregate(
+            rev=Coalesce(Sum(line_rev_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+            cogs=Coalesce(Sum(cogs_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+        )
+        custom_revenue = _money(custom_items_agg["rev"])
+        custom_cogs = _money(custom_items_agg["cogs"])
+        custom_profit = _money(custom_revenue - custom_cogs)
+
+        product_items_agg = items_qs.exclude(custom_filter).aggregate(
+            rev=Coalesce(Sum(line_rev_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+            cogs=Coalesce(Sum(cogs_expr), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
+        )
+        product_revenue = _money(product_items_agg["rev"])
+        product_cogs = _money(product_items_agg["cogs"])
+        product_profit = _money(product_revenue - product_cogs)
+
         total_opex = _money(salaries + rent + taxes + utilities + other)
         operating_profit = _money(gross_profit - total_opex)
         net_profit = operating_profit
@@ -3981,6 +4181,20 @@ class AnalyticsView(APIView):
             "cogs": str(_money(cogs)),
             "gross_profit": str(gross_profit),
             "margin_percent": margin_pct,
+            "breakdown": {
+                "products": {
+                    "title": "Товары",
+                    "revenue": str(product_revenue),
+                    "cogs": str(product_cogs),
+                    "gross_profit": str(product_profit),
+                },
+                "custom_services": {
+                    "title": "Без товара (доп. услуги)",
+                    "revenue": str(custom_revenue),
+                    "cogs": str(custom_cogs),
+                    "gross_profit": str(custom_profit),
+                },
+            },
             "opex": {
                 "salaries": str(_money(salaries)),
                 "rent": str(_money(rent)),
@@ -4033,4 +4247,156 @@ class AnalyticsPnLAPIView(APIView):
         branch = _get_active_branch(request)
         period = _get_period(request)
         data = AnalyticsView()._pnl(request, company, branch, period)
+        return Response(data)
+
+
+class AnalyticsStockAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        company = _get_company(request.user)
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        branch = _get_active_branch(request)
+        period = _get_period(request)
+        data = AnalyticsView()._stock(request, company, branch, period)
+        return Response(data)
+
+
+class AnalyticsLossSalesAPIView(APIView):
+    """
+    GET /api/main/analytics/loss-sales/?date_from=&date_to=&branch=
+    Отчёт по продажам в убыток (ТЗ-BE-2026-08, раздел 4):
+    Продажи, где сумма строки после всех скидок меньше cost_price × qty.
+    ТЗ ч.12, 2.7: даты наоборот → 400; период не подменяется; убыточные строки
+    отбираются в БД, ответ кэшируется до следующей продажи.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    CACHE_TTL = 300
+
+    def get(self, request):
+        company = _get_company(request.user)
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+
+        Sale, SaleItem = get_sale_models()
+        period = _get_period(request, strict=True)
+        branch = _get_active_branch(request)
+
+        qhash = hashlib.md5(
+            f"{period.start.isoformat()}|{period.end.isoformat()}".encode("utf-8")
+        ).hexdigest()
+        ck = cache_market_analytics_key(
+            str(company.id), str(branch.id) if branch else None, "loss-sales", qhash
+        )
+        cached = cache.get(ck)
+        if cached is not None:
+            return Response(cached)
+
+        paid_val = _choice_value(Sale, "Status", "PAID", "paid")
+        debt_val = _choice_value(Sale, "Status", "DEBT", "debt")
+        partial_ret_val = _choice_value(Sale, "Status", "PARTIALLY_RETURNED", "partially_returned")
+
+        dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
+        sale_filter = {
+            "sale__company": company,
+            "sale__status__in": (paid_val, debt_val, partial_ret_val),
+            f"sale__{dt_field}__gte": period.start,
+            f"sale__{dt_field}__lt": period.end,
+        }
+        if branch is not None and _model_has_field(Sale, "branch"):
+            sale_filter["sale__branch"] = branch
+
+        money_f = DecimalField(max_digits=18, decimal_places=4)
+        zero = Value(Decimal("0"), output_field=money_f)
+        items_qs = (
+            SaleItem.objects.filter(**sale_filter, quantity__gt=0)
+            .annotate(
+                _cost=Coalesce("purchase_price_snapshot", "product__purchase_price", zero, output_field=money_f),
+                _line=ExpressionWrapper(
+                    F("unit_price") * F("quantity")
+                    - Coalesce("line_discount", zero, output_field=money_f)
+                    - Coalesce("manual_discount", zero, output_field=money_f),
+                    output_field=money_f,
+                ),
+            )
+            .annotate(_cost_total=ExpressionWrapper(F("_cost") * F("quantity"), output_field=money_f))
+            .filter(_cost__gt=0, _line__lt=F("_cost_total") - Decimal("0.005"))
+            .select_related("product", "sale", "sale__user", "sale__branch")
+            .order_by("sale__created_at")
+        )
+
+        loss_sales_map = {}
+        overall_loss = Decimal("0.00")
+
+        for it in items_qs:
+            prod = it.product
+            cost = it.purchase_price_snapshot
+            if cost is None:
+                cost = getattr(prod, "purchase_price", None) or Decimal("0.00")
+            cost = Decimal(str(cost))
+            if cost <= Decimal("0.00"):
+                continue
+
+            qty = Decimal(str(it.quantity or 0))
+            if qty <= 0:
+                continue
+
+            unit_p = Decimal(str(it.unit_price or 0))
+            disc = Decimal(str(it.line_discount or 0)) + Decimal(str(it.manual_discount or 0))
+            line_total = _money((unit_p * qty) - disc)
+            cost_total = _money(cost * qty)
+
+            if line_total < cost_total:
+                loss_amount = _money(cost_total - line_total)
+                overall_loss += loss_amount
+                sale = it.sale
+                if sale.id not in loss_sales_map:
+                    cashier_name = ""
+                    c_user = getattr(sale, "user", None)
+                    if c_user:
+                        cashier_name = (
+                            f"{(c_user.first_name or '').strip()} {(c_user.last_name or '').strip()}".strip()
+                            or getattr(c_user, "username", "")
+                            or str(c_user)
+                        )
+                    loss_sales_map[sale.id] = {
+                        "sale_id": str(sale.id),
+                        "doc_number": getattr(sale, "doc_number", "") or str(sale.id)[:8],
+                        "date": sale.created_at.isoformat() if getattr(sale, "created_at", None) else "",
+                        "cashier": cashier_name,
+                        "branch_name": getattr(sale.branch, "name", "") if sale.branch else "",
+                        "total_loss": Decimal("0.00"),
+                        "items": [],
+                    }
+                loss_sales_map[sale.id]["total_loss"] += loss_amount
+                loss_sales_map[sale.id]["items"].append({
+                    "item_id": str(it.id),
+                    "product_id": str(prod.id) if prod else None,
+                    "name": it.name_snapshot or (prod.name if prod else "Товар"),
+                    "quantity": str(qty),
+                    "unit_price": str(_money(unit_p)),
+                    "cost_price": str(_money(cost)),
+                    "line_total": str(line_total),
+                    "loss": str(loss_amount),
+                    "is_wholesale": getattr(it, "is_wholesale", False),
+                })
+
+        sales_list = []
+        for s in loss_sales_map.values():
+            s["total_loss"] = str(_money(s["total_loss"]))
+            sales_list.append(s)
+
+        data = {
+            "period": {
+                "start": period.start.isoformat(),
+                "end": period.end.isoformat(),
+                "date_from": period.start.strftime("%Y-%m-%d"),
+                "date_to": (period.end - timedelta(seconds=1)).strftime("%Y-%m-%d"),
+            },
+            "total_loss": str(_money(overall_loss)),
+            "sales_count": len(sales_list),
+            "sales": sales_list,
+        }
+        cache.set(ck, data, self.CACHE_TTL)
         return Response(data)

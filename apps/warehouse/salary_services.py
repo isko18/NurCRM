@@ -209,12 +209,59 @@ def agent_balance(company_id, agent_id) -> Decimal:
     return _q2(total or 0)
 
 
+class SalaryCashError(ValueError):
+    """Выплату нельзя провести через указанную кассу (сообщение — для 400 {"cash_register": [...]})."""
+
+
+def _salary_money_document(*, company, agent, amount, cash_register, comment, created_by):
+    """Проведённый MONEY_EXPENSE из кассы с системной категорией «Зарплата»."""
+    from . import services_money
+    from .utils import ensure_system_payment_categories
+
+    if cash_register.company_id != company.id:
+        raise SalaryCashError("Касса принадлежит другой компании.")
+    # Блокируем кассу до конца транзакции: параллельные выплаты не уведут её в минус.
+    m.CashRegister.objects.select_for_update().filter(pk=cash_register.pk).first()
+    balance = services_money.cash_register_balance(cash_register)
+    if balance < amount:
+        raise SalaryCashError(
+            f"Недостаточно средств в кассе «{cash_register.name}». Доступно: {_q2(balance)}, требуется: {amount}."
+        )
+    branch = cash_register.branch
+    ensure_system_payment_categories(company, branch)
+    category = m.PaymentCategory.objects.filter(
+        company=company, branch=branch, system_code=m.PaymentCategory.SystemCode.SALARY,
+    ).first()
+    agent_name = (
+        f"{getattr(agent, 'first_name', '') or ''} {getattr(agent, 'last_name', '') or ''}".strip()
+        or getattr(agent, "email", None) or str(agent.pk)
+    )
+    text = f"Выплата ЗП агенту {agent_name}"
+    if comment:
+        text = f"{text}: {comment}"
+    money = m.MoneyDocument.objects.create(
+        doc_type=m.MoneyDocument.DocType.MONEY_EXPENSE,
+        status=m.MoneyDocument.Status.DRAFT,
+        cash_register=cash_register,
+        company=company,
+        branch=branch,
+        payment_category=category,
+        amount=amount,
+        comment=text[:255],
+    )
+    services_money.post_money_document(money)
+    return money
+
+
 @transaction.atomic
-def create_payout(*, company, agent, amount, comment: str = "", created_by=None):
+def create_payout(*, company, agent, amount, comment: str = "", created_by=None, cash_register=None):
     """
     Создаёт выплату и закрывает начисления агента (accrued) FIFO — от старых к новым.
     Частично покрытое начисление разбивается: закрытая часть (paid, привязана к
     выплате) + остаток (accrued). Всё в одной транзакции.
+
+    cash_register — выплата из кассы: дополнительно проведённый MONEY_EXPENSE
+    (категория «Зарплата»), с проверкой остатка кассы. Без кассы — как раньше.
     """
     amount = _q2(amount)
     if amount <= 0:
@@ -230,12 +277,20 @@ def create_payout(*, company, agent, amount, comment: str = "", created_by=None)
     if amount > balance:
         raise SalaryBalanceError(balance)
 
+    money = None
+    if cash_register is not None:
+        money = _salary_money_document(
+            company=company, agent=agent, amount=amount, cash_register=cash_register,
+            comment=(comment or "").strip(), created_by=created_by,
+        )
+
     payout = m.AgentSalaryPayout.objects.create(
         company=company,
         agent=agent,
         amount=amount,
         comment=(comment or "").strip(),
         created_by=created_by,
+        money_document=money,
     )
 
     remaining = amount

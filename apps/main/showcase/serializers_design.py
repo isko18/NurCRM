@@ -299,11 +299,17 @@ class ShowcasePromoBlockSerializer(serializers.ModelSerializer):
 
 
 class ShowcaseOrderItemSerializer(serializers.ModelSerializer):
+    variant_size = serializers.CharField(source="variant.size", read_only=True, default=None)
+    variant_color = serializers.CharField(source="variant.color", read_only=True, default=None)
+
     class Meta:
         model = ShowcaseOrderItem
         fields = [
             "id",
             "product",
+            "variant",
+            "variant_size",
+            "variant_color",
             "product_name",
             "qty",
             "price",
@@ -329,21 +335,27 @@ class ShowcaseOrderSerializer(serializers.ModelSerializer):
             "comment",
             "total",
             "source",
+            "sale",
+            "stock_reserved",
             "items",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "number", "total", "created_at", "updated_at"]
+        read_only_fields = ["id", "number", "total", "sale", "stock_reserved", "created_at", "updated_at"]
 
 
 class ShowcaseOrderCreateItemSerializer(serializers.Serializer):
     product = serializers.UUIDField(required=True)
-    qty = serializers.DecimalField(max_digits=12, decimal_places=3, min_value=Decimal("0.001"))
+    variant = serializers.UUIDField(required=False, allow_null=True, default=None)
+    qty = serializers.DecimalField(
+        max_digits=12, decimal_places=3, min_value=Decimal("0.001"), max_value=Decimal("100000")
+    )
 
 
 class ShowcaseOrderCustomerSerializer(serializers.Serializer):
-    name = serializers.CharField(max_length=128, required=True)
-    phone = serializers.CharField(max_length=64, required=True)
+    # Обязательность имени/телефона задаёт cart.fields документа вида (проверяется во вьюхе).
+    name = serializers.CharField(max_length=128, required=False, allow_blank=True, default="")
+    phone = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")
 
 
 class ShowcaseOrderDeliverySerializer(serializers.Serializer):
@@ -357,7 +369,8 @@ class ShowcaseOrderCreateSerializer(serializers.Serializer):
         child=ShowcaseOrderCreateItemSerializer(),
         allow_empty=False,
         required=True,
+        max_length=100,
     )
     delivery = ShowcaseOrderDeliverySerializer(required=False, default=dict)
-    comment = serializers.CharField(required=False, allow_blank=True, default="")
-    source = serializers.CharField(required=False, default="showcase", allow_blank=True)
+    comment = serializers.CharField(required=False, allow_blank=True, default="", max_length=2000)
+    source = serializers.CharField(required=False, default="showcase", allow_blank=True, max_length=32)

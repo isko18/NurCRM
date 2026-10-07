@@ -21,6 +21,7 @@ from .kassa_views import (
     ClientBonusHistoryAPIView,
     ClientDebtorsAPIView,
     ClientPayDebtAPIView,
+    ClientDirectDebtAPIView,
     PosQuickCheckoutAPIView,
     SaleReturnListAPIView,
 )
@@ -28,6 +29,13 @@ from .analytics_market import *
 from .analytics_dashboard import *
 from .document import SaleReceiptAPIView, SaleInvoiceAPIView
 from apps.main.showcase.views_public import PublicCompanyProductDetailAPIView, PublicCompanyAPIView, PublicCompanyShowcaseAPIView
+from apps.main.recommendations import (
+    RecommendationEventsAPIView,
+    RecommendationLinkSaleAPIView,
+    RecommendationStatsAPIView,
+    RecommendationPairsAPIView,
+    SalesTargetAPIView,
+)
 from apps.main.showcase.views_design import (
     ShowcaseDesignAPIView,
     ShowcaseDraftUpdateAPIView,
@@ -51,6 +59,25 @@ from apps.main.showcase.views_design import (
     PublicCompanyShowcaseDesignAPIView,
     PublicCompanyShowcaseOrderCreateAPIView,
     PublicCompanyShowcaseTrackAPIView,
+    ShowcaseEditorOptionsAPIView,
+    ShowcaseDraftResetAPIView,
+    ShowcaseDraftApplyPresetAPIView,
+    ShowcaseProductsListAPIView,
+    ShowcaseProductDetailAPIView,
+    ShowcaseProductsOrderAPIView,
+    ShowcaseProductsBulkAPIView,
+    ShowcaseCategoriesListAPIView,
+    ShowcaseCategoryDetailAPIView,
+    ShowcaseCategoriesOrderAPIView,
+    ShowcasePageListCreateAPIView,
+    ShowcasePageDetailAPIView,
+    ShowcaseSlugCheckAPIView,
+)
+from apps.main.showcase.views_public_design import (
+    PublicCompanyShowcaseEventsAPIView,
+    PublicCompanyShowcasePageAPIView,
+    PublicCompanyShowcaseCategoriesAPIView,
+    PublicCompanyShowcaseCartQuoteAPIView,
 )
 from apps.main.inventory_views import (
     ProductInventorySessionListCreateAPIView,
@@ -75,9 +102,18 @@ from apps.main.production_salary_views import (
     ProductionPayoutListCreateAPIView,
 )
 from apps.construction.views import CashFlowListCreateView
+from apps.users.app_settings_views import CompanyAppSettingsAPIView
+from apps.main.part12_views import (
+    AnalyticsFinanceAPIView,
+    AnalyticsMarketSummaryAPIView,
+    BarcodeDuplicatesAPIView,
+    PosCheckoutBatchAPIView,
+)
 
 
 urlpatterns = [
+    # Приложение клиентов: поиск по телефону, QR, перенос бонусов, магазин в приложении, приглашения
+    path("", include("apps.clientapp.staff_urls")),
 
     # 🔹 Контакты
     path('socialapplications/<uuid:pk>/', SocialApplicationsRetrieveUpdateDestroyAPIView.as_view(), name='socialapplications-detail'),
@@ -112,6 +148,8 @@ urlpatterns = [
     path('products/compact-list/', ProductCompactListView.as_view(), name='product-compact-list'),
     path('products/scale-export/', WeightProductsScaleExportAPIView.as_view(), name='product-scale-export'),
     path('products/create-by-barcode/', ProductCreateByBarcodeAPIView.as_view(), name='product-create-by-barcode'),
+    path("products/barcode-duplicates/", BarcodeDuplicatesAPIView.as_view(), name="product-barcode-duplicates"),
+    path("app-settings/<str:app>/", CompanyAppSettingsAPIView.as_view(), name="company-app-settings"),
     path('products/create-manual/', ProductCreateManualAPIView.as_view(), name='product-create-manual'),
     path('products/mass-incoming/', ProductMassIncomingAPIView.as_view(), name='product-mass-incoming'),
     path('products/bulk-update/', ProductBulkUpdateAPIView.as_view(), name='product-bulk-update'),
@@ -236,6 +274,18 @@ urlpatterns = [
         name="client-deals-pay-any",
     ),
 
+    # installments reschedule / promised date
+    path(
+        "clients/<uuid:client_id>/deals/<uuid:deal_id>/installments/<uuid:installment_id>/",
+        ClientDealInstallmentUpdateAPIView.as_view(),
+        name="client-deal-installment-update",
+    ),
+    path(
+        "clients/<uuid:client_id>/deals/<uuid:pk>/installments/<uuid:installment_id>/",
+        ClientDealInstallmentUpdateAPIView.as_view(),
+        name="client-deal-installment-update-pk",
+    ),
+
     # pay/refund (nested)
     path(
         "clients/<uuid:client_id>/deals/<uuid:pk>/pay/",
@@ -259,6 +309,9 @@ urlpatterns = [
     path("clientdeals/", ClientDealListCreateAPIView.as_view(), name="deal-list-create"),
     path("clientdeals/<uuid:pk>/", ClientDealRetrieveUpdateDestroyAPIView.as_view(), name="deal-detail"),
 
+    path("clientdeals/<uuid:deal_id>/installments/<uuid:installment_id>/", ClientDealInstallmentUpdateAPIView.as_view(), name="clientdeal-installment-update"),
+    path("deals/<uuid:deal_id>/installments/<uuid:installment_id>/", ClientDealInstallmentUpdateAPIView.as_view(), name="deal-installment-update"),
+
     path("clientdeals/<uuid:pk>/pay/", ClientDealPayAPIView.as_view(), name="deal-pay"),
     path("clientdeals/<uuid:pk>/refund/", ClientDealRefundAPIView.as_view(), name="deal-refund"),
 
@@ -272,6 +325,7 @@ urlpatterns = [
     path("clients/with-debts/", ClientWithDebtsListAPIView.as_view(), name="clients-with-debts"),
     path("clients/debtors/", ClientDebtorsAPIView.as_view(), name="clients-debtors"),
     path("clients/<uuid:pk>/pay-debt/", ClientPayDebtAPIView.as_view(), name="client-pay-debt"),
+    path("clients/<uuid:client_id>/debts/", ClientDirectDebtAPIView.as_view(), name="client-direct-debt"),
     path("clients/<uuid:pk>/bonus/", ClientBonusAPIView.as_view(), name="client-bonus"),
     path("clients/<uuid:pk>/bonus/history/", ClientBonusHistoryAPIView.as_view(), name="client-bonus-history"),
     path(
@@ -287,6 +341,7 @@ urlpatterns = [
     ),
     
     path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
+    path("pos/checkout/batch/", PosCheckoutBatchAPIView.as_view(), name="pos-checkout-batch"),
     path("pos/checkout/", PosQuickCheckoutAPIView.as_view(), name="pos-quick-checkout"),
     path("pos/returns/", SaleReturnListAPIView.as_view(), name="pos-return-list"),
     path("pos/sales/<uuid:pk>/exchange/", SaleExchangeAPIView.as_view(), name="pos-sale-exchange"),
@@ -437,16 +492,22 @@ urlpatterns = [
     path("owners/analytics/", OwnerOverallAnalyticsAPIView.as_view(), name="owner-overall-analytics"),
     
     
+    path("analytics/market/summary/", AnalyticsMarketSummaryAPIView.as_view(), name="analytics-market-summary"),
     path("analytics/market/", AnalyticsView.as_view(), name="analytics"),
     path("analytics/reconcile/", AnalyticsReconcileAPIView.as_view(), name="analytics-reconcile"),
     path("analytics/cashflow/", AnalyticsCashFlowAPIView.as_view(), name="analytics-cashflow"),
+    path("analytics/loss-sales/", AnalyticsLossSalesAPIView.as_view(), name="analytics-loss-sales"),
+    path("analytics/finance/", AnalyticsFinanceAPIView.as_view(), name="analytics-finance"),
     path("analytics/pnl/", AnalyticsPnLAPIView.as_view(), name="analytics-pnl"),
+    path("analytics/stock/", AnalyticsStockAPIView.as_view(), name="analytics-stock"),
     path("analytics/market/reconcile/", AnalyticsReconcileAPIView.as_view(), name="analytics-market-reconcile"),
     path("analytics/market/cashflow/", AnalyticsCashFlowAPIView.as_view(), name="analytics-market-cashflow"),
     path("analytics/market/pnl/", AnalyticsPnLAPIView.as_view(), name="analytics-market-pnl"),
+    path("analytics/market/stock/", AnalyticsStockAPIView.as_view(), name="analytics-market-stock"),
     path("reconcile/", AnalyticsReconcileAPIView.as_view(), name="direct-reconcile"),
     path("cashflow/", AnalyticsCashFlowAPIView.as_view(), name="direct-cashflow"),
     path("pnl/", AnalyticsPnLAPIView.as_view(), name="direct-pnl"),
+    path("stock/", AnalyticsStockAPIView.as_view(), name="direct-stock"),
     path(
         "market-sale-employee-pay-profiles/",
         MarketSaleEmployeePayProfileListCreateAPIView.as_view(),
@@ -464,6 +525,10 @@ urlpatterns = [
     path("public/companies/<slug:slug>/showcase/design/", PublicCompanyShowcaseDesignAPIView.as_view(), name="public-company-showcase-design"),
     path("public/companies/<slug:slug>/orders/", PublicCompanyShowcaseOrderCreateAPIView.as_view(), name="public-company-showcase-orders"),
     path("public/companies/<slug:slug>/showcase/track/", PublicCompanyShowcaseTrackAPIView.as_view(), name="public-company-showcase-track"),
+    path("public/companies/<slug:slug>/showcase/events/", PublicCompanyShowcaseEventsAPIView.as_view(), name="public-company-showcase-events"),
+    path("public/companies/<slug:slug>/showcase/categories/", PublicCompanyShowcaseCategoriesAPIView.as_view(), name="public-company-showcase-categories"),
+    path("public/companies/<slug:slug>/showcase/pages/<slug:page_slug>/", PublicCompanyShowcasePageAPIView.as_view(), name="public-company-showcase-page"),
+    path("public/companies/<slug:slug>/showcase/cart/quote/", PublicCompanyShowcaseCartQuoteAPIView.as_view(), name="public-company-showcase-cart-quote"),
     
     path("public/knowledge-base/", PublicKnowledgeBaseCourseListCreateAPIView.as_view()),
     path("public/knowledge-base/<uuid:course_id>/", PublicKnowledgeBaseCourseRetrieveAPIView.as_view()),
@@ -471,8 +536,11 @@ urlpatterns = [
     # ==========================
     # Showcase Visual Editor & Management (SC-01 - SC-11)
     # ==========================
+    path("showcase/editor/options/", ShowcaseEditorOptionsAPIView.as_view(), name="showcase-editor-options"),
     path("showcase/design/", ShowcaseDesignAPIView.as_view(), name="showcase-design"),
     path("showcase/design/draft/", ShowcaseDraftUpdateAPIView.as_view(), name="showcase-design-draft"),
+    path("showcase/design/draft/reset/", ShowcaseDraftResetAPIView.as_view(), name="showcase-design-draft-reset"),
+    path("showcase/design/draft/apply-preset/", ShowcaseDraftApplyPresetAPIView.as_view(), name="showcase-design-draft-apply-preset"),
     path("showcase/design/draft/product-order/", ShowcaseDraftProductOrderAPIView.as_view(), name="showcase-design-product-order"),
     path("showcase/design/preview-link/", ShowcasePreviewLinkAPIView.as_view(), name="showcase-design-preview-link"),
     path("showcase/design/publish/", ShowcasePublishAPIView.as_view(), name="showcase-design-publish"),
@@ -491,10 +559,33 @@ urlpatterns = [
     path("showcase/promo-blocks/reorder/", ShowcasePromoBlockReorderAPIView.as_view(), name="showcase-promo-blocks-reorder"),
     path("showcase/promo-blocks/<uuid:pk>/", ShowcasePromoBlockDetailAPIView.as_view(), name="showcase-promo-blocks-detail"),
 
+    path("showcase/products/", ShowcaseProductsListAPIView.as_view(), name="showcase-products-list"),
+    path("showcase/products/order/", ShowcaseProductsOrderAPIView.as_view(), name="showcase-products-order"),
+    path("showcase/products/bulk/", ShowcaseProductsBulkAPIView.as_view(), name="showcase-products-bulk"),
+    path("showcase/products/<uuid:product_id>/", ShowcaseProductDetailAPIView.as_view(), name="showcase-products-detail"),
+
+    path("showcase/categories/", ShowcaseCategoriesListAPIView.as_view(), name="showcase-categories-list"),
+    path("showcase/categories/order/", ShowcaseCategoriesOrderAPIView.as_view(), name="showcase-categories-order"),
+    path("showcase/categories/<uuid:category_id>/", ShowcaseCategoryDetailAPIView.as_view(), name="showcase-categories-detail"),
+
+    path("showcase/pages/", ShowcasePageListCreateAPIView.as_view(), name="showcase-pages-list-create"),
+    path("showcase/pages/<uuid:pk>/", ShowcasePageDetailAPIView.as_view(), name="showcase-pages-detail"),
+
+    path("showcase/slug-check/", ShowcaseSlugCheckAPIView.as_view(), name="showcase-slug-check"),
+
     path("showcase/orders/", ShowcaseOrderListAPIView.as_view(), name="showcase-orders-list"),
     path("showcase/orders/<uuid:pk>/", ShowcaseOrderDetailAPIView.as_view(), name="showcase-orders-detail"),
 
     path("showcase/stats/", ShowcaseStatsAPIView.as_view(), name="showcase-stats"),
+
+    # ==========================
+    # Recommendations / Upsell & Sales Targets (TZ-BE-2026-07 / Часть 7)
+    # ==========================
+    path("recommendations/events/", RecommendationEventsAPIView.as_view(), name="recommendation-events"),
+    path("recommendations/events/link-sale/", RecommendationLinkSaleAPIView.as_view(), name="recommendation-link-sale"),
+    path("recommendations/stats/", RecommendationStatsAPIView.as_view(), name="recommendation-stats"),
+    path("recommendations/pairs/", RecommendationPairsAPIView.as_view(), name="recommendation-pairs"),
+    path("sales-targets/", SalesTargetAPIView.as_view(), name="sales-targets"),
 
     # ==========================
     # Telegram Bot & AI (TZ-BE-2026-06 / Часть 5)

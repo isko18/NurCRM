@@ -8,6 +8,7 @@ from django.db.models import Q, Prefetch
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 
+import logging
 from decimal import Decimal
 
 from . import models, serializers_documents, services, services_money
@@ -22,6 +23,8 @@ from .views import (
 )
 from .filters import ProductFilter
 from apps.utils import _is_owner_like
+
+logger = logging.getLogger(__name__)
 
 
 def _agent_allowed_for_company(agent_user, company):
@@ -249,7 +252,7 @@ class DocumentTransferListCreateView(_DocumentTypedListCreateView):
                 services.post_document(doc, allow_negative=allow_negative)
                 doc.refresh_from_db()
             except Exception as e:
-                raise DRFValidationError({"detail": str(e)})
+                raise DRFValidationError(services.error_payload(e))
 
 
 class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -276,6 +279,33 @@ class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDe
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
         return qs
+
+    def perform_destroy(self, instance):
+        """
+        Удалить можно только черновик без движений и денег (documents-delete-draft.md).
+        Проведённый документ сначала распроводят: иначе его движения пропали бы из
+        истории, а остатки и касса остались бы изменёнными.
+        """
+        doc = instance
+        if doc.status != models.Document.Status.DRAFT:
+            raise DRFValidationError({"detail": "Удалить можно только черновик. Сначала отмените проведение."})
+        if doc.is_sale_request or models.AgentRequestCart.objects.filter(sale_document=doc).exists():
+            raise DRFValidationError({"detail": "Заявку агента нельзя удалить как черновик."})
+        if doc.moves.exists() or doc.agent_moves.exists():
+            raise DRFValidationError({"detail": "У документа есть движения товара — удаление запрещено."})
+        if models.MoneyDocument.objects.filter(source_document=doc).exists():
+            raise DRFValidationError({"detail": "У документа есть денежный документ — удаление запрещено."})
+        if models.CashApprovalRequest.objects.filter(document=doc).exclude(
+            status=models.CashApprovalRequest.Status.REJECTED
+        ).exists():
+            raise DRFValidationError({"detail": "По документу есть запрос в кассу — удаление запрещено."})
+        if doc.salary_accruals.exists():
+            raise DRFValidationError({"detail": "По документу начислена зарплата — удаление запрещено."})
+        logger.info(
+            "warehouse document deleted: id=%s number=%s type=%s by user=%s",
+            doc.pk, doc.number, doc.doc_type, getattr(self.request.user, "pk", None),
+        )
+        doc.delete()
 
 
 class DocumentScanView(CompanyBranchRestrictedMixin, APIView):
@@ -521,7 +551,7 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
                     logger.warning("Auto approve cash request failed: %s", e)
 
         except Exception as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(services.error_payload(e), status=status.HTTP_400_BAD_REQUEST)
         doc.refresh_from_db()
         return Response(self.get_serializer(doc).data)
 
@@ -542,6 +572,19 @@ class DocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
 
     def post(self, request, pk=None):
         doc = self.get_object()
+        if (
+            doc.doc_type == models.Document.DocType.TRANSFER
+            and doc.warehouse_from_id and doc.warehouse_to_id
+            and doc.warehouse_from.company_id != doc.warehouse_to.company_id
+        ):
+            # stock-partnership §7.11 (D7): межкомпанейское — только получатель (у него списывается товар)
+            from apps.warehouse.views_partnership import user_can_manage_partnership
+
+            if not user_can_manage_partnership(request.user, doc.warehouse_to.company):
+                return Response(
+                    {"detail": "Отменить межкомпанейское перемещение может только получатель."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
         try:
             services.unpost_document(doc)
         except Exception as e:
@@ -752,6 +795,7 @@ class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
             warehouse_from=wh_from,
             warehouse_to=wh_to,
             comment=ser.validated_data.get("comment") or "",
+            created_by=request.user,
         )
 
         for it in ser.validated_data["items"]:
@@ -765,7 +809,7 @@ class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
         try:
             services.post_document(doc)
         except Exception as e:
-            raise DRFValidationError({"detail": str(e)})
+            raise DRFValidationError(services.error_payload(e))
 
         out = serializers_documents.DocumentSerializer(doc, context={"request": request}).data
         return Response(out, status=status.HTTP_201_CREATED)

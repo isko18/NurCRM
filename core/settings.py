@@ -129,6 +129,8 @@ INSTALLED_APPS = [
     'apps.onec',
     'apps.releases',
     'apps.integrations',
+    'apps.support',
+    'apps.clientapp',
     # 'apps.crm',
 ]
 
@@ -332,11 +334,24 @@ SIMPLE_JWT = {
 # ВАЖНО: у каждого окружения ДОЛЖЕН быть свой broker (отдельная Redis-БД).
 # Prod/staging/onec раньше делили db0 и одну очередь `celery` — задачи
 # раздавались по кругу воркерам разных кодовых баз, которые их не знают, и
-# терялись ~50% (pending навсегда, сообщения не отправлялись). Задаётся через env.
-CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/1'))
 CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', CELERY_BROKER_URL)
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
+
+CELERY_IMPORTS = (
+    'apps.main.tasks',
+    'apps.main.telegram_bot.tasks',
+    'apps.main.recommendations_tasks',
+    'apps.main.rentals_tasks',
+    'apps.consalting.tasks',
+    'apps.construction.tasks',
+    'apps.integrations.tasks',
+    'apps.onec.tasks',
+    'apps.instagram.tasks',
+    'apps.support.tasks',
+    'apps.clientapp.tasks',
+)
 
 # Строгий режим машины состояний воронки консалтинга.
 # False (по умолчанию) — недопустимые переходы выполняются, но логируются.
@@ -347,6 +362,46 @@ CONSALTING_FUNNEL_STRICT = False
 from celery.schedules import crontab  # noqa: E402
 
 CELERY_BEAT_SCHEDULE = {
+    'support-daily-digest': {
+        'task': 'apps.support.tasks.send_daily_support_digest',
+        'schedule': crontab(hour=9, minute=0),
+    },
+    'support-process-pending': {
+        'task': 'apps.support.tasks.process_pending_reports',
+        'schedule': crontab(minute='*/2'),
+    },
+    'support-new-version-check': {
+        'task': 'apps.support.tasks.check_new_version_regressions',
+        'schedule': crontab(minute='*/10'),
+    },
+    'support-cleanup': {
+        'task': 'apps.support.tasks.cleanup_support_data',
+        'schedule': crontab(hour=4, minute=10),
+    },
+    'telegram-check-server-bots-webhooks': {
+        'task': 'apps.main.telegram_bot.tasks.check_server_bots_webhooks',
+        'schedule': crontab(minute=15),
+    },
+    'telegram-monitor-bot-queue': {
+        'task': 'apps.main.telegram_bot.tasks.monitor_bot_queue',
+        'schedule': crontab(minute='*'),
+    },
+    'recommendations-dispatch-pairs': {
+        'task': 'apps.main.recommendations_tasks.dispatch_recommendation_pairs',
+        'schedule': crontab(hour=0, minute=0),
+    },
+    'recommendations-purge-old-events': {
+        'task': 'apps.main.recommendations_tasks.purge_old_recommendation_events',
+        'schedule': crontab(hour=6, minute=30),
+    },
+    'rentals-send-overdue-notifications': {
+        'task': 'apps.main.rentals_tasks.send_overdue_rentals_notifications',
+        'schedule': crontab(hour=8, minute=0),
+    },
+    'rentals-purge-old-documents': {
+        'task': 'apps.main.rentals_tasks.purge_rental_documents_30_days',
+        'schedule': crontab(hour=3, minute=45),
+    },
     'consalting-scan-no-activity': {
         'task': 'apps.consalting.tasks.scan_no_activity',
         'schedule': crontab(minute='*/30'),
@@ -395,7 +450,34 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.main.tasks.send_tariff_notifications',
         'schedule': crontab(hour=9, minute=0),
     },
+    # Приложение клиентов: координаты магазинов по адресу (Nominatim, ≤1 запроса/с).
+    'clientapp-geocode-missing-shops': {
+        'task': 'apps.clientapp.tasks.geocode_missing_shops',
+        'schedule': crontab(minute='*/30'),
+    },
+    # Приложение клиентов: истёкшие входы через Telegram и QR-токены.
+    'clientapp-cleanup': {
+        'task': 'apps.clientapp.tasks.cleanup_client_app',
+        'schedule': crontab(hour=4, minute=40),
+    },
+    # Склад: ежедневный контроль остатков (карточка/регистр/Σ движений), только лог и алерт.
+    'warehouse-check-stock-consistency': {
+        'task': 'apps.warehouse.tasks.check_stock_consistency',
+        'schedule': crontab(hour=5, minute=20),
+    },
 }
+
+# ===========================
+# Приложение клиентов (/api/v1/)
+# ===========================
+# Отдельный бот входа (создать в @BotFather). Без токена/username вход отвечает 503 auth_unavailable.
+CLIENT_APP_TELEGRAM_BOT_TOKEN = os.getenv('CLIENT_APP_TELEGRAM_BOT_TOKEN', '')
+CLIENT_APP_TELEGRAM_WEBHOOK_SECRET = os.getenv('CLIENT_APP_TELEGRAM_WEBHOOK_SECRET', '')
+CLIENT_APP_BOT_USERNAME = os.getenv('CLIENT_APP_BOT_USERNAME', '')
+CLIENT_APP_QR_TTL_SECONDS = _get_int_env('CLIENT_APP_QR_TTL_SECONDS', 300)
+CLIENT_APP_REFERRAL_WINDOW_DAYS = _get_int_env('CLIENT_APP_REFERRAL_WINDOW_DAYS', 7)
+CLIENT_APP_REFERRAL_LINK_BASE = os.getenv('CLIENT_APP_REFERRAL_LINK_BASE', 'https://app.nurcrm.kg/r/')
+NOMINATIM_USER_AGENT = os.getenv('NOMINATIM_USER_AGENT', 'NurCRM-ClientApp/1.0 (+https://app.nurcrm.kg)')
 
 # ===========================
 # Кэширование (Redis)
@@ -468,6 +550,7 @@ CORS_ALLOW_HEADERS = list(default_headers) + [
     'x-csrftoken',
     'x-requested-with',
     'x-pos-device',
+    'idempotency-key',
     'sentry-trace',
     'baggage',
     'cache-control',
@@ -559,6 +642,17 @@ LOGGING = {
         'apps.cafe.views': {
             'handlers': ['console'],
             'level': _WS_LOG_LEVEL,
+            'propagate': False,
+        },
+        # httpx пишет полный URL запроса на INFO — в нём токены ботов и ключ ИИ.
+        'httpx': {
+            'handlers': ['console'],
+            'level': 'WARNING',
+            'propagate': False,
+        },
+        'httpcore': {
+            'handlers': ['console'],
+            'level': 'WARNING',
             'propagate': False,
         },
     },

@@ -81,6 +81,15 @@ def checkout_cart(
             raise ValueError(str(e)) from e
         consume_by_pid[it.product_id] += item_consume
 
+    # Проверка обязательности варианта (ТЗ-10 п. 3.5 Вариант А)
+    active_variant_pids = set(
+        ProductVariant.objects.filter(product_id__in=prod_ids, is_active=True).values_list("product_id", flat=True)
+    )
+    for it in items:
+        if it.product_id and it.product_id in active_variant_pids and not it.variant_id:
+            p_name = products[it.product_id].name if it.product_id in products else "Товар"
+            raise ValueError(f"Товар «{p_name}» имеет размеры/цвета. Выберите размер/цвет.")
+
     # Остаток по вариантам (размер/цвет)
     variant_ids = [it.variant_id for it in items if it.variant_id]
     variants = {v.id: v for v in ProductVariant.objects.select_for_update().filter(id__in=variant_ids)}
@@ -171,6 +180,7 @@ def checkout_cart(
                 variant_id=it.variant_id,
                 performer_id=it.performer_id,
                 performer_commission_amount=_performer_commission(it),
+                is_wholesale=bool(getattr(it, "is_wholesale", False) or getattr(cart, "is_wholesale", False)),
             )
         )
     SaleItem.objects.bulk_create(sale_items)
@@ -234,6 +244,13 @@ def checkout_cart(
     CartItem.objects.filter(cart=cart).delete()
     cart.status = Cart.Status.CHECKED_OUT
     cart.save(update_fields=["status", "updated_at"])
+
+    if cart.company_id:
+        try:
+            from django.core.cache import cache
+            cache.delete(f"tg_catalog_data:{cart.company_id}")
+        except Exception:
+            pass
 
     if getattr(cart, "shift_id", None) and sale.shift_id != cart.shift_id:
         sale.shift_id = cart.shift_id
@@ -305,7 +322,10 @@ def checkout_cart(
                     kind=ClientDeal.Kind.DEBT,
                     amount=sale.total,
                     prepayment=prepay_val,
-                    debt_days=30,
+                    # Один взнос на всю сумму со сроком через 30 дней (ТЗ ч.12, 2.2):
+                    # в графике v2 debt_days — число платежей, а не срок.
+                    debt_days=1,
+                    first_due_date=timezone.localdate() + timedelta(days=30),
                 )
             if not DealInstallment.objects.filter(deal=deal_obj).exists():
                 rem_inst = max(Decimal("0.00"), sale.total - prepay_val)
