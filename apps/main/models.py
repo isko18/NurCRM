@@ -621,9 +621,15 @@ def assert_barcode_unique_in_company(company_id, barcode, *, exclude_product_id=
     if exclude_product_id:
         prod_qs = prod_qs.exclude(pk=exclude_product_id)
         alt_qs = alt_qs.exclude(product_id=exclude_product_id)
-    if prod_qs.exists() or alt_qs.exists():
+    other = prod_qs.only("id", "name", "code").first()
+    if other is None:
+        alt = alt_qs.select_related("product").only("product__id", "product__name", "product__code").first()
+        other = alt.product if alt is not None else None
+    if other is not None:
+        # «Калькуляция», задача 3: в тексте — какой именно товар уже с этим штрихкодом.
+        code = f" (код {other.code})" if getattr(other, "code", None) else ""
         raise ValidationError(
-            {"barcode": f"Штрихкод «{bc}» уже используется другим товаром в этом филиале/складе."}
+            {"barcode": f"Штрихкод «{bc}» уже есть у товара «{other.name}»{code} в этом филиале/складе."}
         )
 
 

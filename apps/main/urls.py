@@ -2,6 +2,7 @@ from django.urls import path, include
 
 from apps.main.mass_incoming_views import ProductMassIncomingAPIView
 from .views import *
+from .price_check import ProductCatalogVersionView, ProductPriceCheckView
 from .pos_views import *
 from .kassa_stage3 import (
     AppointmentDetailAPIView,
@@ -146,9 +147,13 @@ urlpatterns = [
     # 🔹 Продукты, категории, бренды
     path('products/list/', ProductListView.as_view(), name='product-list'),
     path('products/compact-list/', ProductCompactListView.as_view(), name='product-compact-list'),
+    path('products/price-check/', ProductPriceCheckView.as_view(), name='product-price-check'),
+    path('products/catalog-version/', ProductCatalogVersionView.as_view(), name='product-catalog-version'),
     path('products/scale-export/', WeightProductsScaleExportAPIView.as_view(), name='product-scale-export'),
     path('products/create-by-barcode/', ProductCreateByBarcodeAPIView.as_view(), name='product-create-by-barcode'),
     path("products/barcode-duplicates/", BarcodeDuplicatesAPIView.as_view(), name="product-barcode-duplicates"),
+    # синоним для «Калькуляции» (calculator-after-stress-test/03)
+    path("products/duplicate-barcodes/", BarcodeDuplicatesAPIView.as_view(), name="product-duplicate-barcodes"),
     path("app-settings/<str:app>/", CompanyAppSettingsAPIView.as_view(), name="company-app-settings"),
     path('products/create-manual/', ProductCreateManualAPIView.as_view(), name='product-create-manual'),
     path('products/mass-incoming/', ProductMassIncomingAPIView.as_view(), name='product-mass-incoming'),

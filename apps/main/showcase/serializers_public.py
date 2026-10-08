@@ -66,6 +66,8 @@ class PublicProductSerializer(serializers.ModelSerializer):
 
     in_stock = serializers.SerializerMethodField()
     low_stock = serializers.SerializerMethodField()
+    # то же, что stock («Акционный товар»); stock оставлен на переходный период
+    is_promo = serializers.BooleanField(source="stock", read_only=True)
 
     class Meta:
         model = Product
@@ -80,6 +82,7 @@ class PublicProductSerializer(serializers.ModelSerializer):
             "in_stock",
             "low_stock",
             "stock",
+            "is_promo",
             "is_new",
             "country",
             "barcode",

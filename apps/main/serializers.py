@@ -1020,15 +1020,19 @@ def sync_product_alternate_barcodes(product: Product, raw):
             raise serializers.ValidationError({
                 "alternate_barcodes": f"Доп. штрихкод «{b}» совпадает с основным штрихкодом товара.",
             })
-        if Product.objects.filter(company_id=company_id, barcode=b).exclude(pk=product.pk).exists():
+        other = Product.objects.filter(company_id=company_id, barcode=b).exclude(pk=product.pk).only("name", "code").first()
+        if other is not None:
+            code = f" (код {other.code})" if other.code else ""
             raise serializers.ValidationError({
-                "alternate_barcodes": f"Штрихкод «{b}» уже используется как основной у другого товара.",
+                "alternate_barcodes": f"Штрихкод «{b}» уже есть у товара «{other.name}»{code} как основной.",
             })
-        if ProductAlternateBarcode.objects.filter(company_id=company_id, barcode=b).exclude(
+        alt = ProductAlternateBarcode.objects.filter(company_id=company_id, barcode=b).exclude(
             product_id=product.pk
-        ).exists():
+        ).select_related("product").first()
+        if alt is not None:
+            code = f" (код {alt.product.code})" if alt.product.code else ""
             raise serializers.ValidationError({
-                "alternate_barcodes": f"Штрихкод «{b}» уже зарегистрирован как дополнительный у другого товара.",
+                "alternate_barcodes": f"Штрихкод «{b}» уже есть у товара «{alt.product.name}»{code} как дополнительный.",
             })
 
     old_codes = list(product.alternate_barcodes.values_list("barcode", flat=True))
@@ -1378,9 +1382,11 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         qs = ProductAlternateBarcode.objects.filter(company_id=company_id, barcode=b)
         if pk:
             qs = qs.exclude(product_id=pk)
-        if qs.exists():
+        alt = qs.select_related("product").first()
+        if alt is not None:
+            code = f" (код {alt.product.code})" if alt.product.code else ""
             raise serializers.ValidationError(
-                "Этот штрих-код уже используется как дополнительный у другого товара."
+                f"Штрихкод «{b}» уже есть у товара «{alt.product.name}»{code} как дополнительный."
             )
         return b
 
@@ -1628,6 +1634,14 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             pup = self._safe_decimal(getattr(pkg, "piece_unit_price", None), self._Q2)
             setattr(pkg, "piece_unit_price", pup)
 
+    def to_internal_value(self, data):
+        # «Калькуляция», задача 4: is_promo — понятное имя для stock («Акционный товар»).
+        # Принимаем его вместо stock; если пришли оба — главный stock (старое имя).
+        if hasattr(data, "get") and "is_promo" in data and "stock" not in data:
+            data = data.copy() if hasattr(data, "copy") else dict(data)
+            data["stock"] = data.get("is_promo")
+        return super().to_internal_value(data)
+
     def to_representation(self, instance):
         # чистим проблемные Decimal перед сериализацией, чтобы избежать InvalidOperation
         self._sanitize_decimal_fields(instance)
@@ -1636,6 +1650,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         except InvalidOperation:
             self._sanitize_decimal_fields(instance)
             data = super().to_representation(instance)
+        if "stock" in data:
+            data["is_promo"] = data["stock"]
         try:
             data["alternate_barcodes"] = [
                 {"barcode": item.barcode, "name": item.name, "quantity": item.quantity}

@@ -23,47 +23,19 @@ class BarcodeDuplicatesAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        # Расширено для «Калькуляции» (calculator-after-stress-test/03): у товара есть code,
+        # status, branch_name; у группы — same_scope (true — дубль в одном филиале/основном
+        # каталоге, нужно объединить; false — копии в разных филиалах после перемещения).
+        # ?same_scope_only=true — только настоящие дубли.
+        from apps.main.duplicate_barcodes import find_duplicate_barcodes
+
         company = _company(request)
-        owners = defaultdict(dict)  # barcode -> {product_id: is_alternate}
-
-        main = (
-            Product.objects.filter(company=company)
-            .exclude(barcode__isnull=True)
-            .exclude(barcode="")
-            .values_list("id", "barcode")
+        same_scope_only = str(request.query_params.get("same_scope_only") or "").strip().lower() in (
+            "1", "true", "yes", "on",
         )
-        for pid, bc in main:
-            owners[bc.strip()][pid] = False
-        alt = ProductAlternateBarcode.objects.filter(company=company).values_list("product_id", "barcode")
-        for pid, bc in alt:
-            owners[(bc or "").strip()].setdefault(pid, True)
-
-        dup = {bc: pids for bc, pids in owners.items() if bc and len(pids) > 1}
-        products = {
-            p.id: p
-            for p in Product.objects.filter(id__in={pid for pids in dup.values() for pid in pids}).only(
-                "id", "name", "quantity", "created_at", "branch_id"
-            )
-        }
-        result = []
-        for bc in sorted(dup):
-            rows = []
-            for pid, is_alt in dup[bc].items():
-                p = products.get(pid)
-                if p is None:
-                    continue
-                rows.append({
-                    "id": str(p.id),
-                    "name": p.name,
-                    "quantity": str(p.quantity),
-                    "created_at": p.created_at.isoformat() if p.created_at else None,
-                    "branch": str(p.branch_id) if p.branch_id else None,
-                    "is_alternate": is_alt,
-                })
-            rows.sort(key=lambda r: r["created_at"] or "")
-            if len(rows) > 1:
-                result.append({"barcode": bc, "products": rows})
-        return Response(result)
+        return Response(find_duplicate_barcodes(
+            Product.objects.filter(company=company), same_scope_only=same_scope_only,
+        ))
 
 
 class _BatchItemRequest:

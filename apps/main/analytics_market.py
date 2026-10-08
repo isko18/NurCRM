@@ -1192,6 +1192,10 @@ class AnalyticsView(APIView):
                 "cogs": str(_money(cogs)) if cogs is not None else None,
                 "gross_profit": str(_money(gross_profit)) if gross_profit is not None else None,
                 "margin_percent": margin_percent,
+                # Синонимы для «Калькуляции» (calculator-after-stress-test/04): фронт читает
+                # *_total, как на вкладке смен. Значения те же.
+                "gross_profit_total": str(_money(gross_profit)) if gross_profit is not None else None,
+                "margin_percent_total": margin_percent,
                 "cogs_warning": cogs_warning,
                 "catalog_products_count": catalog_products_count,
                 "total_stock_quantity": total_stock_quantity,
