@@ -19,6 +19,7 @@ from uuid import UUID
 
 from apps.users.models import Branch
 
+from .validators import WarehouseGuardMixin
 from .serializers import (
     WarehouseSerializer,
     BrandSerializer,
@@ -504,7 +505,7 @@ def filter_qs_company_branch_or_global(view, qs):
 
 
 # ==== Warehouse views ====
-class WarehouseView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+class WarehouseView(WarehouseGuardMixin, CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = WarehouseSerializer
     queryset = m.Warehouse.objects.select_related("company", "branch").all()
     filter_backends = [DjangoFilterBackend]
@@ -521,7 +522,7 @@ class WarehouseView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
         )
 
 
-class WarehouseDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class WarehouseDetailView(WarehouseGuardMixin, CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = WarehouseSerializer
     queryset = m.Warehouse.objects.select_related("company", "branch").all()
     lookup_field = "id"

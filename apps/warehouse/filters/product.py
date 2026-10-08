@@ -1,6 +1,6 @@
 
 import django_filters
-from django.db.models import Q
+from django.db.models import F, Q
 
 from apps.warehouse.models import (
     WarehouseProduct,
@@ -38,6 +38,10 @@ class ProductFilter(django_filters.FilterSet):
     # Прочее
     status = django_filters.ChoiceFilter(choices=WarehouseProduct.Status.choices)
     stock = django_filters.BooleanFilter(field_name="stock")
+    # QA B37: весовые товары склада (для весов и печати этикеток)
+    is_weight = django_filters.BooleanFilter(field_name="is_weight")
+    # QA B08: остаток ниже минимального (minimum_quantity > 0 и quantity < minimum_quantity)
+    below_minimum = django_filters.BooleanFilter(method="filter_below_minimum")
 
     # По дате создания (опционально)
     created_after = django_filters.DateFilter(field_name="created_at", lookup_expr="gte")
@@ -53,6 +57,8 @@ class ProductFilter(django_filters.FilterSet):
             "product_group",
             "status",
             "stock",
+            "is_weight",
+            "below_minimum",
             "name",
             "article",
             "search",
@@ -85,3 +91,9 @@ class ProductFilter(django_filters.FilterSet):
             | Q(alternate_barcodes__barcode__icontains=value)
             | Q(alternate_barcodes__name__icontains=value)
         ).distinct()
+
+    def filter_below_minimum(self, queryset, name, value):
+        cond = Q(minimum_quantity__gt=0, quantity__lt=F("minimum_quantity"))
+        if value is None:
+            return queryset
+        return queryset.filter(cond) if value else queryset.exclude(cond)

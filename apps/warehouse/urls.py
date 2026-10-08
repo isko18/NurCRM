@@ -43,6 +43,8 @@ from .views import (
 )
 from .views_documents import (
     DocumentListCreateView, DocumentDetailView, DocumentPostView, DocumentUnpostView,
+    DocumentReturnableView,
+    GenerateBarcodeView,
     DocumentCashApproveView, DocumentCashRejectView,
     CashApprovalRequestListView, CashApprovalRequestApproveView, CashApprovalRequestRejectView,
     AgentDocumentListCreateView, AgentDocumentDetailView,
@@ -67,6 +69,7 @@ from .views_money import (
     MoneyDocumentDetailView,
     MoneyDocumentPostView,
     MoneyDocumentUnpostView,
+    WarehousePeriodCloseView,
     MoneyDocumentRejectView,
     CounterpartyMoneyOperationsView,
     WarehouseCashConfirmationSettingsView,
@@ -135,6 +138,7 @@ urlpatterns = [
 
     # global product catalog across all company warehouses (list only)
     path("products/", WarehouseProductCatalogListView.as_view(), name="warehouse-products-catalog"),
+    path("products/generate-barcode/", GenerateBarcodeView.as_view(), name="warehouse-products-generate-barcode"),
 
     # product detail (global by product uuid)
     path("products/<uuid:product_uuid>/", ProductDetailView.as_view(), name="warehouse-product-detail"),
@@ -258,6 +262,8 @@ urlpatterns += [
     path("documents/<uuid:pk>/", DocumentDetailView.as_view(), name="warehouse-document-detail"),
     path("documents/<uuid:pk>/post/", DocumentPostView.as_view(), name="warehouse-document-post"),
     path("documents/<uuid:pk>/unpost/", DocumentUnpostView.as_view(), name="warehouse-document-unpost"),
+    path("documents/<uuid:pk>/returnable/", DocumentReturnableView.as_view(), name="warehouse-document-returnable"),
+    path("settings/period-close/", WarehousePeriodCloseView.as_view(), name="warehouse-period-close"),
     path("documents/<uuid:pk>/cash/approve/", DocumentCashApproveView.as_view(), name="warehouse-document-cash-approve"),
     path("documents/<uuid:pk>/cash/reject/", DocumentCashRejectView.as_view(), name="warehouse-document-cash-reject"),
     path("cash/requests/", CashApprovalRequestListView.as_view(), name="warehouse-cash-requests"),

@@ -707,6 +707,8 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
     money_qs = wm.MoneyDocument.objects.filter(
         company=company,
         status=wm.MoneyDocument.Status.POSTED,
+        # Миграционные приходы (B05) закрывают старые долги, но деньги кассы не двигают.
+        is_migration=False,
         doc_type__in=(wm.MoneyDocument.DocType.MONEY_RECEIPT, wm.MoneyDocument.DocType.MONEY_EXPENSE),
         date__gte=dt_from,
         date__lt=dt_to_excl,
@@ -717,15 +719,14 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
     # или без. Они НЕ должны попадать ни в обычный приход/расход, ни в графу «операции с
     # контрагентами» — считаются отдельной графой «долг» (money_debt_*).
     is_debt = Q(payment_category__system_code=wm.PaymentCategory.SystemCode.DEBT)
-    # Денежные операции с контрагентом (counterparty задан, кроме «Долги») — это взаиморасчёты
-    # по сальдо (оплата контрагенту / приход от контрагента). Они НЕ должны попадать в обычный
-    # приход/расход кассы (иначе сальдо кассы искажается), а учитываются отдельной графой
-    # «операции с контрагентами».
-    # Авто-оплаты товарных документов (source_document задан: продажа, закупка, возвраты,
-    # предоплата) — обычное движение кассы, даже если у документа есть контрагент.
-    is_cp = Q(counterparty_id__isnull=False) & Q(source_document__isnull=True) & ~is_debt
-    # Обычный приход/расход (формирует сальдо кассы): ручные документы без контрагента
-    # и авто-оплаты товарных документов; не «долг».
+    # QA B11 (A3): операция относится к блоку «контрагенты», если у денежного документа есть
+    # контрагент ИЛИ он создан из товарного документа с контрагентом (оплата продажи/закупа,
+    # возвраты, предоплата, погашение долга). Раньше авто-оплаты товарных документов и
+    # погашения долга попадали в «кассу без контрагентов».
+    # Операции по категории «Долги» по-прежнему — отдельная графа money_debt_* (не задваиваем).
+    is_cp = (Q(counterparty_id__isnull=False) | Q(source_document__counterparty_id__isnull=False)) & ~is_debt
+    # «Касса без контрагентов»: только документы без контрагента и без основания с
+    # контрагентом — ручные приходы/расходы, инкассация, зарплата.
     is_regular = ~is_cp & ~is_debt
     RECEIPT = wm.MoneyDocument.DocType.MONEY_RECEIPT
     EXPENSE = wm.MoneyDocument.DocType.MONEY_EXPENSE
@@ -824,8 +825,11 @@ def _build_owner_cash_analytics(*, company, branch, dt_from, dt_to_excl, group_b
         )
 
     def _by_category(doc_type):
+        # Разбивка по категориям — по всем операциям кассы, кроме «Долгов» (в т.ч. с контрагентами, B11):
+        # иначе после переноса оплат документов в блок «контрагенты» из отчёта по
+        # категориям пропали бы «Продажа» и «Закупка».
         qs = (
-            money_qs.filter(Q(doc_type=doc_type) & is_regular)
+            money_qs.filter(Q(doc_type=doc_type) & ~is_debt)
             .values("payment_category_id", "payment_category__title")
             .annotate(
                 docs_count=Count("id"),

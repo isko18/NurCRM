@@ -1,6 +1,7 @@
 """
 Партнёрство компаний (склад + касса). Все операции — только владелец/админ, агентам никогда (stock-partnership.md §7).
 """
+from django.utils import timezone
 from datetime import date, timedelta
 from decimal import Decimal
 
@@ -243,7 +244,7 @@ class PartnershipTerminateAPIView(_PartnershipBase):
             "partner_company_id": str(partner.id),
             "partnership_id": str(p.id),
             "status": p.status,
-            "terminated_at": p.terminated_at.isoformat(),
+            "terminated_at": timezone.localtime(p.terminated_at).isoformat(),
             "cancelled_operations": cancelled,
         })
 
@@ -377,7 +378,7 @@ class PartnerWarehousesAPIView(_PartnershipBase):
             "partner_company": {"id": str(partner.id), "name": partner.name},
             "partnership": {
                 "id": str(p.id),
-                "since": (p.activated_at or p.created_at).isoformat(),
+                "since": timezone.localtime(p.activated_at or p.created_at).isoformat(),
                 "allow_direct_pull": p.allows_direct_pull_from(my.id),
                 "partner_allows_direct_pull": partner_allows,
             },

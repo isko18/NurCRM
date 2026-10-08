@@ -136,33 +136,68 @@ def _restrict_pk_queryset_strict(field, base_qs, company, branch):
 
 def ensure_system_payment_categories(company, branch=None):
     """
-    Идемпотентно создаёт системные категории «Продажа», «Долги» и «Инкассация» для компании или филиала.
-    Если уже есть запись с тем же title и без system_code — присваивает ей системный код.
-    """
-    try:
-        from . import models
+    Идемпотентно создаёт системные категории («Продажа», «Долги», «Закупка», …) компании.
 
-        for member in models.PaymentCategory.SystemCode:
-            code = member.value
-            title = member.label
-            qs = models.PaymentCategory.objects.filter(company=company, branch=branch)
-            existing = qs.filter(system_code=code).first()
-            if existing:
-                if existing.title != title:
-                    existing.title = title
-                    existing.save(update_fields=["title"])
-                continue
-            orphan = qs.filter(system_code__isnull=True, title=title).first()
-            if orphan:
-                orphan.system_code = code
-                orphan.save(update_fields=["system_code"])
-                continue
-            models.PaymentCategory.objects.create(
-                company=company,
-                branch=branch,
-                system_code=code,
-                title=title,
-            )
+    QA B13: системные категории — одни на компанию (branch=NULL), а не копия на каждый
+    филиал: раньше владелец без выбранного филиала видел «Закупку» столько раз, сколько
+    филиалов, и отчёты по категориям расходились. Аргумент branch оставлен для
+    совместимости вызовов и не используется.
+    Если уже есть запись компании с тем же title и без system_code — ей присваивается код.
+    """
+    import logging
+
+    from django.db import transaction
+
+    from . import models
+    from apps.users.models import Company
+
+    if company is None:
+        return
+    all_codes = {m.value for m in models.PaymentCategory.SystemCode}
+    have = set(
+        models.PaymentCategory.objects.filter(
+            company=company, branch__isnull=True, system_code__isnull=False
+        ).values_list("system_code", flat=True)
+    )
+    if all_codes <= have:
+        # Быстрый путь без блокировки: всё уже создано (обычный случай).
+        return
+    try:
+        with transaction.atomic():
+            # Сериализуем создание по компании: параллельные проведения не создадут дубли.
+            Company.objects.select_for_update().filter(pk=company.pk).first()
+            qs = models.PaymentCategory.objects.filter(company=company, branch__isnull=True)
+            for member in models.PaymentCategory.SystemCode:
+                code = member.value
+                title = member.label
+                existing = qs.filter(system_code=code).exists()
+                if existing:
+                    continue
+                orphan = qs.filter(system_code__isnull=True, title=title).first()
+                if orphan:
+                    orphan.system_code = code
+                    orphan.save(update_fields=["system_code"])
+                    continue
+                models.PaymentCategory.objects.create(
+                    company=company,
+                    branch=None,
+                    system_code=code,
+                    title=title,
+                )
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("ensure_system_payment_categories failed for company %s", getattr(company, "pk", None))
+
+
+def system_payment_category(company, code):
+    """Системная категория компании по коду (создаётся при необходимости)."""
+    from . import models
+
+    if company is None:
+        return None
+    ensure_system_payment_categories(company)
+    return (
+        models.PaymentCategory.objects.filter(company=company, branch__isnull=True, system_code=code)
+        .order_by("id")
+        .first()
+    )
 

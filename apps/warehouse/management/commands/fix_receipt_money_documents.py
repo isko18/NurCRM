@@ -187,8 +187,11 @@ class Command(BaseCommand):
                     # остаётся в его комментарии), чтобы привязать корректный расход.
                     m.MoneyDocument.objects.filter(pk=money.pk).update(source_document=None)
                     doc = m.Document.objects.get(pk=doc.pk)
+                # Исправление прошлых данных: текущий остаток кассы не проверяем (B06 —
+                # для новых операций), расход ставится датой документа.
                 new_money = services._create_or_post_money_document(
-                    doc, money_doc_type=m.MoneyDocument.DocType.MONEY_EXPENSE, amount=amount
+                    doc, money_doc_type=m.MoneyDocument.DocType.MONEY_EXPENSE, amount=amount,
+                    allow_negative_cash=True,
                 )
                 m.MoneyDocument.objects.filter(pk=new_money.pk).update(
                     date=doc.date, comment=f"{new_money.comment}\n{REGEN_NOTE}".strip()

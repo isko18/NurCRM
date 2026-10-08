@@ -9,6 +9,7 @@ from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 
 import logging
+from datetime import timedelta
 from decimal import Decimal
 
 from . import models, serializers_documents, services, services_money
@@ -22,9 +23,28 @@ from .views import (
     ProductCatalogPagination,
 )
 from .filters import ProductFilter
+from .validators import WarehouseGuardMixin, ensure_unique_counterparty
 from apps.utils import _is_owner_like
 
 logger = logging.getLogger(__name__)
+
+
+def _truthy(raw) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in ("true", "1", "yes", "y", "on")
+
+
+def _service_error_response(exc):
+    return Response(services.error_payload(exc), status=services.error_status(exc))
+
+
+def _raise_service_error(exc):
+    from rest_framework.exceptions import PermissionDenied
+
+    if services.error_status(exc) == 403:
+        raise PermissionDenied(services.error_payload(exc))
+    raise DRFValidationError(services.error_payload(exc))
 
 
 def _agent_allowed_for_company(agent_user, company):
@@ -103,9 +123,39 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
         # Необязательная фильтрация по операционной дате документа:
         # ?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD (по полю date, не created_at).
         qs = services_money.apply_requested_date_range(qs, "date", self)
+        qs = self._apply_extra_filters(qs)
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
+        return qs
+
+    def _apply_extra_filters(self, qs):
+        """
+        ?posted_negative=true — проведённые в минус (B02);
+        ?stale_days=N — «зависшие»: ждут кассу / заявка дольше N дней (B43);
+        ?base_document=<uuid> — возвраты по документу (B04).
+        """
+        params = self.request.query_params
+        if "posted_negative" in params:
+            if _truthy(params.get("posted_negative")):
+                qs = qs.filter(posted_negative_at__isnull=False)
+            else:
+                qs = qs.filter(posted_negative_at__isnull=True)
+        raw_stale = (params.get("stale_days") or "").strip()
+        if raw_stale:
+            try:
+                days = max(0, int(raw_stale))
+            except ValueError:
+                raise DRFValidationError({"stale_days": "Укажите целое число дней."})
+            border = timezone.now() - timedelta(days=days)
+            qs = qs.filter(
+                Q(status=models.Document.Status.CASH_PENDING)
+                & (Q(cash_request__requested_at__lte=border) | Q(cash_request__isnull=True, updated_at__lte=border))
+                | Q(status=models.Document.Status.SALE_REQUEST, updated_at__lte=border)
+            )
+        raw_base = (params.get("base_document") or "").strip()
+        if raw_base:
+            qs = qs.filter(base_document_id=raw_base)
         return qs
 
     def _enforce_wholesale_permission(self, serializer, user):
@@ -246,13 +296,11 @@ class DocumentTransferListCreateView(_DocumentTypedListCreateView):
         doc = serializer.instance
         if doc and doc.status == doc.Status.DRAFT:
             try:
-                allow_negative = self.request.data.get("allow_negative", False)
-                if isinstance(allow_negative, str):
-                    allow_negative = allow_negative.lower() in ("true", "1", "yes")
-                services.post_document(doc, allow_negative=allow_negative)
+                allow_negative = _truthy(self.request.data.get("allow_negative", False))
+                services.post_document(doc, allow_negative=allow_negative, user=self.request.user)
                 doc.refresh_from_db()
             except Exception as e:
-                raise DRFValidationError(services.error_payload(e))
+                _raise_service_error(e)
 
 
 class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -289,6 +337,12 @@ class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDe
         doc = instance
         if doc.status != models.Document.Status.DRAFT:
             raise DRFValidationError({"detail": "Удалить можно только черновик. Сначала отмените проведение."})
+        try:
+            services.ensure_period_open(
+                company=services.document_company(doc), dates=[doc.date], user=self.request.user
+            )
+        except Exception as e:
+            _raise_service_error(e)
         if doc.is_sale_request or models.AgentRequestCart.objects.filter(sale_document=doc).exists():
             raise DRFValidationError({"detail": "Заявку агента нельзя удалить как черновик."})
         if doc.moves.exists() or doc.agent_moves.exists():
@@ -480,9 +534,12 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
         # 2. Если документ ожидает решения кассы (CASH_PENDING), утверждаем кассовый запрос до POSTED
         if doc.status == doc.Status.CASH_PENDING:
             try:
-                services.approve_cash_request(doc, decided_by=request.user)
+                services.approve_cash_request(
+                    doc, decided_by=request.user,
+                    allow_negative_cash=_truthy(request.data.get("allow_negative_cash")),
+                )
             except Exception as e:
-                return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+                return _service_error_response(e)
             doc.refresh_from_db()
             return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
 
@@ -530,6 +587,7 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
                 allow_negative=allow_negative,
                 user=request.user,
                 allow_duplicate=bool(allow_duplicate),
+                allow_negative_cash=_truthy(request.data.get("allow_negative_cash")),
             )
             doc.refresh_from_db()
 
@@ -551,7 +609,7 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
                     logger.warning("Auto approve cash request failed: %s", e)
 
         except Exception as e:
-            return Response(services.error_payload(e), status=status.HTTP_400_BAD_REQUEST)
+            return _service_error_response(e)
         doc.refresh_from_db()
         return Response(self.get_serializer(doc).data)
 
@@ -586,9 +644,13 @@ class DocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
                     status=status.HTTP_403_FORBIDDEN,
                 )
         try:
-            services.unpost_document(doc)
+            services.unpost_document(
+                doc,
+                user=request.user,
+                allow_negative=_truthy(request.data.get("allow_negative")),
+            )
         except Exception as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return _service_error_response(e)
         return Response(self.get_serializer(doc).data)
 
 
@@ -609,9 +671,12 @@ class DocumentCashApproveView(CompanyBranchRestrictedMixin, generics.GenericAPIV
         doc = self.get_object()
         note = (request.data.get("note") or "").strip()
         try:
-            services.approve_cash_request(doc, decided_by=request.user, note=note)
+            services.approve_cash_request(
+                doc, decided_by=request.user, note=note,
+                allow_negative_cash=_truthy(request.data.get("allow_negative_cash")),
+            )
         except Exception as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return _service_error_response(e)
         doc.refresh_from_db()
         return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
 
@@ -638,6 +703,40 @@ class DocumentCashRejectView(CompanyBranchRestrictedMixin, generics.GenericAPIVi
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         doc.refresh_from_db()
         return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
+
+
+class DocumentReturnableView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    """
+    QA B04: сколько можно вернуть по продаже/закупу.
+    GET /api/warehouse/documents/{id}/returnable/
+    → {"items": [{"base_item", "product", "name", "sold", "returned", "returnable", "price"}]}
+    """
+
+    serializer_class = serializers_documents.DocumentSerializer
+
+    def get_queryset(self):
+        qs = models.Document.objects.select_related("warehouse_from", "warehouse_to", "counterparty")
+        qs = DocumentListCreateView._filter_company_branch(self, qs)
+        if not _is_owner_like(self.request.user):
+            qs = qs.filter(agent=self.request.user)
+        return qs
+
+    def get(self, request, pk=None):
+        doc = self.get_object()
+        if doc.doc_type not in (models.Document.DocType.SALE, models.Document.DocType.PURCHASE):
+            return Response(
+                {"detail": "Возврат оформляется только по продаже или закупу.", "code": "return_base_invalid"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response({
+            "document": str(doc.pk),
+            "number": doc.number,
+            "status": doc.status,
+            "counterparty": str(doc.counterparty_id) if doc.counterparty_id else None,
+            "paid": str(services._base_document_paid_amount(doc)),
+            "refunded": str(services._returns_cash_refunded(doc)),
+            "items": services.returnable_items(doc),
+        })
 
 
 class CashApprovalRequestListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
@@ -707,9 +806,12 @@ class CashApprovalRequestApproveView(CompanyBranchRestrictedMixin, generics.Gene
         note = (ser.validated_data.get("note") or "").strip()
 
         try:
-            services.approve_cash_request(cash_request.document, decided_by=request.user, note=note)
+            services.approve_cash_request(
+                cash_request.document, decided_by=request.user, note=note,
+                allow_negative_cash=_truthy(request.data.get("allow_negative_cash")),
+            )
         except Exception as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return _service_error_response(e)
 
         cash_request.refresh_from_db()
         out = serializers_documents.CashApprovalRequestSerializer(cash_request, context={"request": request}).data
@@ -807,12 +909,29 @@ class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
             item.save()
 
         try:
-            services.post_document(doc)
+            services.post_document(
+                doc, user=request.user, allow_negative=_truthy(request.data.get("allow_negative"))
+            )
         except Exception as e:
-            raise DRFValidationError(services.error_payload(e))
+            _raise_service_error(e)
 
         out = serializers_documents.DocumentSerializer(doc, context={"request": request}).data
         return Response(out, status=status.HTTP_201_CREATED)
+
+
+class GenerateBarcodeView(CompanyBranchRestrictedMixin, APIView):
+    """
+    QA B30: следующий свободный внутренний штрихкод EAN-13 (префикс 20) компании.
+    GET /api/warehouse/products/generate-barcode/ → {"barcode": "2000000000017"}
+    """
+
+    def get(self, request, *args, **kwargs):
+        from .validators import generate_internal_barcode
+
+        company = self._company()
+        if company is None:
+            raise DRFValidationError({"company": "Компания не найдена."})
+        return Response({"barcode": generate_internal_barcode(company)})
 
 
 class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
@@ -868,7 +987,7 @@ class ProductDetailView(ProtectedProductDeleteMixin, CompanyBranchRestrictedMixi
         return self._filter_qs_company_branch(qs)
 
 
-class WarehouseListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+class WarehouseListCreateView(WarehouseGuardMixin, CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = serializers_documents.WarehouseSimpleSerializer
     
     def get_queryset(self):
@@ -877,7 +996,7 @@ class WarehouseListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateA
         return self._filter_qs_company_branch(qs)
 
 
-class WarehouseDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class WarehouseDetailView(WarehouseGuardMixin, CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = serializers_documents.WarehouseSimpleSerializer
     
     def get_queryset(self):
@@ -988,6 +1107,12 @@ class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
 
     def perform_create(self, serializer):
         user = self.request.user
+        # B16: дубли по телефону/ИНН запрещены, по имени — только с force_duplicate_name.
+        ensure_unique_counterparty(
+            company=self._company(),
+            data=serializer.validated_data,
+            force_duplicate_name=_truthy(self.request.data.get("force_duplicate_name")),
+        )
         if _is_owner_like(user):
             company = self._company()
             agent = serializer.validated_data.get("agent")
@@ -1022,6 +1147,12 @@ class CounterpartyDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpda
     def perform_update(self, serializer):
         user = self.request.user
         instance = serializer.instance
+        ensure_unique_counterparty(
+            company=instance.company or self._company(),
+            data=serializer.validated_data,
+            instance=instance,
+            force_duplicate_name=_truthy(self.request.data.get("force_duplicate_name")),
+        )
         if _is_owner_like(user):
             company = getattr(instance, "company", None) or self._company()
             agent = serializer.validated_data.get("agent")

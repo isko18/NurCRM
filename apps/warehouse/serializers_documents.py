@@ -1,6 +1,7 @@
 from decimal import Decimal
 from rest_framework import serializers
 from django.db import transaction
+from django.utils import timezone
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.exceptions import ObjectDoesNotExist
 from django.contrib.auth import get_user_model
@@ -128,6 +129,45 @@ def _apply_sale_price_to_item(item_data: dict, doc) -> dict:
     return merged
 
 
+def _raise_service_error(exc):
+    """Ошибка сервиса склада → DRF-ответ с тем же телом/кодом (403 для прав, иначе 400)."""
+    from rest_framework.exceptions import PermissionDenied
+
+    payload = warehouse_services.error_payload(exc)
+    if warehouse_services.error_status(exc) == 403:
+        raise PermissionDenied(payload)
+    raise serializers.ValidationError(payload)
+
+
+def _fill_item_from_base(item_data: dict, base_document) -> dict:
+    """
+    QA B04: строка возврата по строке продажи/закупа. Товар, цена и скидка берутся из
+    строки-основания, а не из запроса.
+    """
+    base_item = item_data.get("base_item")
+    if base_item is None:
+        return item_data
+    if base_document is not None and base_item.document_id != base_document.pk:
+        raise serializers.ValidationError(
+            {"items": {"base_item": "Строка-основание не принадлежит документу-основанию.", "code": "return_base_invalid"}}
+        )
+    base_doc = base_item.document
+    eff_pct = warehouse_services.effective_document_line_discount_percent(
+        base_item.discount_percent, base_doc.discount_percent
+    )
+    merged = dict(item_data)
+    merged["product"] = base_item.product
+    merged["price"] = Decimal(base_item.price or 0)
+    merged["discount_percent"] = eff_pct
+    discount_amount = Decimal("0.00")
+    if eff_pct <= 0 and Decimal(base_item.discount_amount or 0) > 0 and Decimal(base_item.qty or 0) > 0:
+        discount_amount = (
+            Decimal(base_item.discount_amount) * Decimal(item_data.get("qty") or 0) / Decimal(base_item.qty)
+        ).quantize(Decimal("0.01"))
+    merged["discount_amount"] = discount_amount
+    return merged
+
+
 class StockMoveSerializer(serializers.ModelSerializer):
     """Сериализатор движения товара с видом: приход или расход."""
 
@@ -190,11 +230,23 @@ class DocumentItemSerializer(serializers.ModelSerializer):
         max_digits=18, decimal_places=2, required=False, allow_null=True
     )
     effective_discount_percent = serializers.SerializerMethodField()
+    # QA B04: строка продажи/закупа, по которой оформлен возврат.
+    base_item = serializers.PrimaryKeyRelatedField(
+        queryset=models.DocumentItem.objects.select_related("document", "product"),
+        required=False,
+        allow_null=True,
+    )
+    # QA B01: куда зачислен товар на складе-получателе (перемещение).
+    target_product = serializers.PrimaryKeyRelatedField(read_only=True)
+    target_product_name = serializers.CharField(source="target_product.name", read_only=True, allow_null=True)
 
     class Meta:
         model = models.DocumentItem
         fields = (
             "id",
+            "base_item",
+            "target_product",
+            "target_product_name",
             "product",
             "product_name",
             "product_article",
@@ -309,6 +361,14 @@ class DocumentSerializer(serializers.ModelSerializer):
     created_by_email = serializers.EmailField(source="created_by.email", read_only=True, allow_null=True)
     initiator_company = serializers.PrimaryKeyRelatedField(read_only=True)
     initiator_company_name = serializers.CharField(source="initiator_company.name", read_only=True, allow_null=True)
+    base_document = serializers.PrimaryKeyRelatedField(
+        queryset=models.Document.objects.all(), required=False, allow_null=True,
+        help_text="Продажа (для SALE_RETURN) или закуп (для PURCHASE_RETURN), по которой оформлен возврат.",
+    )
+    base_document_number = serializers.CharField(source="base_document.number", read_only=True, allow_null=True)
+    posted_negative_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    date_changed_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    pending_since = serializers.SerializerMethodField()
 
     class Meta:
         ref_name = "WarehouseDocumentSerializer"
@@ -356,8 +416,59 @@ class DocumentSerializer(serializers.ModelSerializer):
             "receipts",
             "expenses",
             "cashflows",
+            "base_document",
+            "base_document_number",
+            "posted_negative_by",
+            "posted_negative_at",
+            "date_changed_by",
+            "date_changed_at",
+            "pending_since",
         )
-        read_only_fields = ("number", "total", "status", "cash_request_status", "cashflows")
+        read_only_fields = (
+            "number", "total", "status", "cash_request_status", "cashflows",
+            "posted_negative_by", "posted_negative_at", "date_changed_by", "date_changed_at",
+        )
+
+    def get_pending_since(self, obj):
+        """QA B43: с какого момента документ ждёт кассу (CASH_PENDING), иначе null."""
+        if obj.status != models.Document.Status.CASH_PENDING:
+            return None
+        req = self._safe_one_to_one(obj, "cash_request")
+        value = getattr(req, "requested_at", None) or obj.updated_at
+        return serializers.DateTimeField().to_representation(value) if value else None
+
+    def _request_user(self):
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request is not None else None
+        return user if getattr(user, "is_authenticated", False) else None
+
+    def _check_date_rules(self, attrs):
+        """QA B07: смена даты — только с правом; закрытый период — по старой и новой дате."""
+        user = self._request_user()
+        if user is None:
+            return
+        new_date = attrs.get("date")
+        old_date = getattr(self.instance, "date", None)
+        company_id = None
+        wh = attrs.get("warehouse_from") or attrs.get("warehouse_to")
+        if wh is None and self.instance is not None:
+            wh = self.instance.warehouse_from or self.instance.warehouse_to
+        if wh is not None:
+            company_id = wh.company_id
+        elif self.instance is not None:
+            company_id = warehouse_services.document_company(self.instance)
+        try:
+            if new_date is not None and (
+                old_date is None
+                or warehouse_services.document_local_date(new_date)
+                != warehouse_services.document_local_date(old_date)
+            ):
+                warehouse_services.ensure_can_set_document_date(user=user, new_date=new_date)
+            dates = [d for d in (old_date, new_date) if d is not None]
+            if self.instance is not None or new_date is not None:
+                warehouse_services.ensure_period_open(company=company_id, dates=dates, user=user)
+        except (warehouse_services.BusinessRuleError, warehouse_services.OperationForbidden) as exc:
+            _raise_service_error(exc)
 
     def get_cashflows(self, obj):
         from apps.construction.models import CashFlow
@@ -416,6 +527,32 @@ class DocumentSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         if warehouse_services.is_document_date_in_future(attrs.get("date")):
             raise serializers.ValidationError({"date": warehouse_services.DOCUMENT_FUTURE_DATE_ERROR})
+        self._check_date_rules(attrs)
+        base = attrs.get("base_document")
+        if base is None and getattr(self.instance, "base_document", None) is None:
+            # Строки ссылаются на продажу/закуп, а основание документа не задано — берём из строк.
+            for it in attrs.get("items") or []:
+                if it.get("base_item") is not None:
+                    attrs = dict(attrs)
+                    base = attrs["base_document"] = it["base_item"].document
+                    break
+        if base is not None:
+            doc_type = attrs.get("doc_type") or getattr(self.instance, "doc_type", None)
+            expected = warehouse_services.RETURN_BASE_TYPE.get(doc_type)
+            if expected is None or base.doc_type != expected:
+                raise serializers.ValidationError({
+                    "base_document": "Основание указывается только для возврата: продажа для SALE_RETURN, закуп для PURCHASE_RETURN.",
+                    "code": "return_base_invalid",
+                })
+            attrs = dict(attrs)
+            # Контрагент и склад возврата — из основания.
+            if not attrs.get("counterparty") and base.counterparty_id:
+                attrs["counterparty"] = base.counterparty
+            if not attrs.get("warehouse_from") and base.warehouse_from_id:
+                attrs["warehouse_from"] = base.warehouse_from
+        if attrs.get("items"):
+            base_for_items = base if base is not None else getattr(self.instance, "base_document", None)
+            attrs["items"] = [_fill_item_from_base(dict(it), base_for_items) for it in attrs["items"]]
         attrs = self._apply_multi_warehouse_defaults(attrs)
         return super().validate(attrs) if hasattr(super(), "validate") else attrs
 
@@ -606,9 +743,17 @@ class DocumentSerializer(serializers.ModelSerializer):
                     {"status": "Нельзя изменять проведенный/ожидающий кассу документ. Сначала отмените проведение."}
                 )
 
+            date_changed = "date" in validated_data and validated_data["date"] != instance.date
+
             # Валидация документа перед обновлением
             for key, value in validated_data.items():
                 setattr(instance, key, value)
+            if date_changed:
+                user = self._request_user()
+                instance.date_changed_by = user
+                instance.date_changed_at = timezone.now()
+                validated_data["date_changed_by"] = user
+                validated_data["date_changed_at"] = instance.date_changed_at
             if ("is_sale_request" in validated_data) or ("doc_type" in validated_data):
                 instance.status = self._resolve_sale_status(instance.doc_type, instance.is_sale_request, current_status=current_status)
 
@@ -647,6 +792,12 @@ class DocumentSerializer(serializers.ModelSerializer):
                     item.save()
 
             warehouse_services.recalc_document_totals(instance)
+
+            if date_changed:
+                # Денежный документ черновика (после отмены проведения) — с той же датой (B07).
+                models.MoneyDocument.objects.filter(source_document=instance).exclude(
+                    status=models.MoneyDocument.Status.POSTED
+                ).update(date=instance.date)
 
         instance.refresh_from_db()
         return instance
@@ -864,6 +1015,13 @@ class CounterpartySerializer(serializers.ModelSerializer):
         extra_kwargs = {
             "phone": {"required": False, "allow_blank": True},
         }
+
+    def validate_inn(self, value):
+        from .validators import normalize_inn, validate_inn
+
+        if self.instance is not None and normalize_inn(value) == normalize_inn(self.instance.inn):
+            return value
+        return validate_inn(value)
 
     def create(self, validated_data):
         bank_accounts = validated_data.pop("bank_accounts", None)

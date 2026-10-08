@@ -38,6 +38,29 @@ class PaymentCategorySerializer(serializers.ModelSerializer):
         ref_name = "WarehousePaymentCategorySerializer"
 
 
+class MoneyDocumentDateField(serializers.DateTimeField):
+    """YYYY-MM-DD → эта дата + текущее местное время; ISO datetime — как есть."""
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("input_formats", ["iso-8601"])
+        super().__init__(**kwargs)
+
+    def to_internal_value(self, value):
+        import datetime as _dt
+        import re
+
+        from django.utils import timezone
+
+        if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip()):
+            try:
+                day = _dt.date.fromisoformat(value.strip())
+            except ValueError:
+                self.fail("invalid", format="YYYY-MM-DD")
+            now = timezone.localtime()
+            return timezone.make_aware(_dt.datetime.combine(day, now.time().replace(microsecond=0)))
+        return super().to_internal_value(value)
+
+
 class MoneyDocumentSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -67,10 +90,9 @@ class MoneyDocumentSerializer(serializers.ModelSerializer):
 
     # Операционная дата: принимаем YYYY-MM-DD (модалка) или ISO-datetime.
     # Не передана при создании → используется текущий момент (default модели).
-    date = serializers.DateTimeField(
-        required=False,
-        input_formats=["iso-8601", "%Y-%m-%d"],
-    )
+    # Только дата → текущее местное время этого дня, а не 00:00 (QA B15/B32).
+    date = MoneyDocumentDateField(required=False)
+    is_migration = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = models.MoneyDocument
@@ -94,10 +116,11 @@ class MoneyDocumentSerializer(serializers.ModelSerializer):
             "source_document",
             "amount",
             "comment",
+            "is_migration",
             "created_at",
             "updated_at",
         )
-        read_only_fields = ("number", "status", "created_at", "updated_at", "source_document")
+        read_only_fields = ("number", "status", "created_at", "updated_at", "source_document", "is_migration")
         ref_name = "WarehouseMoneyDocumentSerializer"
 
     def validate(self, attrs):
@@ -189,3 +212,19 @@ class WarehouseCashConfirmationSettingsSerializer(serializers.ModelSerializer):
         fields = ("enabled",)
 
 
+
+
+class WarehousePeriodCloseSerializer(serializers.ModelSerializer):
+    updated_by = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = models.WarehouseAccountingSettings
+        fields = ("closed_until", "updated_by", "updated_date")
+        read_only_fields = ("updated_by", "updated_date")
+
+    def validate_closed_until(self, value):
+        from django.utils import timezone
+
+        if value is not None and value >= timezone.localdate():
+            raise serializers.ValidationError("Закрыть можно только прошедший период (дата раньше сегодняшней).")
+        return value

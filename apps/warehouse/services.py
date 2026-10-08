@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
 from django.db import transaction
@@ -5,8 +6,10 @@ from django.utils import timezone
 from django.conf import settings
 
 from . import models
+from . import op_permissions as perms
 from . import stock as stock_service
 from .models import q_qty
+from .op_permissions import BusinessRuleError, OperationForbidden
 from .utils import effective_payment_kind
 
 
@@ -186,9 +189,21 @@ def compute_document_line_total(
     return max(Decimal("0.00"), (subtotal - da).quantize(Decimal("0.01")))
 
 
+def document_local_date(value):
+    """Календарная дата документа по местному времени (Asia/Bishkek), а не по UTC (QA B33)."""
+    if value is None:
+        return timezone.localdate()
+    if isinstance(value, datetime):
+        if timezone.is_naive(value):
+            value = timezone.make_aware(value)
+        return timezone.localtime(value).date()
+    return value
+
+
 def _ensure_number(document: models.Document):
-    # generate number like TYPE-YYYYMMDD-0001 per day+type
-    today = timezone.now().date()
+    # Номер TYPE-YYYYMMDD-0001: дата — местная дата самого документа (QA B07/B33),
+    # иначе у документа задним числом или проведённого ночью дата в номере «врёт».
+    today = document_local_date(document.date)
     with transaction.atomic():
         seq, created = models.DocumentSequence.objects.select_for_update().get_or_create(
             doc_type=document.doc_type, date=today, defaults={"seq": 0}
@@ -331,12 +346,9 @@ def _resolve_document_payment_category(document, company, branch):
     code = code_by_doc_type.get(document.doc_type)
     if code is None:
         return None
-    from .utils import ensure_system_payment_categories
+    from .utils import system_payment_category
 
-    ensure_system_payment_categories(company, branch)
-    return models.PaymentCategory.objects.filter(
-        company=company, branch=branch, system_code=code
-    ).first()
+    return system_payment_category(company, code)
 
 
 def _pick_single(qs, *, what: str, allow_multiple_take_first: bool = False):
@@ -366,12 +378,82 @@ class CashRegisterNotFound(ValueError):
 
 
 def error_payload(exc) -> dict:
-    """Тело ответа 400 для ошибки сервиса: {"detail": ...} и "code", если он есть у исключения."""
+    """Тело ответа для ошибки сервиса: {"detail": ...}, "code" и доп. поля, если они есть у исключения."""
     data = {"detail": str(exc)}
     code = getattr(exc, "api_code", None)
     if code:
         data["code"] = code
+    extra = getattr(exc, "extra", None)
+    if extra:
+        data.update(extra)
     return data
+
+
+def error_status(exc) -> int:
+    """HTTP-статус для ошибки сервиса: 403 — нет права (OperationForbidden), иначе 400."""
+    return 403 if isinstance(exc, OperationForbidden) else 400
+
+
+# ---------------------------------------------------------------------------
+# Закрытие периода и смена даты (QA B07)
+# ---------------------------------------------------------------------------
+
+def get_closed_until(company):
+    """Дата закрытия периода компании или None."""
+    if company is None:
+        return None
+    company_id = getattr(company, "id", company)
+    return (
+        models.WarehouseAccountingSettings.objects.filter(company_id=company_id)
+        .values_list("closed_until", flat=True)
+        .first()
+    )
+
+
+def ensure_period_open(*, company, dates, user=None):
+    """
+    Документ с датой <= closed_until нельзя проводить, отменять, редактировать и удалять
+    без права can_post_closed_period. dates — старая и/или новая дата документа.
+    """
+    closed_until = get_closed_until(company)
+    if closed_until is None:
+        return
+    for value in dates:
+        if value is None:
+            continue
+        if document_local_date(value) <= closed_until:
+            if perms.has_op_permission(user, perms.POST_CLOSED_PERIOD):
+                return
+            raise BusinessRuleError(
+                f"Период до {closed_until.strftime('%d.%m.%Y')} закрыт. Изменения запрещены.",
+                "period_closed",
+                closed_until=closed_until.isoformat(),
+            )
+
+
+def ensure_can_set_document_date(*, user, new_date):
+    """Дата документа, отличная от сегодняшней, — только с правом can_change_document_date."""
+    if user is None or new_date is None:
+        return
+    if document_local_date(new_date) != timezone.localdate():
+        perms.require_op_permission(user, perms.CHANGE_DOCUMENT_DATE)
+
+
+def document_company(document):
+    company_id = getattr(document, "company_id", None) or document.resolve_company_id()
+    return company_id
+
+
+def ensure_allow_negative_permitted(document, user):
+    """
+    QA B02: allow_negative=true из запроса — только с правом can_post_negative_stock;
+    агентам (в т.ч. мобильное приложение) — никогда.
+    """
+    if user is None:
+        return
+    if document.agent_id or perms.is_warehouse_agent(user):
+        raise OperationForbidden(perms.POST_NEGATIVE_STOCK, "Агенту проведение в минус запрещено.")
+    perms.require_op_permission(user, perms.POST_NEGATIVE_STOCK)
 
 
 def resolve_cash_register(*, company, branch, explicit=None):
@@ -470,6 +552,9 @@ def _create_or_post_money_document(
     document: models.Document,
     money_doc_type: str = None,
     amount: Decimal = None,
+    *,
+    user=None,
+    allow_negative_cash: bool = False,
 ):
     money_doc_type = money_doc_type or _resolve_money_doc_type(document.doc_type)
     if not money_doc_type:
@@ -497,8 +582,11 @@ def _create_or_post_money_document(
                 existing.cash_register = document.cash_register
             if getattr(document, "payment_category", None):
                 existing.payment_category = document.payment_category
+            # Дата денег = дата товарного документа (B07): после смены даты
+            # и повторного проведения денежный документ не остаётся со старой датой.
+            existing.date = document.date
             existing.save()
-            services_money.post_money_document(existing)
+            services_money.post_money_document(existing, user=user, allow_negative_cash=allow_negative_cash)
         return existing
 
     if not document.counterparty_id and document.doc_type in (
@@ -524,9 +612,8 @@ def _create_or_post_money_document(
     if payment_category is not None:
         if payment_category.company_id != company.id:
             raise ValueError("Категория платежа принадлежит другой компании.")
-        if (branch is None and payment_category.branch_id is not None) or (
-            branch is not None and payment_category.branch_id != branch.id
-        ):
+        # Категория компании (branch=NULL) подходит любому филиалу (системные — только такие, B13).
+        if payment_category.branch_id is not None and (branch is None or payment_category.branch_id != branch.id):
             raise ValueError("Категория платежа принадлежит другому филиалу.")
 
     from . import services_money
@@ -534,6 +621,7 @@ def _create_or_post_money_document(
     money_doc = models.MoneyDocument.objects.create(
         doc_type=money_doc_type,
         status=models.MoneyDocument.Status.DRAFT,
+        date=document.date,
         cash_register=cash_register,
         counterparty=document.counterparty,
         payment_category=payment_category,
@@ -544,7 +632,7 @@ def _create_or_post_money_document(
         branch=branch,
         source_document=document,
     )
-    services_money.post_money_document(money_doc)
+    services_money.post_money_document(money_doc, user=user, allow_negative_cash=allow_negative_cash)
     return money_doc
 
 
@@ -558,7 +646,9 @@ def _create_money_document_for_request(document: models.Document, request_obj: m
     )
 
 
-def apply_cash_request_effects(document: models.Document, *, user=None, note: str = ""):
+def apply_cash_request_effects(
+    document: models.Document, *, user=None, note: str = "", allow_negative_cash: bool = False
+):
     """
     Применяет денежные эффекты проведения наличного документа:
     - Создает и сразу проводит MoneyDocument (зачисление/списание в кассу)
@@ -567,7 +657,10 @@ def apply_cash_request_effects(document: models.Document, *, user=None, note: st
     """
     money_doc_type = _resolve_money_doc_type(document.doc_type)
     amount = Decimal(document.total or 0).quantize(Decimal("0.01"))
-    money_doc = _create_or_post_money_document(document, money_doc_type=money_doc_type, amount=amount)
+    money_doc = _create_or_post_money_document(
+        document, money_doc_type=money_doc_type, amount=amount,
+        user=user, allow_negative_cash=allow_negative_cash,
+    )
 
     request_obj = getattr(document, "cash_request", None)
     if request_obj is not None:
@@ -594,12 +687,185 @@ def apply_cash_request_effects(document: models.Document, *, user=None, note: st
     return money_doc
 
 
+# ---------------------------------------------------------------------------
+# Возвраты по документу-основанию (QA B04)
+# ---------------------------------------------------------------------------
+
+RETURN_DOC_TYPES = frozenset({
+    models.Document.DocType.SALE_RETURN,
+    models.Document.DocType.PURCHASE_RETURN,
+})
+
+RETURN_BASE_TYPE = {
+    models.Document.DocType.SALE_RETURN: models.Document.DocType.SALE,
+    models.Document.DocType.PURCHASE_RETURN: models.Document.DocType.PURCHASE,
+}
+
+_POSTED_STATUSES = (models.Document.Status.POSTED, models.Document.Status.CASH_PENDING)
+
+
+def returned_qty_by_base_item(base_document, *, exclude_document_id=None) -> dict:
+    """{base_item_id: Σ qty} по проведённым возвратам этого документа-основания."""
+    from django.db.models import Sum
+
+    qs = models.DocumentItem.objects.filter(
+        base_item__document=base_document,
+        document__status__in=_POSTED_STATUSES,
+    )
+    if exclude_document_id is not None:
+        qs = qs.exclude(document_id=exclude_document_id)
+    return {
+        row["base_item_id"]: q_qty(Decimal(row["s"] or 0))
+        for row in qs.values("base_item_id").annotate(s=Sum("qty"))
+    }
+
+
+def returnable_items(base_document) -> list:
+    """Сколько можно вернуть по каждой строке документа-основания (GET .../returnable/)."""
+    returned = returned_qty_by_base_item(base_document)
+    out = []
+    for item in base_document.items.select_related("product").order_by("id"):
+        sold = q_qty(Decimal(item.qty or 0))
+        ret = returned.get(item.id, Decimal("0.000"))
+        qty = Decimal(item.qty or 0)
+        unit_price = (Decimal(item.net_amount or item.line_total or 0) / qty) if qty else Decimal("0")
+        out.append({
+            "base_item": str(item.id),
+            "product": str(item.product_id) if item.product_id else None,
+            "name": getattr(item.product, "name", "") if item.product_id else "",
+            "sold": str(sold),
+            "returned": str(ret),
+            "returnable": str(max(Decimal("0.000"), q_qty(sold - ret))),
+            "price": str(Decimal(item.price or 0).quantize(Decimal("0.01"))),
+            "unit_net_price": str(unit_price.quantize(Decimal("0.01"))),
+        })
+    return out
+
+
+def _base_document_paid_amount(base_document) -> Decimal:
+    """Сколько реально оплачено по продаже/закупу деньгами (для return_exceeds_paid)."""
+    md = models.MoneyDocument.objects.filter(
+        source_document=base_document, status=models.MoneyDocument.Status.POSTED
+    ).first()
+    if md is not None:
+        return Decimal(md.amount or 0).quantize(Decimal("0.01"))
+    return Decimal("0.00")
+
+
+def _returns_cash_refunded(base_document, *, exclude_document_id=None) -> Decimal:
+    from django.db.models import Sum
+
+    qs = models.MoneyDocument.objects.filter(
+        source_document__base_document=base_document,
+        status=models.MoneyDocument.Status.POSTED,
+    )
+    if exclude_document_id is not None:
+        qs = qs.exclude(source_document_id=exclude_document_id)
+    return Decimal(qs.aggregate(s=Sum("amount"))["s"] or 0).quantize(Decimal("0.01"))
+
+
+def validate_return_document(document, *, user=None):
+    """
+    Проверки возврата при проведении (B04):
+    - есть base_document (переходный период: без основания — только с правом
+      can_post_negative_stock; документы агента — по старым правилам);
+    - основание проведено, того же типа/контрагента/компании;
+    - по каждой строке qty <= продано − уже возвращено (проведённые возвраты);
+    - деньгами из кассы — не больше, чем фактически оплачено по основанию.
+    """
+    base = document.base_document
+    if base is None:
+        if document.agent_id:
+            return
+        if user is not None and perms.has_op_permission(user, perms.POST_NEGATIVE_STOCK):
+            return
+        raise BusinessRuleError(
+            "Укажите документ-основание: возврат оформляется по конкретной "
+            + ("продаже." if document.doc_type == document.DocType.SALE_RETURN else "закупке."),
+            "return_base_required",
+        )
+
+    expected_type = RETURN_BASE_TYPE[document.doc_type]
+    if (
+        base.doc_type != expected_type
+        or base.status != models.Document.Status.POSTED
+        or (document.counterparty_id and base.counterparty_id != document.counterparty_id)
+        or (document_company(base) != document_company(document))
+    ):
+        raise BusinessRuleError(
+            "Документ-основание не подходит: он должен быть проведённой "
+            + ("продажей" if expected_type == models.Document.DocType.SALE else "закупкой")
+            + " этого же контрагента и компании.",
+            "return_base_invalid",
+        )
+
+    returned = returned_qty_by_base_item(base, exclude_document_id=document.pk)
+    requested = {}
+    for item in document.items.select_related("base_item", "product"):
+        if item.base_item_id is None or item.base_item.document_id != base.pk:
+            raise BusinessRuleError(
+                "Каждая строка возврата должна ссылаться на строку документа-основания (base_item).",
+                "return_base_invalid",
+            )
+        requested[item.base_item_id] = requested.get(item.base_item_id, Decimal("0")) + Decimal(item.qty or 0)
+
+    problems = []
+    for base_item in base.items.filter(pk__in=list(requested)).select_related("product"):
+        sold = q_qty(Decimal(base_item.qty or 0))
+        ret = returned.get(base_item.pk, Decimal("0.000"))
+        req = q_qty(requested[base_item.pk])
+        if req > sold - ret:
+            problems.append({
+                "base_item": str(base_item.pk),
+                "name": getattr(base_item.product, "name", "") if base_item.product_id else "",
+                "sold": str(sold),
+                "returned": str(ret),
+                "requested": str(req),
+            })
+    if problems:
+        p0 = problems[0]
+        can = q_qty(Decimal(p0["sold"]) - Decimal(p0["returned"]))
+        raise BusinessRuleError(
+            f"По строке «{p0['name']}» продано {p0['sold']}, уже возвращено {p0['returned']}. "
+            f"Вернуть можно не больше {max(can, Decimal('0.000'))}.",
+            "return_exceeds_sold",
+            items=problems,
+        )
+
+    payment_kind = effective_payment_kind(document.payment_kind)
+    cash_out = Decimal("0.00")
+    if payment_kind == models.Document.PaymentKind.CASH:
+        cash_out = Decimal(document.total or 0)
+    cash_out += Decimal(getattr(document, "prepayment_amount", None) or 0)
+    if cash_out > 0:
+        paid = _base_document_paid_amount(base)
+        already = _returns_cash_refunded(base, exclude_document_id=document.pk)
+        available = max(Decimal("0.00"), paid - already)
+        if cash_out.quantize(Decimal("0.01")) > available:
+            raise BusinessRuleError(
+                f"Деньгами можно вернуть не больше {available} сом: столько оплачено по документу-основанию "
+                f"(с учётом прошлых возвратов). Остаток оформите возвратом в долг (уменьшением долга).",
+                "return_exceeds_paid",
+                paid=str(paid),
+                refunded=str(already),
+                amount=str(cash_out.quantize(Decimal("0.01"))),
+            )
+
+
 def post_document(
     document: models.Document,
     allow_negative: bool = None,
     user=None,
     allow_duplicate: bool = False,
+    allow_negative_cash: bool = False,
 ) -> models.Document:
+    """
+    Проведение складского документа.
+
+    user — кто проводит (для прав §2); None — системный вызов без проверки прав.
+    allow_negative=True из запроса — только с правом can_post_negative_stock (B02).
+    allow_negative_cash=True — расход из кассы в минус, только с правом can_cash_negative (B06).
+    """
     if document.status in (document.Status.CASH_PENDING, document.Status.POSTED):
         raise ValueError("Document already posted")
 
@@ -608,10 +874,18 @@ def post_document(
         raise ValueError("Commercial offer cannot be posted")
 
     if not document.items.exists():
-        raise ValueError("Cannot post empty document")
+        raise BusinessRuleError("Нельзя провести документ без строк.", "document_empty")
 
     if is_document_date_in_future(document.date):
         raise ValueError(DOCUMENT_FUTURE_DATE_ERROR)
+
+    explicit_negative = bool(allow_negative)
+    if explicit_negative:
+        ensure_allow_negative_permitted(document, user)
+    if allow_negative_cash:
+        perms.require_op_permission(user, perms.CASH_NEGATIVE)
+
+    ensure_period_open(company=document_company(document), dates=[document.date], user=user)
 
     # Валидация документа перед проведением
     try:
@@ -652,6 +926,12 @@ def post_document(
             _ensure_number(document)
 
         recalc_document_totals(document)
+
+        if document.doc_type in RETURN_DOC_TYPES:
+            if document.base_document_id:
+                # Блокируем основание: два параллельных возврата не вернут больше проданного.
+                models.Document.objects.select_for_update().filter(pk=document.base_document_id).first()
+            validate_return_document(document, user=user)
 
         # Защита от дубля: тот же документ, отправленный дважды подряд (двойной клик,
         # ретрай после таймаута), иначе остаток на складе меняется дважды.
@@ -765,28 +1045,40 @@ def post_document(
                         else None
                     )
 
-                if source.barcode:
-                    existing = qs.filter(barcode=source.barcode).first()
-                    if existing:
-                        return existing
+                # QA B01: товар-получатель ищем строго так —
+                #   1) та же «карточка компании» (catalog_key) на складе-получателе;
+                #   2) тот же непустой штрихкод (несколько совпадений → ошибка);
+                #   3) иначе новая карточка с тем же catalog_key.
+                # По коду и названию НЕ сопоставляем: коды начинались с 0001 в каждом
+                # складе, и товар зачислялся на чужую карточку.
+                if not source.catalog_key:
+                    source.catalog_key = uuid.uuid4()
+                    models.WarehouseProduct.objects.filter(pk=source.pk).update(catalog_key=source.catalog_key)
+                existing = qs.filter(catalog_key=source.catalog_key).order_by("created_date").first()
+                if existing:
+                    return existing
 
-                if source.code:
-                    existing = qs.filter(code=source.code).first()
-                    if existing:
-                        return existing
+                barcode = (source.barcode or "").strip()
+                if barcode:
+                    matches = list(qs.filter(barcode=barcode).order_by("created_date")[:5])
+                    if len(matches) > 1:
+                        names = ", ".join(f"«{m.name}»" for m in matches)
+                        raise BusinessRuleError(
+                            f"На складе «{warehouse_to.name}» несколько товаров со штрихкодом {barcode}: "
+                            f"{names}. Уточните товар.",
+                            "transfer_target_ambiguous",
+                        )
+                    if matches:
+                        target = matches[0]
+                        if not target.catalog_key:
+                            target.catalog_key = source.catalog_key
+                            models.WarehouseProduct.objects.filter(pk=target.pk).update(
+                                catalog_key=source.catalog_key
+                            )
+                        return target
 
-                if source.article:
-                    existing = qs.filter(article=source.article, name=source.name).first()
-                    if existing:
-                        return existing
-
-                # Поиск только по названию убран: разные товары с одинаковым именем
-                # склеивались, и приход уходил не в тот товар. Нет совпадения по
-                # штрихкоду/коду/артикулу+названию — создаём новый товар на приёмнике.
-
-                code = source.code
-                if code and qs.filter(code=code).exists():
-                    code = None
+                # Код новой карточки генерируется заново — сквозной по компании (B31).
+                code = None
 
                 plu = getattr(source, "plu", None)
                 if plu is not None and qs.filter(plu=plu).exists():
@@ -815,6 +1107,9 @@ def post_document(
                     stock=source.stock,
                     expiration_date=source.expiration_date,
                     quantity=Decimal("0.000"),
+                    catalog_key=source.catalog_key,
+                    wholesale_price=source.wholesale_price,
+                    minimum_quantity=source.minimum_quantity,
                 )
                 for link in source.alternate_barcodes.all():
                     if not link.barcode:
@@ -828,6 +1123,7 @@ def post_document(
                     models.WarehouseProductAlternateBarcode.objects.create(product=new_p, barcode=link.barcode)
                 return new_p
 
+            transfer_targets = []
             for item in items:
                 if item.product.warehouse_id != document.warehouse_from_id:
                     raise ValueError("Transfer requires product from warehouse_from")
@@ -857,6 +1153,7 @@ def post_document(
                 )
                 # to — приход на склад-приёмник (product in destination warehouse)
                 dest_product = _get_or_create_transfer_product(item.product, document.warehouse_to)
+                transfer_targets.append((item, dest_product))
                 stock_service.apply_stock_delta(
                     warehouse=document.warehouse_to,
                     product=dest_product,
@@ -866,6 +1163,23 @@ def post_document(
                     source_kind=models.StockMove.SourceKind.DOCUMENT,
                     allow_negative=True,
                 )
+
+            # Куда зачислено (ответ проведения, B01) и оценка перемещения по
+            # себестоимости, а не по цене продажи (B22).
+            repriced = []
+            for item, dest_product in transfer_targets:
+                item.target_product = dest_product
+                cost = Decimal(item.cost_price or 0).quantize(Decimal("0.01"))
+                if Decimal(item.price or 0) != cost:
+                    item.price = cost
+                    item.discount_percent = Decimal("0.00")
+                    item.discount_amount = Decimal("0.00")
+                repriced.append(item)
+            if repriced:
+                models.DocumentItem.objects.bulk_update(
+                    repriced, ["target_product", "price", "discount_percent", "discount_amount"]
+                )
+                recalc_document_totals(document)
 
         elif document.doc_type == document.DocType.INVENTORY:
             if document.warehouse_from is None:
@@ -977,6 +1291,7 @@ def post_document(
                 money_doc = models.MoneyDocument.objects.create(
                     doc_type=money_doc_type,
                     status=models.MoneyDocument.Status.DRAFT,
+                    date=document.date,
                     cash_register=cash_register,
                     counterparty=document.counterparty,
                     payment_category=payment_category,
@@ -1006,7 +1321,12 @@ def post_document(
 
             if money_doc.status == models.MoneyDocument.Status.DRAFT:
                 from . import services_money
-                services_money.post_money_document(money_doc)
+                if money_doc.date != document.date:
+                    money_doc.date = document.date
+                    money_doc.save(update_fields=["date"])
+                services_money.post_money_document(
+                    money_doc, user=user, allow_negative_cash=allow_negative_cash
+                )
 
         # Деньги создаём/подтверждаем только для payment_kind=cash.
         # Для credit (и для типов без денежного движения) документ сразу считается проведённым.
@@ -1029,7 +1349,7 @@ def post_document(
             else:
                 document.status = document.Status.POSTED
                 document.save(update_fields=["status"])
-                apply_cash_request_effects(document, user=user)
+                apply_cash_request_effects(document, user=user, allow_negative_cash=allow_negative_cash)
         else:
             # Если по документу раньше был кассовый запрос (например, сменили payment_kind),
             # помечаем его как обработанный, чтобы не висел в PENDING.
@@ -1063,6 +1383,12 @@ def post_document(
             document.save(update_fields=["status"])
             sync_document_auto_cashflow(document, user=user)
 
+        if explicit_negative and allow_negative:
+            # Кто и когда провёл документ в обход запрета минуса (B02).
+            document.posted_negative_by = user
+            document.posted_negative_at = timezone.now()
+            document.save(update_fields=["posted_negative_by", "posted_negative_at"])
+
         # Начисления зарплаты агенту (процент с продажи со склада-источника).
         # В той же транзакции, что и проведение продажи.
         from apps.warehouse import salary_services
@@ -1071,9 +1397,83 @@ def post_document(
     return document
 
 
-def unpost_document(document: models.Document) -> models.Document:
+def _check_unpost_negative(document, moves, *, agent_personal_stock: bool):
+    """
+    QA B03: откат документа, который увеличивал остаток (закуп, приход, возврат продажи,
+    входящее перемещение, инвентаризация с плюсом), не должен уводить остаток в минус —
+    значит, товар уже продан/списан. Проверка под блокировкой регистра.
+    """
+    need = {}
+    for mv in moves:
+        qty_delta = q_qty(Decimal(mv.qty_delta or 0))
+        if qty_delta <= 0:
+            continue
+        key = (mv.warehouse_id, mv.product_id)
+        if key not in need:
+            need[key] = [mv.warehouse, mv.product, Decimal("0.000")]
+        need[key][2] += qty_delta
+
+    problems = []
+    for (wh_id, product_id), (warehouse, product, qty) in need.items():
+        if product is None:
+            continue
+        if agent_personal_stock:
+            bal = (
+                models.AgentStockBalance.objects.select_for_update()
+                .filter(agent_id=document.agent_id, warehouse_id=wh_id, product_id=product_id)
+                .first()
+            )
+            cur = q_qty(Decimal(getattr(bal, "qty", 0) or 0))
+        else:
+            cur = stock_service.get_on_hand(warehouse=warehouse, product=product, lock=True)
+        after = q_qty(cur - qty)
+        if after < 0:
+            problems.append({
+                "product": str(product_id),
+                "name": getattr(product, "name", "") or "",
+                "warehouse": str(wh_id),
+                "current_qty": str(cur),
+                "after_qty": str(after),
+            })
+    if problems:
+        first = problems[0]
+        raise BusinessRuleError(
+            f"Нельзя отменить проведение: товар «{first['name']}» уже продан или списан. "
+            f"Остаток станет {first['after_qty']}.",
+            "unpost_negative_stock",
+            items=problems,
+        )
+
+
+def unpost_document(document: models.Document, user=None, allow_negative: bool = False) -> models.Document:
+    """
+    Отмена проведения. user — кто отменяет (право can_unpost_documents, §2);
+    None — системный вызов (отказ кассы, каскад из кэшфлоу) без проверки прав.
+    allow_negative=True — откат в минус, только с правом can_post_negative_stock.
+    """
     if document.status not in (document.Status.POSTED, document.Status.CASH_PENDING):
         raise ValueError("Document is not posted")
+
+    if user is not None:
+        perms.require_op_permission(user, perms.UNPOST_DOCUMENTS)
+    if allow_negative:
+        ensure_allow_negative_permitted(document, user)
+    ensure_period_open(company=document_company(document), dates=[document.date], user=user)
+
+    # Возвраты по этому документу (B04): пока они проведены, отмена продажи/закупа
+    # сделала бы возвращённое количество больше проданного.
+    if document.doc_type in (document.DocType.SALE, document.DocType.PURCHASE):
+        posted_returns = list(
+            document.returns.filter(
+                status__in=(document.Status.POSTED, document.Status.CASH_PENDING)
+            ).values_list("number", flat=True)[:5]
+        )
+        if posted_returns:
+            raise BusinessRuleError(
+                "Нельзя отменить проведение: по документу проведены возвраты "
+                f"({', '.join(n or '—' for n in posted_returns)}). Сначала отмените их.",
+                "unpost_has_returns",
+            )
 
     with transaction.atomic():
         agent_personal_stock = bool(
@@ -1081,6 +1481,8 @@ def unpost_document(document: models.Document) -> models.Document:
         )
         if agent_personal_stock:
             moves = list(document.agent_moves.select_related("warehouse", "product").select_for_update())
+            if not allow_negative:
+                _check_unpost_negative(document, moves, agent_personal_stock=True)
             for mv in moves:
                 bal, _ = models.AgentStockBalance.objects.select_for_update().get_or_create(
                     agent=mv.agent,
@@ -1113,6 +1515,8 @@ def unpost_document(document: models.Document) -> models.Document:
             moves = list(
                 document.moves.select_related("warehouse", "product").select_for_update(of=("self",))
             )
+            if not allow_negative:
+                _check_unpost_negative(document, moves, agent_personal_stock=False)
             for mv in moves:
                 qty_delta = q_qty(Decimal(mv.qty_delta or 0))
                 bal = stock_service.apply_stock_delta(
@@ -1221,7 +1625,9 @@ def sync_document_auto_cashflow(document: models.Document, user=None):
         return None
 
 
-def approve_cash_request(document: models.Document, *, decided_by=None, note: str = "") -> models.Document:
+def approve_cash_request(
+    document: models.Document, *, decided_by=None, note: str = "", allow_negative_cash: bool = False
+) -> models.Document:
     if document.status != document.Status.CASH_PENDING:
         raise ValueError("Документ не ожидает решения кассы.")
 
@@ -1232,7 +1638,9 @@ def approve_cash_request(document: models.Document, *, decided_by=None, note: st
         raise ValueError("Запрос в кассу уже обработан.")
 
     with transaction.atomic():
-        apply_cash_request_effects(document, user=decided_by, note=note)
+        apply_cash_request_effects(
+            document, user=decided_by, note=note, allow_negative_cash=allow_negative_cash
+        )
         document.status = document.Status.POSTED
         document.save(update_fields=["status"])
 

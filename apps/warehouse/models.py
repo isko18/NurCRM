@@ -339,7 +339,18 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         blank=True,
         null=True,
         db_index=True,
-        help_text="Автогенерация, если не указан. Уникален в рамках склада.",
+        help_text="Автогенерация, если не указан. Новые коды — сквозные по компании (QA B31).",
+    )
+
+    # QA B01: общий ключ всех копий одного товара в компании (по складам). Перемещение
+    # зачисляет товар на склад-получатель только в карточку с тем же ключом
+    # (или с тем же штрихкодом), а не по коду/названию.
+    catalog_key = models.UUIDField(
+        "Ключ товара в компании",
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Одинаковый у всех копий одного товара на разных складах компании.",
     )
 
     unit = models.CharField(
@@ -505,8 +516,10 @@ class WarehouseProduct(BaseModelId, BaseModelDate, BaseModelCompanyBranch):
         if self.code or not self.company_id or not self.warehouse_id:
             return
 
+        # QA B31: нумерация сквозная по компании, а не «0001 в каждом складе» —
+        # иначе коды разных товаров разных складов совпадают.
         qs = (
-            WarehouseProduct.objects.filter(company_id=self.company_id, warehouse_id=self.warehouse_id)
+            WarehouseProduct.objects.filter(company_id=self.company_id)
             .exclude(code__isnull=True)
             .exclude(code__exact="")
             .filter(code__regex=r"^\d+$")
@@ -1709,6 +1722,24 @@ class Document(models.Model):
         settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
         verbose_name="Кто создал",
     )
+    # QA B04: возврат оформляется по конкретной продаже (SALE_RETURN) или закупу (PURCHASE_RETURN).
+    base_document = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.PROTECT, related_name="returns",
+        verbose_name="Документ-основание",
+        help_text="Продажа (для SALE_RETURN) или закуп (для PURCHASE_RETURN), по которой оформлен возврат.",
+    )
+    # QA B02: кто и когда провёл документ в минус (allow_negative).
+    posted_negative_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+        verbose_name="Проведён в минус: кто",
+    )
+    posted_negative_at = models.DateTimeField(null=True, blank=True, verbose_name="Проведён в минус: когда")
+    # QA B07: кто и когда последним менял дату документа.
+    date_changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+        verbose_name="Дату менял",
+    )
+    date_changed_at = models.DateTimeField(null=True, blank=True, verbose_name="Дата изменена")
     initiator_company = models.ForeignKey(
         "users.Company", null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
         verbose_name="Компания-инициатор (межкомпанейское перемещение)",
@@ -1902,6 +1933,16 @@ class DocumentItem(models.Model):
         verbose_name="Себестоимость единицы",
         help_text="Закупочная цена товара на момент проведения. NULL — строка проведена до появления поля "
                   "(аналитика берёт текущую закупочную цену и помечает cost_is_estimated).",
+    )
+    # QA B04: строка продажи/закупа, по которой возвращают товар.
+    base_item = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.PROTECT, related_name="returned_items",
+        verbose_name="Строка-основание",
+    )
+    # QA B01: куда зачислен товар на складе-получателе (для TRANSFER).
+    target_product = models.ForeignKey(
+        "warehouse.WarehouseProduct", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="+", verbose_name="Товар на складе-получателе",
     )
 
     class Meta:
@@ -2893,6 +2934,11 @@ class MoneyDocument(BaseModelCompanyBranch):
 
     amount = models.DecimalField(max_digits=18, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма")
     comment = models.TextField(blank=True, verbose_name="Комментарий")
+    # QA B05: приход, созданный миграцией по старой оплаченной продаже. Закрывает долг
+    # контрагента, но НЕ меняет остаток кассы (деньги уже учтены раньше).
+    is_migration = models.BooleanField(
+        default=False, db_index=True, verbose_name="Миграционный (не влияет на кассу)",
+    )
 
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="Дата обновления")
@@ -3333,3 +3379,30 @@ class WarehouseCashConfirmationSettings(BaseModelId, BaseModelDate):
 
     def __str__(self):
         return f"WarehouseCashConfirmationSettings({self.company_id}: enabled={self.enabled})"
+
+class WarehouseAccountingSettings(BaseModelId, BaseModelDate):
+    """
+    Учётные настройки склада компании (QA B07).
+
+    closed_until — дата закрытия периода: документы с датой <= closed_until нельзя
+    проводить, отменять, редактировать и удалять без права can_post_closed_period.
+    """
+
+    company = models.OneToOneField(
+        "users.Company",
+        on_delete=models.CASCADE,
+        related_name="warehouse_accounting_settings",
+        verbose_name="Компания",
+    )
+    closed_until = models.DateField(null=True, blank=True, verbose_name="Период закрыт по")
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+        verbose_name="Кто изменил",
+    )
+
+    class Meta:
+        verbose_name = "Учётные настройки склада"
+        verbose_name_plural = "Учётные настройки склада"
+
+    def __str__(self):
+        return f"{self.company_id}: закрыт по {self.closed_until or '—'}"

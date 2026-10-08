@@ -120,15 +120,45 @@ def get_company_limits(company, plan_code: Optional[str] = None) -> Dict[str, An
 
     emp_max = 3 if plan_code == "start" else None
 
+    # QA B36: считаем и модуль магазина (main.Warehouse/Product), и модуль «Склад»
+    # (warehouse.Warehouse/WarehouseProduct). Раньше для оптового склада used был по
+    # модулю магазина и не совпадал с фактом. Копии одного товара на разных складах
+    # (общий catalog_key) считаются одним товаром (D-B36).
     try:
         wh_used = company.warehouses.count()
     except Exception:
         wh_used = 0
+    try:
+        from apps.warehouse.models import Warehouse as WhWarehouse
+
+        wh_used += WhWarehouse.objects.filter(company=company).count()
+    except Exception:
+        pass
 
     try:
         prod_used = company.products.count()
     except Exception:
         prod_used = 0
+    try:
+        from django.db.models import F
+        from django.db.models.functions import Cast, Coalesce
+        from django.db.models import CharField
+
+        from apps.warehouse.models import WarehouseProduct
+
+        prod_used += (
+            WarehouseProduct.objects.filter(company=company)
+            .annotate(
+                unique_key=Coalesce(
+                    Cast("catalog_key", CharField()), Cast("id", CharField()), output_field=CharField()
+                )
+            )
+            .values("unique_key")
+            .distinct()
+            .count()
+        )
+    except Exception:
+        pass
 
     return {
         "employees": {"used": emp_used, "max": emp_max},

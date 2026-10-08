@@ -785,8 +785,9 @@ class WarehouseAnalyticsCalculationFixesTests(TestCase):
         )
         cache.clear()
         summary = self._owner_payload()["summary"]
-        self.assertEqual(summary["money_receipt_amount"], "500.00")
-        self.assertEqual(summary["money_counterparty_receipt_amount"], "300.00")
+        # QA B11: оплата документа с контрагентом — в блоке «контрагенты», а не «касса без контрагентов».
+        self.assertEqual(summary["money_receipt_amount"], "0.00")
+        self.assertEqual(summary["money_counterparty_receipt_amount"], "800.00")
 
     def test_returns_subtracted_in_summary_and_top_agents(self):
         self._sale("1000.00", agent=self.agent)
@@ -870,8 +871,15 @@ class WarehouseAnalyticsCalculationFixesTests(TestCase):
 
     def test_posted_cash_receipt_creates_money_expense_with_purchase_category(self):
         """§6 #1, #2: RECEIPT за наличные → расход денег 1000, категория — системная «Закупка»."""
-        wm.CashRegister.objects.create(company=self.company, branch=self.branch, name="Касса")
+        cash = wm.CashRegister.objects.create(company=self.company, branch=self.branch, name="Касса")
         wm.PaymentCategory.objects.create(company=self.company, branch=self.branch, title="Ручная категория")
+        # B06: расход из кассы — только при достаточном остатке. Пополняем кассу датой «вчера»
+        # вне периода сводки не нужно: проверяем только расход документа ниже.
+        wm.MoneyDocument.objects.create(
+            company=self.company, branch=self.branch, cash_register=cash,
+            doc_type=wm.MoneyDocument.DocType.MONEY_RECEIPT, status=wm.MoneyDocument.Status.POSTED,
+            amount=Decimal("1000.00"), date=timezone.now() - timedelta(days=400),
+        )
         doc = wm.Document.objects.create(
             doc_type=wm.Document.DocType.RECEIPT,
             status=wm.Document.Status.DRAFT,
@@ -914,8 +922,9 @@ class WarehouseAnalyticsCalculationFixesTests(TestCase):
         self.assertEqual(money.payment_category.system_code, wm.PaymentCategory.SystemCode.SALE)
         cache.clear()
         data = self._owner_payload()
-        self.assertEqual(data["summary"]["money_receipt_amount"], "500.00")
-        self.assertEqual(data["summary"]["money_counterparty_receipt_amount"], "0.00")
+        # QA B11: наличная продажа с контрагентом — «Приход от контрагентов».
+        self.assertEqual(data["summary"]["money_receipt_amount"], "0.00")
+        self.assertEqual(data["summary"]["money_counterparty_receipt_amount"], "500.00")
         self.assertEqual(data["summary"]["own_sales_amount"], "500.00")
         cats = {r["category_title"]: r["amount"] for r in data["details"]["money_receipts_by_category"]}
         self.assertEqual(cats.get("Продажа"), "500.00")

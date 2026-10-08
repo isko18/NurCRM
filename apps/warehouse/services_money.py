@@ -350,7 +350,10 @@ def _ensure_number_money(doc: models.MoneyDocument):
     Генерация номера для денежных документов: TYPE-YYYYMMDD-0001 (как в складских).
     Используем существующую таблицу DocumentSequence.
     """
-    today = timezone.now().date()
+    # Местная дата документа (QA B33), а не UTC «сегодня».
+    from .services import document_local_date
+
+    today = document_local_date(doc.date)
     with transaction.atomic():
         seq, _created = models.DocumentSequence.objects.select_for_update().get_or_create(
             doc_type=doc.doc_type, date=today, defaults={"seq": 0}
@@ -361,26 +364,145 @@ def _ensure_number_money(doc: models.MoneyDocument):
         doc.save(update_fields=["number"])
 
 
-def post_money_document(doc: models.MoneyDocument) -> models.MoneyDocument:
+def _fmt_money(x) -> str:
+    """1 200,00 — как в текстах ошибок для пользователя."""
+    v = _dec_q2(x)
+    sign = "-" if v < 0 else ""
+    whole, frac = f"{abs(v):.2f}".split(".")
+    groups = []
+    while whole:
+        groups.insert(0, whole[-3:])
+        whole = whole[:-3]
+    return f"{sign}{' '.join(groups)},{frac}"
+
+
+def ensure_cash_available(doc: models.MoneyDocument, *, user=None, allow_negative_cash: bool = False):
+    """
+    QA B06: расход из кассы не должен уводить её в минус. Проверка под блокировкой строки
+    кассы (две параллельные выдачи не пройдут обе). Обход — allow_negative_cash=True с
+    правом can_cash_negative. Должна вызываться внутри транзакции.
+    """
+    from .op_permissions import BusinessRuleError, CASH_NEGATIVE, require_op_permission
+
+    if doc.doc_type != models.MoneyDocument.DocType.MONEY_EXPENSE or not doc.cash_register_id:
+        return
+    if getattr(doc, "is_migration", False):
+        return
+    register = models.CashRegister.objects.select_for_update().get(pk=doc.cash_register_id)
+    if allow_negative_cash:
+        require_op_permission(user, CASH_NEGATIVE)
+        return
+    balance = cash_register_balance(register)
+    amount = _dec_q2(doc.amount)
+    if balance - amount < 0:
+        raise BusinessRuleError(
+            f"В кассе «{register.name}» {_fmt_money(balance)} сом, расход {_fmt_money(amount)} сом. "
+            f"Не хватает {_fmt_money(amount - balance)} сом.",
+            "cash_insufficient",
+            balance=str(balance),
+            amount=str(amount),
+            cash_register=str(register.pk),
+        )
+
+
+def _money_document_company(doc):
+    return doc.company_id or getattr(doc.cash_register, "company_id", None)
+
+
+def counterparty_debt_balance(counterparty, *, exclude_money_id=None) -> Decimal:
+    """
+    Сальдо контрагента по всей компании: > 0 — контрагент должен компании,
+    < 0 — компания должна контрагенту. Та же формула, что в карточке контрагента
+    (продажи/возвраты поставщику − закупы/возвраты покупателя + расходы − приходы).
+    """
+    Doc = models.Document
+    MD = models.MoneyDocument
+    dec = DecimalField(max_digits=18, decimal_places=2)
+    zero = Value(Decimal("0.00"), output_field=dec)
+    docs = Doc.objects.filter(
+        counterparty=counterparty,
+        status=Doc.Status.POSTED,
+        doc_type__in=DOC_DEBIT_TYPES + DOC_CREDIT_TYPES,
+    ).aggregate(
+        debit=Coalesce(Sum("total", filter=Q(doc_type__in=DOC_DEBIT_TYPES)), zero),
+        credit=Coalesce(Sum("total", filter=Q(doc_type__in=DOC_CREDIT_TYPES)), zero),
+    )
+    money_qs = MD.objects.filter(counterparty=counterparty, status=MD.Status.POSTED)
+    if exclude_money_id is not None:
+        money_qs = money_qs.exclude(pk=exclude_money_id)
+    money = money_qs.aggregate(
+        paid=Coalesce(Sum("amount", filter=Q(doc_type=MD.DocType.MONEY_EXPENSE)), zero),
+        received=Coalesce(Sum("amount", filter=Q(doc_type=MD.DocType.MONEY_RECEIPT)), zero),
+    )
+    return _dec_q2(
+        (_dec_q2(docs["debit"]) + _dec_q2(money["paid"]))
+        - (_dec_q2(docs["credit"]) + _dec_q2(money["received"]))
+    )
+
+
+def ensure_no_debt_overpayment(doc: models.MoneyDocument, *, allow_advance: bool = False):
+    """
+    QA B15: оплата долга (категория «Долги», ручной документ с контрагентом) не может быть
+    больше текущего долга. allow_advance=True — переплата проводится как аванс.
+    """
+    from .op_permissions import BusinessRuleError
+
+    if allow_advance or doc.source_document_id or not doc.counterparty_id:
+        return
+    category = doc.payment_category
+    if category is None or category.system_code != models.PaymentCategory.SystemCode.DEBT:
+        return
+    balance = counterparty_debt_balance(doc.counterparty, exclude_money_id=doc.pk)
+    if doc.doc_type == models.MoneyDocument.DocType.MONEY_RECEIPT:
+        debt = max(balance, Decimal("0.00"))  # контрагент должен нам
+    else:
+        debt = max(-balance, Decimal("0.00"))  # мы должны контрагенту
+    amount = _dec_q2(doc.amount)
+    if amount > debt:
+        raise BusinessRuleError(
+            f"Долг контрагента {_fmt_money(debt)} сом. Сумма {_fmt_money(amount)} больше на "
+            f"{_fmt_money(amount - debt)}. Чтобы записать переплату авансом, передайте allow_advance=true.",
+            "debt_overpayment",
+            debt=str(debt),
+            amount=str(amount),
+        )
+
+
+def post_money_document(
+    doc: models.MoneyDocument, *, user=None, allow_negative_cash: bool = False, allow_advance: bool = False
+) -> models.MoneyDocument:
+    """
+    Проведение денежного документа. user — кто проводит (права §2); None — системный вызов.
+    """
+    from .services import ensure_period_open
+
     if doc.status == doc.Status.POSTED:
         raise ValueError("Document already posted")
 
     # validate
     doc.clean()
-
-    if not doc.number:
-        _ensure_number_money(doc)
+    ensure_period_open(company=_money_document_company(doc), dates=[doc.date], user=user)
 
     with transaction.atomic():
+        if doc.counterparty_id:
+            # Блокируем контрагента: две оплаты одного долга не пройдут обе.
+            models.Counterparty.objects.select_for_update().filter(pk=doc.counterparty_id).first()
+        ensure_no_debt_overpayment(doc, allow_advance=allow_advance)
+        ensure_cash_available(doc, user=user, allow_negative_cash=allow_negative_cash)
+        if not doc.number:
+            _ensure_number_money(doc)
         doc.status = doc.Status.POSTED
         doc.save(update_fields=["status"])
 
     return doc
 
 
-def unpost_money_document(doc: models.MoneyDocument) -> models.MoneyDocument:
+def unpost_money_document(doc: models.MoneyDocument, *, user=None) -> models.MoneyDocument:
+    from .services import ensure_period_open
+
     if doc.status != doc.Status.POSTED:
         raise ValueError("Document is not posted")
+    ensure_period_open(company=_money_document_company(doc), dates=[doc.date], user=user)
 
     with transaction.atomic():
         doc.status = doc.Status.DRAFT
@@ -405,14 +527,22 @@ def reject_money_document(doc: models.MoneyDocument) -> models.MoneyDocument:
     return doc
 
 
-def cash_register_balance(cash_register) -> Decimal:
-    """Сальдо кассы по проведённым приходам и расходам."""
+def cash_balance_qs():
+    """Проведённые денежные документы, которые двигают деньги кассы (без миграционных, B05)."""
+    return models.MoneyDocument.objects.filter(
+        status=models.MoneyDocument.Status.POSTED,
+        is_migration=False,
+    )
+
+
+def cash_register_balance(cash_register, *, at=None) -> Decimal:
+    """Сальдо кассы по проведённым приходам и расходам (at — на конец этой даты)."""
     if cash_register is None:
         return Decimal("0.00")
-    agg = models.MoneyDocument.objects.filter(
-        cash_register=cash_register,
-        status=models.MoneyDocument.Status.POSTED,
-    ).aggregate(
+    qs = cash_balance_qs().filter(cash_register=cash_register)
+    if at is not None:
+        qs = qs.filter(date__date__lte=at)
+    agg = qs.aggregate(
         receipts=Coalesce(
             Sum("amount", filter=Q(doc_type=models.MoneyDocument.DocType.MONEY_RECEIPT)),
             Value(Decimal("0.00")),
@@ -428,14 +558,9 @@ def cash_register_balance(cash_register) -> Decimal:
 
 
 def _payment_category_incassation(company, branch):
-    from .utils import ensure_system_payment_categories
+    from .utils import system_payment_category
 
-    ensure_system_payment_categories(company, branch)
-    cat = models.PaymentCategory.objects.filter(
-        company=company,
-        branch=branch,
-        system_code=models.PaymentCategory.SystemCode.INCASSATION,
-    ).first()
+    cat = system_payment_category(company, models.PaymentCategory.SystemCode.INCASSATION)
     if not cat:
         raise ValueError("Не найдена категория «Инкассация». Обратитесь к администратору.")
     return cat

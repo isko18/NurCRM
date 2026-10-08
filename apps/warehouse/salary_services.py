@@ -216,7 +216,7 @@ class SalaryCashError(ValueError):
 def _salary_money_document(*, company, agent, amount, cash_register, comment, created_by):
     """Проведённый MONEY_EXPENSE из кассы с системной категорией «Зарплата»."""
     from . import services_money
-    from .utils import ensure_system_payment_categories
+    from .utils import system_payment_category
 
     if cash_register.company_id != company.id:
         raise SalaryCashError("Касса принадлежит другой компании.")
@@ -228,10 +228,7 @@ def _salary_money_document(*, company, agent, amount, cash_register, comment, cr
             f"Недостаточно средств в кассе «{cash_register.name}». Доступно: {_q2(balance)}, требуется: {amount}."
         )
     branch = cash_register.branch
-    ensure_system_payment_categories(company, branch)
-    category = m.PaymentCategory.objects.filter(
-        company=company, branch=branch, system_code=m.PaymentCategory.SystemCode.SALARY,
-    ).first()
+    category = system_payment_category(company, m.PaymentCategory.SystemCode.SALARY)
     agent_name = (
         f"{getattr(agent, 'first_name', '') or ''} {getattr(agent, 'last_name', '') or ''}".strip()
         or getattr(agent, "email", None) or str(agent.pk)

@@ -1,3 +1,4 @@
+from django.utils import timezone
 # apps/warehouse/salary_serializers.py
 from decimal import Decimal, InvalidOperation
 
@@ -57,7 +58,7 @@ class WarehouseRateRowSerializer(serializers.Serializer):
 
     def get_updated_at(self, obj):
         r = self._rate(obj)
-        return r.updated_at.isoformat() if (r and r.updated_at) else None
+        return timezone.localtime(r.updated_at).isoformat() if (r and r.updated_at) else None
 
 
 class WarehouseRateUpdateSerializer(serializers.Serializer):

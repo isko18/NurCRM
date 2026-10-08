@@ -391,6 +391,10 @@ class UserSerializer(serializers.ModelSerializer):
             "can_view_market_discount", "can_view_market_edit_price", "can_view_market_delete_cart_item",
             "can_view_market_procurement", "can_view_market_supplier", "can_view_market_employee_return",
 
+            # Склад: опасные операции (null — по умолчанию для роли)
+            "can_post_negative_stock", "can_unpost_documents", "can_change_document_date",
+            "can_post_closed_period", "can_cash_negative",
+
             # Consulting: воронка продаж
             "can_view_funnel", "can_manage_funnel_leads", "can_manage_funnel_stages", "can_create_funnel", "can_manage_lead_ad_spend", "can_view_leads_inbox", "funnel_grants",
 
@@ -427,6 +431,17 @@ class UserSerializer(serializers.ModelSerializer):
         for k, v in data.items():
             if k.startswith("can_view_") and not isinstance(v, bool):
                 raise serializers.ValidationError({k: "Значение должно быть True или False."})
+
+        # Права на опасные складские операции выдаёт только владелец.
+        from apps.warehouse.op_permissions import OP_PERMISSION_FIELDS, is_company_owner
+
+        # Фронт может присылать карточку целиком — запрещаем только реальное изменение.
+        sent = [
+            k for k in OP_PERMISSION_FIELDS
+            if k in data and data[k] != (getattr(self.instance, k, None) if self.instance is not None else None)
+        ]
+        if sent and current_user is not None and not is_company_owner(current_user):
+            raise serializers.ValidationError({sent[0]: "Это право может выдать только владелец компании."})
 
         return data
 
@@ -1089,6 +1104,15 @@ class CompanySerializer(serializers.ModelSerializer):
             "appointment_work_end",
             "market_sphere",
         ]
+        extra_kwargs = {"cashier_password": {"write_only": True}}
+
+    def validate_inn(self, value):
+        # QA B24: ИНН компании — как у контрагента: пусто или 14 цифр.
+        from apps.warehouse.validators import normalize_inn, validate_inn
+
+        if self.instance is not None and normalize_inn(value) == normalize_inn(self.instance.inn):
+            return value
+        return validate_inn(value)
 
     def to_representation(self, instance):
         from apps.users.services_subscription import (
@@ -1104,8 +1128,15 @@ class CompanySerializer(serializers.ModelSerializer):
         user = getattr(request, "user", None) if request else None
         is_owner = is_user_owner(user, instance)
 
+        # QA B35: пароль кассира не отдаётся никому (поле только на запись);
+        # фронту достаточно знать, задан ли он.
+        data.pop("cashier_password", None)
+        data["has_cashier_password"] = bool(getattr(instance, "cashier_password", None))
+        # QA B47: заполнены ли реквизиты продавца для печатных форм и ЭСФ.
+        data["requisites_complete"] = all(
+            str(getattr(instance, f, "") or "").strip() for f in ("inn", "okpo", "score", "bik")
+        )
         if not is_owner:
-            data.pop("cashier_password", None)
             if isinstance(data.get("subscription_plan"), dict):
                 data["subscription_plan"].pop("price", None)
 
@@ -1189,6 +1220,15 @@ class CompanyUpdateSerializer(serializers.ModelSerializer):
         if slug_taken_by_other(value, exclude_pk=exclude_pk):
             raise SlugConflict()  # 409
         return value
+
+    def validate_inn(self, value):
+        # QA B24: пусто или 14 цифр. Старое неверное значение, присланное без изменений
+        # вместе с остальной формой, не блокирует сохранение других полей.
+        from apps.warehouse.validators import normalize_inn, validate_inn
+
+        if self.instance is not None and normalize_inn(value) == normalize_inn(self.instance.inn):
+            return value
+        return validate_inn(value)
 
     def validate_appointment_work_start(self, value):
         if not value:

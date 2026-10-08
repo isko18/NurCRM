@@ -286,7 +286,7 @@ def partner_row(p, company):
         "id": str(partner.id),
         "name": partner.name,
         "partnership_id": str(p.id),
-        "since": (p.activated_at or p.created_at).isoformat(),
+        "since": timezone.localtime(p.activated_at or p.created_at).isoformat(),
         "allow_direct_pull": p.allows_direct_pull_from(company.id),
         "partner_allows_direct_pull": p.allows_direct_pull_from(partner.id),
         "share_sales_history": p.shares_sales_history_of(company.id),

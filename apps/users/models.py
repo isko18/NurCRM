@@ -699,7 +699,15 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_market_procurement = models.BooleanField(default=False, verbose_name="Маркет: доступ к закупкам")
     can_view_market_supplier = models.BooleanField(default=False, verbose_name="Маркет: доступ к поставщикам")
     can_view_market_employee_return = models.BooleanField(default=False, verbose_name="Маркет: доступ к возврату сотрудника")
-    
+
+    # Склад: права на опасные операции (QA 06.10, §2). NULL — по умолчанию для роли
+    # (см. apps.warehouse.op_permissions.ROLE_DEFAULTS), True/False — явно выданное право.
+    can_post_negative_stock = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: проводить в минус")
+    can_unpost_documents = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: отменять проведение")
+    can_change_document_date = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: менять дату документа")
+    can_post_closed_period = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: изменения в закрытом периоде")
+    can_cash_negative = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: расход кассы в минус")
+
     branches = models.ManyToManyField(
         "Branch",
         through="BranchMembership",
