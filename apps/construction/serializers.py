@@ -805,8 +805,39 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
                     )
                 attrs["shift"] = candidates[0]
 
+        if user and not _is_owner_like(user):
+            self._validate_employee_rights(attrs, user)
+
         # ✅ если shift не передали или shift=None — это “общий режим”, разрешаем
         return attrs
+
+    EMPLOYEE_SOURCE_KINDS = (None, "", CashFlow.SourceKind.MANUAL) + DRAWER_SOURCE_KINDS
+
+    def _validate_employee_rights(self, attrs, user):
+        """Ограничения для не-владельца (кассира): одобрение, авто-движения, закрытые смены."""
+        if "source_kind" in attrs and attrs.get("source_kind") not in self.EMPLOYEE_SOURCE_KINDS:
+            raise serializers.ValidationError({"source_kind": "Этот тип источника ставит только система."})
+
+        inst = self.instance
+        if inst is None:
+            return  # статус при создании выставляет create()
+
+        new_status = attrs.get("status", inst.status)
+        if new_status != inst.status:
+            if inst.status == CashFlow.Status.REJECTED:
+                raise serializers.ValidationError({"status": "Отклонённое движение нельзя вернуть."})
+            company = _get_company_from_user(user)
+            if new_status == CashFlow.Status.APPROVED and getattr(company, "cashflow_requests_enabled", False):
+                raise serializers.ValidationError({"status": "Одобрять движения может только владелец или администратор."})
+
+        money_changed = any(
+            k in attrs and attrs[k] != getattr(inst, k) for k in ("amount", "type", "cashbox")
+        )
+        if money_changed:
+            if inst.shift_id and inst.shift.status != CashShift.Status.OPEN:
+                raise serializers.ValidationError({"detail": "Движение закрытой смены менять нельзя — оформите заявку на правку."})
+            if inst.source_kind not in self.EMPLOYEE_SOURCE_KINDS:
+                raise serializers.ValidationError({"detail": "Автоматическое движение менять нельзя — оформите заявку на правку."})
 
     def create(self, validated_data):
         request = self.context.get("request")
@@ -839,11 +870,11 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
 
         if not req_enabled:
             validated_data["status"] = CashFlow.Status.APPROVED
-        elif "status" not in validated_data:
-            if _is_owner_like(user):
-                validated_data["status"] = CashFlow.Status.APPROVED
-            else:
-                validated_data["status"] = CashFlow.Status.PENDING
+        elif _is_owner_like(user):
+            validated_data.setdefault("status", CashFlow.Status.APPROVED)
+        else:
+            # Включено одобрение: сотрудник не может сам провести движение (status=approved).
+            validated_data["status"] = CashFlow.Status.PENDING
 
         return super().create(validated_data)
 

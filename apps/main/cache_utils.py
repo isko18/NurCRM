@@ -160,8 +160,37 @@ def cache_agent_products_key(agent_id: str, company_id: str, branch_id: Optional
     return f"nurcrm:agent:products:{agent_id}:{company_id}:{branch_id or 'global'}"
 
 
+def _market_analytics_version_key(company_id) -> str:
+    return f"nurcrm:analytics:market-ver:{company_id}"
+
+
+def market_analytics_version(company_id) -> int:
+    try:
+        v = cache.get(_market_analytics_version_key(company_id))
+    except Exception:
+        return 0
+    return int(v or 0)
+
+
+def bump_market_analytics_version(company_id) -> None:
+    """
+    Сбрасывает кэш аналитики маркета компании за O(1): версия входит в ключ,
+    старые ключи просто перестают читаться и истекают по TTL.
+    """
+    if not company_id:
+        return
+    key = _market_analytics_version_key(company_id)
+    try:
+        cache.incr(key)
+    except ValueError:
+        cache.set(key, 1, None)
+    except Exception:
+        pass
+
+
 def cache_market_analytics_key(company_id: str, branch_id: Optional[str], tab: str, query_hash: str) -> str:
     """
     Ключ для market analytics (то, что тебе нужно для analytics_market.py).
     """
-    return f"nurcrm:analytics:market:{company_id}:{branch_id or 'global'}:{tab}:{query_hash}"
+    ver = market_analytics_version(company_id)
+    return f"nurcrm:analytics:market:{company_id}:v{ver}:{branch_id or 'global'}:{tab}:{query_hash}"

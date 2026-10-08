@@ -2859,10 +2859,14 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
 
             auto_flows = []
             if payments:
-                for p_part in payments:
+                for p_idx, p_part in enumerate(payments):
                     p_amt = Decimal(str(p_part.get("amount") or 0))
+                    p_method = p_part.get("method") or "cash"
+                    # Долговая часть — это не деньги в кассе (придут при погашении),
+                    # зачёт уже проведён раньше (возврат при обмене, залог, предоплата).
+                    if p_method in (Sale.PaymentMethod.DEBT, Sale.PaymentMethod.OFFSET):
+                        continue
                     if p_amt > 0:
-                        p_method = p_part.get("method") or "cash"
                         p_title = dict(Sale.PaymentMethod.choices).get(p_method, p_method)
                         cf = create_auto_cashflow(
                             company=sale.company,
@@ -2873,8 +2877,10 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                             shift=sale.shift,
                             type=CashFlow.Type.INCOME,
                             amount=p_amt,
-                            source_kind=CashFlow.SourceKind.POS_SALE if p_method != Sale.PaymentMethod.DEBT else CashFlow.SourceKind.POS_PREPAYMENT,
+                            source_kind=CashFlow.SourceKind.POS_SALE,
                             source_id=str(sale.id),
+                            # Ключ на каждую строку: иначе 500 нал + 500 Мбанк склеивались в одно движение
+                            idempotency_key=f"sale:{sale.id}:pay:{p_method}:{p_idx}",
                             name=f"Продажа ({p_title})",
                             source_business_operation_id="Продажа",
                             affects_shift_drawer=(p_method == Sale.PaymentMethod.CASH),
@@ -2896,6 +2902,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                         amount=cash_prepay,
                         source_kind=CashFlow.SourceKind.POS_PREPAYMENT,
                         source_id=str(sale.id),
+                        idempotency_key=f"sale:{sale.id}:prepay:cash",
                         name="Предоплата (долг)",
                         source_business_operation_id="Продажа",
                         affects_shift_drawer=True,
@@ -2917,6 +2924,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                         amount=sale.card_amount,
                         source_kind=CashFlow.SourceKind.POS_PREPAYMENT,
                         source_id=str(sale.id),
+                        idempotency_key=f"sale:{sale.id}:prepay:{noncash_m}",
                         name=f"Предоплата ({p_title})",
                         source_business_operation_id="Продажа",
                         affects_shift_drawer=False,
@@ -2925,7 +2933,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                     if cf:
                         auto_flows.append(cf)
             else:
-                if (sale.total or 0) > 0:
+                if (sale.total or 0) > 0 and sale.payment_method != Sale.PaymentMethod.OFFSET:
                     method_title = sale.get_payment_method_display() if hasattr(sale, "get_payment_method_display") else sale.payment_method
                     cf_name = f"Продажа ({method_title})" if sale.payment_method != Sale.PaymentMethod.CASH else "Продажа"
                     cf = create_auto_cashflow(
@@ -2939,6 +2947,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                         amount=sale.total,
                         source_kind=CashFlow.SourceKind.POS_SALE,
                         source_id=str(sale.id),
+                        idempotency_key=f"sale:{sale.id}:pay:{sale.payment_method}",
                         name=cf_name,
                         source_business_operation_id="Продажа",
                         payment_method=sale.payment_method,
@@ -3629,7 +3638,7 @@ def _create_refund_cash_kept_flow(*, sale, cashbox, user, shift, amount, method,
         amount=amount,
         source_kind=CashFlow.SourceKind.POS_SALE_RETURN,
         source_id=str(sale.id),
-        idempotency_key=f"{idempotency_key}:{method}:cash-kept" if idempotency_key else None,
+        idempotency_key=f"{idempotency_key}:{method}:cash-kept",
         affects_shift_drawer=True,
         name=f"Наличные остались в кассе: возврат по чеку №{sale.doc_number or sale.id} отдан безналом",
         source_business_operation_id="pos_sale_return",
@@ -3862,6 +3871,13 @@ def _execute_sale_return(
 
     created_flows = []
     actual_shift = None
+    # Без ключа от кассы — служебный: иначе два возврата по 200 по одному чеку
+    # склеивались в одно движение (идемпотентность по сумме).
+    flow_key = str(idempotency_key) if idempotency_key else f"return-auto:{uuid.uuid4().hex}"
+    # Обмен: возвращённая сумма идёт в зачёт нового чека, денег не выдают —
+    # расход на возврат не создаём (иначе обмен даёт двойной доход). Наличную
+    # часть ящику смены всё равно возвращаем поправкой «наличные остались».
+    is_offset_refund = str(refund_method or "").strip().lower() == "offset"
     if cash_to_refund > Decimal("0.00"):
         from apps.construction.models import CashFlow
         from apps.construction.auto_cashflow import create_auto_cashflow
@@ -3880,8 +3896,8 @@ def _execute_sale_return(
                     affects_drawer, _needs_income = _refund_drawer_effect(
                         p_m, refund_method, actual_shift is not None
                     )
-                    ik = f"{idempotency_key}:{p_m}" if idempotency_key else None
-                    cf = create_auto_cashflow(
+                    ik = f"{flow_key}:{p_m}"
+                    cf = None if is_offset_refund else create_auto_cashflow(
                         company=sale.company,
                         branch=sale.branch,
                         cashbox=cashbox,
@@ -3902,8 +3918,8 @@ def _execute_sale_return(
                     if _needs_income:
                         adj = _create_refund_cash_kept_flow(
                             sale=sale, cashbox=cashbox, user=user, shift=actual_shift,
-                            amount=cf.amount if cf else None, method=p_m,
-                            idempotency_key=idempotency_key,
+                            amount=p_amt, method=p_m,
+                            idempotency_key=flow_key,
                         )
                         if adj:
                             created_flows.append(adj)
@@ -3919,8 +3935,8 @@ def _execute_sale_return(
                         affects_drawer, _needs_income = _refund_drawer_effect(
                             p_m, refund_method, actual_shift is not None
                         )
-                        ik = f"{idempotency_key}:{p_m}" if idempotency_key else None
-                        cf = create_auto_cashflow(
+                        ik = f"{flow_key}:{p_m}"
+                        cf = None if is_offset_refund else create_auto_cashflow(
                             company=sale.company,
                             branch=sale.branch,
                             cashbox=cashbox,
@@ -3941,8 +3957,8 @@ def _execute_sale_return(
                         if _needs_income:
                             adj = _create_refund_cash_kept_flow(
                                 sale=sale, cashbox=cashbox, user=user, shift=actual_shift,
-                                amount=cf.amount if cf else None, method=p_m,
-                                idempotency_key=idempotency_key,
+                                amount=part_amt, method=p_m,
+                                idempotency_key=flow_key,
                             )
                             if adj:
                                 created_flows.append(adj)
@@ -3955,7 +3971,7 @@ def _execute_sale_return(
             affects_drawer, _needs_income = _refund_drawer_effect(
                 p_m, refund_method, actual_shift is not None
             )
-            cf = create_auto_cashflow(
+            cf = None if is_offset_refund else create_auto_cashflow(
                 company=sale.company,
                 branch=sale.branch,
                 cashbox=cashbox,
@@ -3965,7 +3981,7 @@ def _execute_sale_return(
                 amount=cash_to_refund,
                 source_kind=CashFlow.SourceKind.POS_SALE_RETURN,
                 source_id=str(sale.id),
-                idempotency_key=str(idempotency_key) if idempotency_key else None,
+                idempotency_key=f"{flow_key}:{p_m}" if not idempotency_key else str(idempotency_key),
                 affects_shift_drawer=affects_drawer,
                 payment_method=p_m,
                 name=f"Возврат по чеку №{sale.doc_number or sale.id}",
@@ -3976,8 +3992,8 @@ def _execute_sale_return(
             if _needs_income:
                 adj = _create_refund_cash_kept_flow(
                     sale=sale, cashbox=cashbox, user=user, shift=actual_shift,
-                    amount=cf.amount if cf else None, method=p_m,
-                    idempotency_key=idempotency_key,
+                    amount=cash_to_refund, method=p_m,
+                    idempotency_key=flow_key,
                 )
                 if adj:
                     created_flows.append(adj)

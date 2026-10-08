@@ -3444,10 +3444,14 @@ class ClientDealListCreateAPIView(CompanyBranchRestrictedMixin, generics.ListCre
             if sale:
                 target_deal = ClientDeal.objects.filter(sale=sale).first()
             if not target_deal:
+                # Только дубль кассовой сделки (есть sale) на ту же сумму: ручной долг
+                # на другую сумму раньше перезаписывал свежий долг с кассы.
                 recent_deal = (
                     ClientDeal.objects.filter(
                         client=client,
                         kind=ClientDeal.Kind.DEBT,
+                        sale__isnull=False,
+                        amount=serializer.validated_data.get("amount"),
                     )
                     .order_by("-created_at")
                     .first()

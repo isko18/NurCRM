@@ -168,8 +168,8 @@ class Cashbox(models.Model):
     def get_summary(self) -> dict:
         z = Decimal("0.00")
 
-        # flows (approved)
-        flows_qs = self.flows.filter(status=CashFlow.Status.APPROVED)
+        # flows (approved, без строк заявок на правку/отмену)
+        flows_qs = self.flows.money()
         fa = flows_qs.aggregate(
             income=Sum("amount", filter=Q(type=CashFlow.Type.INCOME)),
             expense=Sum("amount", filter=Q(type=CashFlow.Type.EXPENSE)),
@@ -923,6 +923,43 @@ class CashShift(models.Model):
         return f"Смена {self.cashier} / {self.cashbox} ({self.status})"
 
 
+class CashFlowQuerySet(models.QuerySet):
+    # Канонические source_kind, у которых бывают «сырые» двойники
+    # (source_kind=NULL, source_cashbox_flow_id = source_id канонической строки).
+    RAW_TWIN_KINDS = ("pos_sale", "pos_prepayment", "debt_repayment", "warehouse_purchase")
+    # Старые source_kind, вышедшие из choices: дубль, если есть каноническая строка с тем же source_id.
+    LEGACY_KINDS = ("sale", "debt_payment")
+
+    def money(self):
+        """
+        Движения, которые считаются деньгами: одобренные и не строки заявок
+        на правку/отмену (у тех request_kind заполнен, а исходное движение
+        правится или отклоняется само).
+        """
+        return self.filter(status=CashFlow.Status.APPROVED, request_kind__isnull=True)
+
+    def without_raw_twins(self):
+        """
+        Исключает «сырые» дубли: строку без source_kind со ссылкой
+        source_cashbox_flow_id (или legacy source_kind с тем же source_id), если
+        есть одобренная каноническая строка того же типа с source_id = этой ссылке. Строки с одним source_id (части смешанной
+        оплаты, несколько погашений, продажа и возврат) не склеиваются.
+        """
+        def twin(ref_field):
+            return models.Exists(CashFlow.objects.filter(
+                company_id=models.OuterRef("company_id"),
+                source_id=models.OuterRef(ref_field),
+                type=models.OuterRef("type"),
+                status=CashFlow.Status.APPROVED,
+                source_kind__in=self.RAW_TWIN_KINDS,
+            ))
+
+        return self.exclude(
+            (Q(source_kind__isnull=True) & Q(source_cashbox_flow_id__isnull=False) & twin("source_cashbox_flow_id"))
+            | (Q(source_kind__in=self.LEGACY_KINDS) & twin("source_id"))
+        )
+
+
 class CashFlow(models.Model):
     class Type(models.TextChoices):
         INCOME = "income", "Приход"
@@ -1092,6 +1129,8 @@ class CashFlow(models.Model):
         related_name="cashflows",
         verbose_name="Категория",
     )
+
+    objects = CashFlowQuerySet.as_manager()
 
     class Meta:
         verbose_name = "Движение по кассе"

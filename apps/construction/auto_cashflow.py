@@ -362,13 +362,16 @@ def create_auto_cashflow(
         if existing:
             return existing
     else:
+        # Без ключа дублем считаем только ту же операцию тем же способом оплаты;
+        # отклонённое движение не мешает провести новое событие.
         existing = CashFlow.objects.filter(
             company=company,
             source_kind=source_kind,
             source_id=str(source_id),
             type=type,
             amount=amount_dec,
-        ).first()
+            payment_method=(str(payment_method).strip().lower() if payment_method else None),
+        ).exclude(status=CashFlow.Status.REJECTED).first()
         if existing:
             return existing
 

@@ -1214,6 +1214,8 @@ class CounterpartyBalanceSummaryView(CompanyBranchRestrictedMixin, APIView):
         # Агент (не владелец) видит итоги только по своим контрагентам.
         agent_raw = (request.query_params.get("agent") or "").strip()
         user = request.user
+        if not _is_owner_like(user):
+            agent_raw = ""  # не-владелец не может подставить чужого агента
         if agent_raw or not _is_owner_like(user):
             agent_qs = filter_qs_company_branch_or_global(self, models.Counterparty.objects.all())
             if counterparty_type:

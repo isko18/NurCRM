@@ -406,3 +406,40 @@ def product_variant_sync_product_stock_and_cache(sender, instance: ProductVarian
         except Exception:
             pass
 
+
+
+# ─────────────────────────────────────────────────────────────
+# Кэш аналитики маркета: сбрасываем после любой записи денег/продаж/смен
+# (раньше — только после возвратов и обменов, новая продажа появлялась до 5 мин).
+# ─────────────────────────────────────────────────────────────
+def _bump_market_analytics(sender, instance, **kwargs):
+    company_id = getattr(instance, "company_id", None)
+    if not company_id:
+        return
+    from apps.main.cache_utils import bump_market_analytics_version
+
+    transaction.on_commit(lambda: bump_market_analytics_version(company_id))
+
+
+def _connect_market_analytics_invalidation():
+    from django.apps import apps as django_apps
+
+    for label in (
+        "main.Sale",
+        "main.SaleReturn",
+        "main.ClientDeal",
+        "main.DealPayment",
+        "main.DebtPayment",
+        "construction.CashFlow",
+        "construction.CashShift",
+    ):
+        try:
+            model = django_apps.get_model(label)
+        except LookupError:
+            continue
+        uid = f"market-analytics-bump:{label}"
+        post_save.connect(_bump_market_analytics, sender=model, dispatch_uid=uid + ":save")
+        post_delete.connect(_bump_market_analytics, sender=model, dispatch_uid=uid + ":delete")
+
+
+_connect_market_analytics_invalidation()

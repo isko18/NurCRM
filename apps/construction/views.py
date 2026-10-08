@@ -253,7 +253,8 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
             # ---- flows (approved) by cashbox ----
             flows = (
                 CashFlow.objects
-                .filter(cashbox_id__in=ids, status=CashFlow.Status.APPROVED)
+                .filter(cashbox_id__in=ids)
+                .money()
                 .values("cashbox_id")
                 .annotate(
                     income=Sum("amount", filter=Q(type=CashFlow.Type.INCOME)),
@@ -309,7 +310,8 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
                 # flows inside open shifts
                 shift_flows = (
                     CashFlow.objects
-                    .filter(shift_id__in=all_open_ids, status=CashFlow.Status.APPROVED)
+                    .filter(shift_id__in=all_open_ids)
+                    .money()
                     .values("shift_id")
                     .annotate(
                         income=Sum(
@@ -392,11 +394,8 @@ class CashboxDetailView(CompanyBranchScopedMixin, generics.RetrieveUpdateDestroy
     serializer_class = CashboxWithFlowsSerializer
 
     def get_queryset(self):
-        qs = super().get_queryset()
-        company = self._company()
-        if not company:
-            return qs.none()
-        return qs.filter(company=company)
+        # Компания + филиал сотрудника (как список касс): чужой филиал → 404.
+        return self._scoped_queryset(super().get_queryset())
 
     def perform_update(self, serializer):
         """Changing a role must not remove the last required active route."""
@@ -1357,6 +1356,25 @@ class CashFlowBulkStatusUpdateView(CompanyBranchScopedMixin, generics.GenericAPI
                 updated_count += 1
                 updated_ids.append(str(cf.id))
 
+        # Отклонённое движение через массовую смену статуса не «воскрешаем»:
+        # при отклонении уже отработал handle_cashflow_reject.
+        resurrect = [
+            str(cf.id) for cf in normal_flows
+            if cf.status == CashFlow.Status.REJECTED and id_to_status.get(cf.id) != CashFlow.Status.REJECTED
+        ]
+        if resurrect:
+            raise ValidationError({"detail": "Отклонённые движения нельзя вернуть.", "ids": resurrect})
+        company = getattr(request.user, "company", None) or getattr(request.user, "owned_company", None)
+        if (
+            not _is_owner_like(request.user)
+            and getattr(company, "cashflow_requests_enabled", False)
+            and any(
+                id_to_status.get(cf.id) == CashFlow.Status.APPROVED and cf.status != CashFlow.Status.APPROVED
+                for cf in normal_flows
+            )
+        ):
+            raise PermissionDenied("Одобрять движения может только владелец или администратор.")
+
         if normal_flows:
             normal_ids = [cf.id for cf in normal_flows]
             for i in range(0, len(normal_ids), self.CHUNK_SIZE):
@@ -1607,7 +1625,8 @@ class CashboxReportAnalyticsView(CompanyBranchScopedMixin, APIView):
         cashbox_id = request.query_params.get("cashbox")
         status_param = (request.query_params.get("status") or "approved").strip().lower()
 
-        flows_qs = CashFlow.objects.filter(company=company)
+        # Компания + филиал сотрудника: итоги другого филиала не отдаём.
+        flows_qs = self._scoped_queryset(CashFlow.objects.all())
         if cashbox_id:
             flows_qs = flows_qs.filter(cashbox_id=cashbox_id)
         else:

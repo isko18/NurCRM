@@ -66,7 +66,9 @@ class AnalyticsCashflowSourceKindTests(TestCase):
 
         self.assertEqual(result["inflow"]["debt_repayments"], "111.11")
         self.assertEqual(result["inflow"]["other_income"], "0.00")
-        self.assertEqual(result["inflow"]["total"], "111.11")
+        # Предоплата по продаже в долг — это деньги от продаж (раньше терялась)
+        self.assertEqual(result["inflow"]["sales_cash"], "88.00")
+        self.assertEqual(result["inflow"]["total"], "199.11")
 
     def test_cashflow_dedupes_legacy_sale_rows_and_raw_cashbox_duplicates(self):
         CashFlow.objects.create(
@@ -114,4 +116,6 @@ class AnalyticsCashflowSourceKindTests(TestCase):
 
         self.assertEqual(finance["cards"]["income_total"], "1500.00")
         self.assertEqual(cashflow["inflow"]["other_income"], "0.00")
-        self.assertEqual(cashflow["inflow"]["total"], "0.00")
+        # Денежный поток строится по CashFlow: продажа учтена один раз
+        self.assertEqual(cashflow["inflow"]["sales_cash"], "1500.00")
+        self.assertEqual(cashflow["inflow"]["total"], "1500.00")

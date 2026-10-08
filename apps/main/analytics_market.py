@@ -19,6 +19,7 @@ from django.db.models import (
     IntegerField,
     Case,
     When,
+    CharField,
 )
 from django.db.models.functions import TruncDate, ExtractHour, ExtractWeekDay, Coalesce
 from django.utils import timezone
@@ -66,47 +67,120 @@ def _qty_str(x) -> str:
         return "0.000"
 
 
-def _dedupe_cashflow_raw_duplicates(qs, *, canonical_kinds, legacy_kinds=()):
+# ─────────────────────────────────────────────────────────────
+# Денежные движения (CashFlow) для finance / cashflow / pnl / reconcile
+# ─────────────────────────────────────────────────────────────
+_CF_SALE_KINDS = ("pos_sale", "pos_prepayment", "sale")
+_CF_DEBT_KINDS = ("debt_repayment", "debt_payment")
+_CF_SUPPLIER_KINDS = ("warehouse_purchase", "procurement_receipt", "supplier_debt_payment")
+_CF_RETURN_KIND = "pos_sale_return"
+# Не деньги: зачёт (обмен, залог, предоплата заказ-наряда) и долговая часть чека.
+_CF_NON_MONEY_METHODS = ("offset", "debt")
+
+
+def _valid_uuid(raw) -> str | None:
+    from uuid import UUID
+
+    try:
+        return str(UUID(str(raw).strip()))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _money_cashflows(company, branch, period, request=None):
     """
-    Removes raw/legacy duplicate cashflow rows that point to the same business source,
-    while leaving the canonical record in place.
-
-    Examples:
-    - canonical: source_kind='pos_sale', source_id='sale-42'
-    - duplicate raw: source_kind=None, source_cashbox_flow_id='sale-42'
-    - legacy duplicate: source_kind='sale', source_id='sale-42'
+    Одобренные денежные движения периода без строк заявок, без «сырых» двойников
+    канонических строк, без зачёта/долга и без технической поправки ящика при
+    возврате («наличные остались в кассе», pos_sale_return + income).
+    Фильтры ?cashbox, ?shift, ?cashier, ?payment_method применяются к самим движениям.
     """
-    rows = list(qs.values("id", "source_kind", "source_id", "source_cashbox_flow_id"))
-    if not rows:
-        return qs
+    from apps.construction.models import CashFlow
 
-    by_id = {row["id"]: row for row in rows}
-    key_to_ids = defaultdict(list)
-    for row in rows:
-        for field_name in ("source_id", "source_cashbox_flow_id"):
-            key = (row.get(field_name) or "").strip()
-            if key:
-                key_to_ids[key].append(row["id"])
+    qs = (
+        CashFlow.objects.filter(
+            company=company,
+            created_at__gte=period.start,
+            created_at__lt=period.end,
+        )
+        .money()
+        .without_raw_twins()
+        .exclude(payment_method__in=_CF_NON_MONEY_METHODS)
+        .exclude(source_kind=_CF_RETURN_KIND, type=CashFlow.Type.INCOME)
+    )
+    if branch is not None:
+        qs = qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    if request is not None:
+        qp = request.query_params
+        for param, field in (("cashbox", "cashbox_id"), ("shift", "shift_id"), ("cashier", "cashier_id")):
+            raw = qp.get(param)
+            if raw:
+                val = _valid_uuid(raw)
+                qs = qs.filter(**{field: val}) if val else qs.none()
+        pm = (qp.get("payment_method") or "").strip().lower()
+        if pm:
+            qs = qs.filter(payment_method=pm)
+    return qs
 
-    drop_ids = set()
-    for ids in key_to_ids.values():
-        if len(ids) <= 1:
-            continue
-        preferred_id = None
-        for row_id in ids:
-            row = by_id.get(row_id)
-            if row and row.get("source_kind") in canonical_kinds:
-                preferred_id = row_id
-                break
-        if preferred_id is None:
-            preferred_id = ids[0]
-        for row_id in ids:
-            if row_id != preferred_id:
-                drop_ids.add(row_id)
 
-    if not drop_ids:
-        return qs
-    return qs.exclude(id__in=drop_ids)
+def _cf_income_category():
+    """Категория прихода — первое совпадение, категории не пересекаются."""
+    sale_q = Q(source_kind__in=_CF_SALE_KINDS) | (
+        Q(source_kind__isnull=True)
+        & (
+            Q(source_business_operation_id__in=("Продажа", "Предоплата"))
+            | Q(name__istartswith="Продажа")
+            | Q(category__title__istartswith="Продажа")
+        )
+    )
+    # Старые строки без payment_method: «Продажа» — наличные, «Продажа (Мбанк)» — безнал.
+    cash_q = Q(payment_method="cash") | (
+        Q(payment_method__isnull=True) & (~Q(name__contains="(") | Q(name__icontains="(налич"))
+    )
+    debt_q = Q(source_kind__in=_CF_DEBT_KINDS) | (
+        Q(source_kind__isnull=True)
+        & Q(source_business_operation_id__in=("Оплата долга", "Погашение долга"))
+    )
+    return Case(
+        When(sale_q & cash_q, then=Value("sales_cash")),
+        When(sale_q, then=Value("sales_card")),
+        When(debt_q, then=Value("debt_repayments")),
+        default=Value("other_income"),
+        output_field=CharField(),
+    )
+
+
+def _cf_expense_category():
+    """Категория расхода — первое совпадение, категории не пересекаются."""
+    return Case(
+        When(source_kind=_CF_RETURN_KIND, then=Value("returns")),
+        When(
+            Q(source_kind__in=_CF_SUPPLIER_KINDS) | Q(name__icontains="закуп") | Q(name__icontains="поставщик"),
+            then=Value("suppliers"),
+        ),
+        When(source_kind="rental_deposit", then=Value("deposits")),
+        When(
+            Q(name__icontains="зарплат") | Q(name__icontains="аванс") | Q(category__title__icontains="зарплат"),
+            then=Value("salaries"),
+        ),
+        When(Q(name__icontains="аренд") | Q(category__title__icontains="аренд"), then=Value("rent")),
+        When(Q(name__icontains="налог") | Q(category__title__icontains="налог"), then=Value("taxes")),
+        When(
+            Q(name__icontains="коммун") | Q(category__title__icontains="коммун")
+            | Q(name__icontains="свет") | Q(name__icontains="интернет"),
+            then=Value("utilities"),
+        ),
+        default=Value("other"),
+        output_field=CharField(),
+    )
+
+
+def _sum_by_category(qs, category_expr) -> dict:
+    rows = (
+        qs.annotate(_cat=category_expr)
+        .values("_cat")
+        .annotate(s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))
+    )
+    return {r["_cat"]: (r["s"] or Z_MONEY) for r in rows}
 
 
 def _format_shift_dt(dt) -> str | None:
@@ -328,34 +402,8 @@ def _get_period(request, *, strict: bool = False) -> Period:
         return Period(start=start, end=end)
 
     if start and end:
-        user = getattr(request, "user", None)
-        company = _get_company(user) if user else None
-        if company:
-            cur_first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            if cur_first.month == 12:
-                cur_nxt = cur_first.replace(year=cur_first.year + 1, month=1)
-            else:
-                cur_nxt = cur_first.replace(month=cur_first.month + 1)
-
-            if start < cur_first:
-                Sale, _ = get_sale_models()
-                if Sale is not None:
-                    dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
-                    paid_val = _choice_value(Sale, "Status", "PAID", "paid")
-                    has_in_req = Sale.objects.filter(
-                        company=company,
-                        status=paid_val,
-                        **{f"{dt_field}__gte": start, f"{dt_field}__lt": end},
-                    ).exists()
-                    if not has_in_req:
-                        has_in_cur = Sale.objects.filter(
-                            company=company,
-                            status=paid_val,
-                            **{f"{dt_field}__gte": cur_first, f"{dt_field}__lt": cur_nxt},
-                        ).exists()
-                        if has_in_cur:
-                            return Period(start=cur_first, end=cur_nxt)
-
+        # Период отдаём ровно тот, что запросили: пустой период — нули,
+        # а не «подставленный» текущий месяц.
         return Period(start=start, end=end)
 
     # период не задан (или задана лишь одна из границ) → текущий месяц
@@ -365,6 +413,14 @@ def _get_period(request, *, strict: bool = False) -> Period:
     else:
         nxt = first.replace(month=first.month + 1)
     return Period(start=first, end=nxt)
+
+
+def _revenue_statuses(Sale) -> tuple:
+    """Статусы чеков в выручке — как на вкладке «Продажи»: оплачен и частично возвращён."""
+    return (
+        _choice_value(Sale, "Status", "PAID", "paid"),
+        _choice_value(Sale, "Status", "PARTIALLY_RETURNED", "partially_returned"),
+    )
 
 
 def _model_has_field(model, field_name: str) -> bool:
@@ -592,6 +648,10 @@ def _get_active_branch(request):
 
     if not _is_owner_like(user):
         fixed = _fixed_branch_from_user(user, company)
+        if fixed is None and Branch.objects.filter(company_id=company_id).exists():
+            # None = «вся компания»: сотруднику без филиала в компании с филиалами
+            # это открыло бы чужие филиалы (и кэш владельца).
+            raise PermissionDenied("Сотрудник не привязан к филиалу.")
         setattr(request, "branch", fixed if fixed else None)
         return fixed if fixed else None
 
@@ -606,6 +666,12 @@ def _get_active_branch(request):
 
     setattr(request, "branch", None)
     return None
+
+
+def _require_finance_access(user):
+    if _is_owner_like(user) or getattr(user, "can_view_analytics", False):
+        return
+    raise PermissionDenied("Нет доступа к финансовой аналитике.")
 
 
 def _user_label(user_obj=None, *, first_name=None, last_name=None, email=None, phone=None, user_id=None) -> str:
@@ -643,6 +709,8 @@ def _user_label(user_obj=None, *, first_name=None, last_name=None, email=None, p
 # ─────────────────────────────────────────────────────────────
 class AnalyticsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
+    # Зарплаты и деньги компании — только владельцу/админу или с доступом к аналитике.
+    SENSITIVE_TABS = ("salary", "finance", "pnl", "cashflow")
 
     def _include_global(self, request) -> bool:
         qp = getattr(request, "query_params", None) or getattr(request, "GET", {})
@@ -751,6 +819,8 @@ class AnalyticsView(APIView):
         company = _get_company(request.user)
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
+        if tab in self.SENSITIVE_TABS:
+            _require_finance_access(request.user)
 
         branch = _get_active_branch(request)
         period = _get_period(request)
@@ -1393,7 +1463,7 @@ class AnalyticsView(APIView):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
 
-            sqs = Sale.objects.filter(company=company, status=paid_value)
+            sqs = Sale.objects.filter(company=company, status__in=_revenue_statuses(Sale))
             if branch is not None and _model_has_field(Sale, "branch"):
                 if self._include_global(request):
                     sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
@@ -1995,7 +2065,8 @@ class AnalyticsView(APIView):
                 o = r.get("shift__opened_at")
                 if not o:
                     continue
-                b = bucket(int(o.hour))
+                # values() отдаёт aware-datetime в UTC — час берём по местному времени
+                b = bucket(int(timezone.localtime(o).hour))
                 bucket_map[b]["revenue"] += Decimal(r.get("total") or 0)
                 bucket_map[b]["transactions"] += 1
 
@@ -2713,7 +2784,7 @@ class AnalyticsView(APIView):
         if Sale and SaleItem and _model_has_field(SaleItem, "sale") and _model_has_field(SaleItem, "quantity"):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
-            sqs = Sale.objects.filter(company=company, status=paid_value)
+            sqs = Sale.objects.filter(company=company, status__in=_revenue_statuses(Sale))
             if branch and _model_has_field(Sale, "branch"):
                 if self._include_global(request):
                     sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
@@ -2877,7 +2948,7 @@ class AnalyticsView(APIView):
         ):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
-            sqs = Sale.objects.filter(company=company, status=paid_value)
+            sqs = Sale.objects.filter(company=company, status__in=_revenue_statuses(Sale))
             if branch and _model_has_field(Sale, "branch"):
                 if self._include_global(request):
                     sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
@@ -3079,7 +3150,7 @@ class AnalyticsView(APIView):
             paid_value = _choice_value(Sale, "Status", "PAID", "paid")
             dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
             
-            sqs = Sale.objects.filter(company=company, status=paid_value)
+            sqs = Sale.objects.filter(company=company, status__in=_revenue_statuses(Sale))
             if branch and _model_has_field(Sale, "branch"):
                 if self._include_global(request):
                     sqs = sqs.filter(Q(branch=branch) | Q(branch__isnull=True))
@@ -3227,24 +3298,8 @@ class AnalyticsView(APIView):
         expense_items = []  # НОВОЕ: полный детальный список расходов
         income_items = []   # НОВОЕ: полный детальный список доходов
 
-        # CashFlow Analysis
-        cfqs = CashFlow.objects.filter(company=company, status=CashFlow.Status.APPROVED)
-        if branch:
-            cfqs = cfqs.filter(Q(branch=branch) | Q(branch__isnull=True))
-        cfqs = cfqs.filter(created_at__gte=period.start, created_at__lt=period.end)
-
-        # Исключаем дублирующие сырые записи, которые указывают на тот же business source,
-        # но были созданы из другого кассового потока / legacy source_kind.
-        cfqs = _dedupe_cashflow_raw_duplicates(
-            cfqs,
-            canonical_kinds=("warehouse_purchase",),
-            legacy_kinds=(),
-        )
-        cfqs = _dedupe_cashflow_raw_duplicates(
-            cfqs,
-            canonical_kinds=("pos_sale", "pos_prepayment"),
-            legacy_kinds=("sale",),
-        )
+        # CashFlow Analysis: одобренные движения без заявок, «сырых» двойников и зачёта
+        cfqs = _money_cashflows(company, branch, period, request).select_related("cashbox", "cashier")
 
         income_total = (
             cfqs.filter(type=CashFlow.Type.INCOME)
@@ -3315,7 +3370,7 @@ class AnalyticsView(APIView):
                 "cashbox": cf.cashbox.name if cf.cashbox else None,
                 "shift": str(cf.shift_id) if hasattr(cf, "shift_id") and cf.shift_id else None,
                 "created_at": cf.created_at.isoformat() if cf.created_at else None,
-                "created_by": _user_label(cf.created_by) if hasattr(cf, "created_by") and cf.created_by else None,
+                "created_by": _user_label(cf.cashier) if cf.cashier_id else None,
                 "description": getattr(cf, "description", None) or getattr(cf, "comment", None),
             }
             for cf in expense_qs
@@ -3334,7 +3389,7 @@ class AnalyticsView(APIView):
                 "cashbox": cf.cashbox.name if cf.cashbox else None,
                 "shift": str(cf.shift_id) if hasattr(cf, "shift_id") and cf.shift_id else None,
                 "created_at": cf.created_at.isoformat() if cf.created_at else None,
-                "created_by": _user_label(cf.created_by) if hasattr(cf, "created_by") and cf.created_by else None,
+                "created_by": _user_label(cf.cashier) if cf.cashier_id else None,
                 "description": getattr(cf, "description", None) or getattr(cf, "comment", None),
             }
             for cf in income_qs
@@ -3821,56 +3876,26 @@ class AnalyticsView(APIView):
         diff5 = abs(prod_items_sum - by_prod_sum)
         c5_ok = diff5 <= Decimal("0.01")
 
-        # 6. Финансовый доход = уникальные платежи
-        cf_in = CashFlow.objects.filter(
-            company=company,
-            type=CashFlow.Type.INCOME,
-            status=CashFlow.Status.APPROVED,
-            created_at__gte=period.start,
-            created_at__lt=period.end,
-        )
-        if branch is not None:
-            cf_in = cf_in.filter(Q(branch=branch) | Q(branch__isnull=True))
+        # 6/7. Финансовый доход/расход без дублей: одна и та же операция (источник,
+        # способ оплаты, сумма) не должна проводиться дважды. Части смешанной оплаты
+        # различаются способом, поэтому дублем не считаются.
+        cf_money = _money_cashflows(company, branch, period)
+        dup_keys = ("source_kind", "source_id", "payment_method", "amount")
 
-        cf_in = _dedupe_cashflow_raw_duplicates(
-            cf_in,
-            canonical_kinds=("pos_sale", "pos_prepayment"),
-            legacy_kinds=("sale",),
-        )
-        cf_in = _dedupe_cashflow_raw_duplicates(
-            cf_in,
-            canonical_kinds=("debt_repayment",),
-            legacy_kinds=("debt_payment",),
-        )
-
-        dups_in = (
-            cf_in.values("source_kind", "source_id", "amount")
+        total_dups_in = (
+            cf_money.filter(type=CashFlow.Type.INCOME, source_id__isnull=False)
+            .values(*dup_keys)
             .annotate(cnt=Count("id"))
-            .filter(cnt__gt=1, source_id__isnull=False)
+            .filter(cnt__gt=1)
             .count()
         )
-        total_dups_in = dups_in
         c6_ok = total_dups_in == 0
 
-        # 7. Финансовый расход = уникальные выплаты
-        cf_out = CashFlow.objects.filter(
-            company=company,
-            type=CashFlow.Type.EXPENSE,
-            status=CashFlow.Status.APPROVED,
-            created_at__gte=period.start,
-            created_at__lt=period.end,
-        )
-        if branch is not None:
-            cf_out = cf_out.filter(Q(branch=branch) | Q(branch__isnull=True))
-        cf_out_dedup = _dedupe_cashflow_raw_duplicates(
-            cf_out,
-            canonical_kinds=("warehouse_purchase",),
-            legacy_kinds=(),
-        )
         dups_out = (
-            cf_out_dedup.values("source_kind", "source_id", "amount")
+            cf_money.filter(type=CashFlow.Type.EXPENSE, source_id__isnull=False)
+            .values(*dup_keys)
             .annotate(cnt=Count("id"))
-            .filter(cnt__gt=1, source_id__isnull=False)
+            .filter(cnt__gt=1)
             .count()
         )
         c7_ok = dups_out == 0
@@ -3901,126 +3926,33 @@ class AnalyticsView(APIView):
     # CASH FLOW (AN-12)
     # ─────────────────────────────────────────────────────────
     def _cashflow(self, request, company, branch, period: Period):
+        """
+        Денежный поток целиком по CashFlow (кассовый метод): приход и расход —
+        по дате движения, категории по source_kind, взаимоисключающие (первое
+        совпадение). Возврат учитывается один раз — движением pos_sale_return;
+        предоплаты по продажам в долг входят в продажи, зачёт не входит.
+        """
         from apps.construction.models import CashFlow
 
-        Sale, _ = get_sale_models()
-        SalePayment = apps.get_model("main.SalePayment")
-        SaleReturn = apps.get_model("main.SaleReturn")
+        cf = _money_cashflows(company, branch, period, request)
+        inc = _sum_by_category(cf.filter(type=CashFlow.Type.INCOME), _cf_income_category())
+        exp = _sum_by_category(cf.filter(type=CashFlow.Type.EXPENSE), _cf_expense_category())
 
-        dt_field = "paid_at" if _model_has_field(Sale, "paid_at") else "created_at"
-        paid_val = _choice_value(Sale, "Status", "PAID", "paid")
-        partial_ret_val = _choice_value(Sale, "Status", "PARTIALLY_RETURNED", "partially_returned")
-
-        sales_qs = Sale.objects.filter(
-            company=company,
-            status__in=(paid_val, partial_ret_val),
-            **{f"{dt_field}__gte": period.start, f"{dt_field}__lt": period.end},
-        )
-        if branch is not None and _model_has_field(Sale, "branch"):
-            if self._include_global(request):
-                sales_qs = sales_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
-            else:
-                sales_qs = sales_qs.filter(branch=branch)
-        sales_qs = self._apply_sale_filters(request, sales_qs, Sale)
-
-        pmts = SalePayment.objects.filter(sale__in=sales_qs)
-        cash_in = pmts.filter(method="cash").aggregate(
-            s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD)
-        )["s"] or Z_MONEY
-
-        card_in = pmts.exclude(method__in=["cash", "debt"]).aggregate(
-            s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD)
-        )["s"] or Z_MONEY
-
-        # Debt repayments (погашения долгов)
-        cf_in = CashFlow.objects.filter(
-            company=company,
-            type=CashFlow.Type.INCOME,
-            status=CashFlow.Status.APPROVED,
-            created_at__gte=period.start,
-            created_at__lt=period.end,
-        )
-        if branch is not None:
-            cf_in = cf_in.filter(Q(branch=branch) | Q(branch__isnull=True))
-
-        # Исключаем дублирующие записи pos_sale и сырых записей
-        cf_in_dedup = _dedupe_cashflow_raw_duplicates(
-            cf_in,
-            canonical_kinds=("pos_sale", "pos_prepayment"),
-            legacy_kinds=("sale",),
-        )
-        cf_in_dedup = _dedupe_cashflow_raw_duplicates(
-            cf_in_dedup,
-            canonical_kinds=("debt_repayment",),
-            legacy_kinds=("debt_payment",),
-        )
-
-        debt_repayments = cf_in_dedup.filter(
-            Q(source_kind="debt_repayment") | Q(source_kind="debt_payment")
-        ).aggregate(
-            s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD)
-        )["s"] or Z_MONEY
-
-        # other_in: только прочие доходы вне продаж, предоплат и погашений долгов (AN-05)
-        other_in = cf_in_dedup.exclude(
-            Q(source_kind__in=["sale", "pos_sale", "pos_prepayment", "debt_payment", "debt_repayment"])
-            | Q(source_business_operation_id__in=["Продажа", "Предоплата", "Оплата долга", "Погашение долга"])
-            | Q(name__istartswith="Продажа")
-            | Q(category__title__istartswith="Продажа")
-        ).aggregate(
-            s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD)
-        )["s"] or Z_MONEY
-
+        cash_in = inc.get("sales_cash", Z_MONEY)
+        card_in = inc.get("sales_card", Z_MONEY)
+        debt_repayments = inc.get("debt_repayments", Z_MONEY)
+        other_in = inc.get("other_income", Z_MONEY)
         total_inflow = _money(cash_in + card_in + debt_repayments + other_in)
 
-        # Outflow (Расход денег)
-        cf_out = CashFlow.objects.filter(
-            company=company,
-            type=CashFlow.Type.EXPENSE,
-            status=CashFlow.Status.APPROVED,
-            created_at__gte=period.start,
-            created_at__lt=period.end,
+        suppliers = exp.get("suppliers", Z_MONEY)
+        salaries = exp.get("salaries", Z_MONEY)
+        rent = exp.get("rent", Z_MONEY)
+        taxes = exp.get("taxes", Z_MONEY)
+        returns = exp.get("returns", Z_MONEY)
+        other_exp = sum(
+            (v for k, v in exp.items() if k not in ("suppliers", "salaries", "rent", "taxes", "returns")),
+            Z_MONEY,
         )
-        if branch is not None:
-            cf_out = cf_out.filter(Q(branch=branch) | Q(branch__isnull=True))
-
-        cf_out = _dedupe_cashflow_raw_duplicates(
-            cf_out,
-            canonical_kinds=("warehouse_purchase",),
-            legacy_kinds=(),
-        )
-
-        suppliers = cf_out.filter(
-            Q(source_kind="warehouse_purchase") | Q(name__icontains="закупка") | Q(name__icontains="поставщик")
-        ).aggregate(s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["s"] or Z_MONEY
-
-        salaries = cf_out.filter(
-            Q(name__icontains="зарплат") | Q(name__icontains="аванс") | Q(category__title__icontains="зарплат")
-        ).aggregate(s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["s"] or Z_MONEY
-
-        rent = cf_out.filter(
-            Q(name__icontains="аренд") | Q(category__title__icontains="аренд")
-        ).aggregate(s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["s"] or Z_MONEY
-
-        taxes = cf_out.filter(
-            Q(name__icontains="налог") | Q(category__title__icontains="налог")
-        ).aggregate(s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["s"] or Z_MONEY
-
-        ret_qs = SaleReturn.objects.filter(
-            company=company,
-            created_at__gte=period.start,
-            created_at__lt=period.end,
-        )
-        if branch is not None and _model_has_field(SaleReturn, "branch"):
-            ret_qs = ret_qs.filter(branch=branch)
-        returns = ret_qs.aggregate(
-            s=Coalesce(Sum("returned_amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD)
-        )["s"] or Z_MONEY
-
-        total_exp = cf_out.aggregate(
-            s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD)
-        )["s"] or Z_MONEY
-        other_exp = max(Z_MONEY, total_exp - suppliers - salaries - rent - taxes)
 
         total_outflow = _money(suppliers + salaries + rent + taxes + other_exp + returns)
         net = _money(total_inflow - total_outflow)
@@ -4100,56 +4032,23 @@ class AnalyticsView(APIView):
             else 0.0
         )
 
-        # OPEX (Операционные расходы - без закупок товара на склад!)
-        cf_out = CashFlow.objects.filter(
-            company=company,
-            type=CashFlow.Type.EXPENSE,
-            status=CashFlow.Status.APPROVED,
-            created_at__gte=period.start,
-            created_at__lt=period.end,
-        )
-        if branch is not None:
-            cf_out = cf_out.filter(Q(branch=branch) | Q(branch__isnull=True))
-
-        cf_out = _dedupe_cashflow_raw_duplicates(
-            cf_out,
-            canonical_kinds=("warehouse_purchase",),
-            legacy_kinds=(),
-        )
-
-        opex_cf = cf_out.exclude(
-            Q(source_kind="warehouse_purchase") | Q(name__icontains="закупка") | Q(name__icontains="поставщик")
-        )
-
-        salaries = opex_cf.filter(
-            Q(name__icontains="зарплат") | Q(name__icontains="аванс") | Q(category__title__icontains="зарплат")
-        ).aggregate(s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["s"] or Z_MONEY
-
-        rent = opex_cf.filter(
-            Q(name__icontains="аренд") | Q(category__title__icontains="аренд")
-        ).aggregate(s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["s"] or Z_MONEY
-
-        taxes = opex_cf.filter(
-            Q(name__icontains="налог") | Q(category__title__icontains="налог")
-        ).aggregate(s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["s"] or Z_MONEY
-
-        utilities = opex_cf.filter(
-            Q(name__icontains="коммун") | Q(category__title__icontains="коммун") | Q(name__icontains="свет") | Q(name__icontains="интернет")
-        ).aggregate(s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["s"] or Z_MONEY
-
-        other = opex_cf.exclude(
-            Q(name__icontains="зарплат") | Q(name__icontains="аванс") | Q(category__title__icontains="зарплат") |
-            Q(name__icontains="аренд") | Q(category__title__icontains="аренд") |
-            Q(name__icontains="налог") | Q(category__title__icontains="налог") |
-            Q(name__icontains="коммун") | Q(category__title__icontains="коммун") | Q(name__icontains="свет") | Q(name__icontains="интернет")
-        ).aggregate(s=Coalesce(Sum("amount"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD))["s"] or Z_MONEY
+        # OPEX: расходы по CashFlow без закупок товара (они уже в себестоимости),
+        # без возвратов покупателям (выручка уже за их вычетом) и без залогов.
+        cf_out = _money_cashflows(company, branch, period).filter(type=CashFlow.Type.EXPENSE)
+        exp = _sum_by_category(cf_out, _cf_expense_category())
+        salaries = exp.get("salaries", Z_MONEY)
+        rent = exp.get("rent", Z_MONEY)
+        taxes = exp.get("taxes", Z_MONEY)
+        utilities = exp.get("utilities", Z_MONEY)
+        other = exp.get("other", Z_MONEY)
 
         # ТЗ-08 п.7: Строки продаж «без товара» (доп. услуга) отдельной группой, а не смешивать с товарами
         items_qs = SaleItem.objects.filter(sale__in=sales_qs)
         custom_filter = Q(is_custom=True) | Q(product__isnull=True)
 
         line_rev_expr = ExpressionWrapper(
-            (F("unit_price") * F("quantity")) - Coalesce(F("line_discount"), Value(Z_MONEY, output_field=MONEY_FIELD)) - Coalesce(F("manual_discount"), Value(Z_MONEY, output_field=MONEY_FIELD)),
+            # line_discount уже включает ручную скидку (manual_discount) — второй раз не вычитаем
+            (F("unit_price") * F("quantity")) - Coalesce(F("line_discount"), Value(Z_MONEY, output_field=MONEY_FIELD)),
             output_field=MONEY_FIELD,
         )
 
@@ -4235,6 +4134,7 @@ class AnalyticsCashFlowAPIView(APIView):
         company = _get_company(request.user)
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
+        _require_finance_access(request.user)
         branch = _get_active_branch(request)
         period = _get_period(request)
         data = AnalyticsView()._cashflow(request, company, branch, period)
@@ -4248,6 +4148,7 @@ class AnalyticsPnLAPIView(APIView):
         company = _get_company(request.user)
         if not company:
             raise PermissionDenied("У пользователя не настроена компания.")
+        _require_finance_access(request.user)
         branch = _get_active_branch(request)
         period = _get_period(request)
         data = AnalyticsView()._pnl(request, company, branch, period)
