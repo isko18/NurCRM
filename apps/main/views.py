@@ -1119,7 +1119,7 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
     pagination_class = ProductListPageNumberPagination
     filter_backends = [ProductBarcodeAwareSearchFilter, filters.OrderingFilter]
     search_fields = ["name", "barcode", "article", "alternate_barcodes__barcode", "alternate_barcodes__name"]
-    ordering_fields = ["created_at", "updated_at", "price"]
+    ordering_fields = ["created_at", "updated_at", "price", "quantity"]
     # По умолчанию — по монотонному seq: детерминированный порядок «сначала новые»
     # без переупорядочивания строк с одинаковым created_at (fallback ниже — тоже -seq).
     ordering = ["-seq"]
@@ -1243,6 +1243,12 @@ class ProductListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
         current = [o for o in (list(qs.query.order_by) or []) if "is_favorite" not in o]
         if not current:
             current = ["-seq"]
+        if any(o.lstrip("-") == "quantity" for o in current):
+            # Сортировка по остатку (блок «Заканчивается»): избранные сверху не нужны —
+            # они сломали бы «N товаров с самым малым остатком»; seq — стабильные страницы.
+            if not any(o.lstrip("-") == "seq" for o in current):
+                current.append("seq")
+            return qs.order_by(*current)
         qs = qs.order_by("-is_favorite", *current)
         return qs
 

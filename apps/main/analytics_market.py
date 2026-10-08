@@ -20,6 +20,9 @@ from django.db.models import (
     Case,
     When,
     CharField,
+    Exists,
+    OuterRef,
+    Subquery,
 )
 from django.db.models.functions import TruncDate, ExtractHour, ExtractWeekDay, Coalesce
 from django.utils import timezone
@@ -370,6 +373,81 @@ def _mixed_payment_split(sales_qs):
         else:
             card += r["v"] or Decimal("0.00")
     return {"cash": cash, "card": card}
+
+
+PAYMENT_METHOD_LABELS = {
+    "cash": "Наличные",
+    "transfer": "Перевод",
+    "mbank": "Мбанк",
+    "optima": "Оптима Банк",
+    "obank": "О!Деньги",
+    "bakai": "Бакай Банк",
+    "debt": "В долг",
+    "offset": "Зачёт",
+    "mixed": "Смешанная (без разбивки)",
+}
+
+
+def _payment_methods_breakdown(sales_qs, revenue: Decimal) -> list:
+    """
+    «Способы оплаты» по фактическим деньгам: строки SalePayment, а не Sale.payment_method.
+    Смешанный чек раскладывается на свои способы (600 нал + 400 карта → cash 600, mbank 400),
+    поэтому Σ total == выручке; `count` — число чеков, где способ встретился (сумма count
+    может быть больше числа чеков). Если строки оплат не сходятся с суммой чека (старые
+    данные, сдача), они пропорционально приводятся к total чека. Чеки без строк оплат
+    (старые) идут по Sale.payment_method; `mixed` остаётся только для чеков без разбивки
+    (`unsplit: true`).
+    """
+    from apps.main.models import Sale, SalePayment
+
+    mixed = Sale.PaymentMethod.MIXED
+    usable = SalePayment.objects.filter(amount__gt=0).exclude(method=mixed)
+    line_sum = Subquery(
+        usable.filter(sale_id=OuterRef("sale_id")).values("sale_id").annotate(s=Sum("amount")).values("s")[:1],
+        output_field=MONEY_FIELD,
+    )
+    by_method: dict = {}
+
+    line_rows = (
+        usable.filter(sale__in=sales_qs.values("id"))
+        .annotate(ls=line_sum)
+        .values("method")
+        .annotate(
+            total=Sum(ExpressionWrapper(F("amount") * F("sale__total") / F("ls"), output_field=MONEY_FIELD)),
+            cnt=Count("sale_id", distinct=True),
+        )
+    )
+    for r in line_rows:
+        by_method[r["method"] or "unknown"] = {"count": r["cnt"], "total": _money(r["total"] or Z_MONEY), "unsplit": False}
+
+    no_lines = sales_qs.annotate(
+        has_lines=Exists(usable.filter(sale_id=OuterRef("pk")))
+    ).filter(has_lines=False)
+    for r in no_lines.values("payment_method").annotate(cnt=Count("id"), total=Sum("total")):
+        key = r["payment_method"] or "unknown"
+        row = by_method.setdefault(key, {"count": 0, "total": Z_MONEY, "unsplit": False})
+        row["count"] += r["cnt"]
+        row["total"] += _money(r["total"] or Z_MONEY)
+        row["unsplit"] = row["unsplit"] or key == mixed
+
+    rows = sorted(by_method.items(), key=lambda kv: kv[1]["total"], reverse=True)
+    # копейки округления относим на самую крупную строку, чтобы Σ == выручке ровно
+    diff = _money(revenue) - sum((v["total"] for _, v in rows), Z_MONEY)
+    if rows and diff:
+        rows[0][1]["total"] += diff
+
+    out = []
+    for key, v in rows:
+        item = {
+            "method": key,
+            "label": PAYMENT_METHOD_LABELS.get(key, key),
+            "count": v["count"],
+            "total": str(_money(v["total"])),
+        }
+        if v["unsplit"]:
+            item["unsplit"] = True
+        out.append(item)
+    return out
 
 
 @dataclass
@@ -985,6 +1063,8 @@ class AnalyticsView(APIView):
         clients = 0
         daily = []
         top_products = []
+        mixed_count = 0
+        mixed_total = Z_MONEY
         returns_count = 0
         returns_amount = Z_MONEY
 
@@ -1123,31 +1203,13 @@ class AnalyticsView(APIView):
             # ── Payment Method Breakdown ──
             payment_breakdown = []
             if _model_has_field(Sale, "payment_method"):
-                payment_rows = (
-                    qs.values("payment_method")
-                    .annotate(
-                        count=Count("id"),
-                        total=Coalesce(
-                            Sum("total"),
-                            Value(Z_MONEY, output_field=MONEY_FIELD),
-                            output_field=MONEY_FIELD,
-                        ),
-                    )
-                    .order_by("-total")
+                payment_breakdown = _payment_methods_breakdown(qs, revenue)
+                mixed_agg = qs.filter(payment_method=Sale.PaymentMethod.MIXED).aggregate(
+                    n=Count("id"),
+                    v=Coalesce(Sum("total"), Value(Z_MONEY, output_field=MONEY_FIELD), output_field=MONEY_FIELD),
                 )
-                payment_breakdown = [
-                    {
-                        "method": r.get("payment_method") or "unknown",
-                        "count": r.get("count") or 0,
-                        "total": str(_money(r.get("total") or Z_MONEY)),
-                    }
-                    for r in payment_rows
-                ]
-                mixed_split = _mixed_payment_split(qs)
-                for row in payment_breakdown:
-                    if row["method"] == "mixed":
-                        row["cash"] = str(_money(mixed_split["cash"]))
-                        row["card"] = str(_money(mixed_split["card"]))
+                mixed_count = mixed_agg["n"] or 0
+                mixed_total = mixed_agg["v"] or Z_MONEY
 
             if SaleItem is not None and _model_has_field(SaleItem, "sale"):
                 item_qs = SaleItem.objects.filter(sale__in=qs)
@@ -1255,6 +1317,9 @@ class AnalyticsView(APIView):
                 "revenue_before_returns": str(_money(Decimal(revenue) + Decimal(partial_returns_amount))),
                 "returns_total": str(_money(returns_amount)),
                 "returns_count": returns_count,
+                # Справочно: чеки со смешанной оплатой (уже разложены по способам в payment_methods)
+                "mixed_total": str(_money(mixed_total)),
+                "mixed_count": mixed_count,
                 "net_revenue": str(_money(revenue)),
                 "transactions": tx,
                 "avg_check": str(_money(avg_check)),

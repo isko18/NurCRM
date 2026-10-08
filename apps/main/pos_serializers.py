@@ -839,6 +839,8 @@ class SaleListSerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(source="client.full_name", read_only=True)
     change = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     first_item_name = serializers.SerializerMethodField(read_only=True)
+    items_preview = serializers.SerializerMethodField(read_only=True)
+    items_count = serializers.SerializerMethodField(read_only=True)
     matched_item_name = serializers.CharField(read_only=True, allow_null=True)
 
     shift = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -882,6 +884,8 @@ class SaleListSerializer(serializers.ModelSerializer):
             "cashbox",
             "cashbox_name",
             "first_item_name",
+            "items_preview",
+            "items_count",
             "matched_item_name",
             "debt_amount",
             "deal_id",
@@ -929,10 +933,19 @@ class SaleListSerializer(serializers.ModelSerializer):
         )
 
     def get_first_item_name(self, obj):
-        item = obj.items.first()
-        if not item:
+        # items предзагружены (prefetch) — без запроса на каждую строку списка;
+        # порядок как у .first() (по pk), чтобы «первая позиция» была стабильной.
+        items = list(obj.items.all())
+        if not items:
             return None
+        item = min(items, key=lambda i: str(i.id))
         return (item.name_snapshot or "").strip() or getattr(getattr(item, "product", None), "name", None)
+
+    def get_items_preview(self, obj):
+        return self.get_first_item_name(obj)
+
+    def get_items_count(self, obj):
+        return len(obj.items.all())
 
     def get_cashbox_name(self, obj):
         cb = getattr(obj, "cashbox", None)

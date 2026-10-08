@@ -4394,23 +4394,40 @@ class SaleConsultantsAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixi
         return Response(result, status=status.HTTP_200_OK)
 
 
+class SaleListOrderingFilter(filters.OrderingFilter):
+    """
+    `ordering=-paid_at` сортирует по времени продажи: Coalesce(paid_at, created_at).
+    Иначе чеки без paid_at (продажа в долг) при DESC в PostgreSQL шли бы первыми (NULLS FIRST).
+    К явной сортировке добавляется `-id`, чтобы страницы не пересекались при равных значениях.
+    """
+
+    def get_ordering(self, request, queryset, view):
+        terms = super().get_ordering(request, queryset, view)
+        if not terms or not request.query_params.get(self.ordering_param):
+            return terms
+        mapped = [("-" if t.startswith("-") else "") + "sold_at" if t.lstrip("-") == "paid_at" else t for t in terms]
+        if not any(t.lstrip("-") == "id" for t in mapped):
+            mapped.append("-id")
+        return mapped
+
+
 class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, generics.ListAPIView):
     serializer_class = SaleListSerializer
     queryset = (
-        Sale.objects.select_related("user", "consultant")
+        Sale.objects.select_related("user", "consultant", "client", "cashbox", "cashbox__branch")
         .prefetch_related("items__product", "payments", "deals")
         .all()
     )
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, SaleListOrderingFilter]
     filterset_fields = ("user", "consultant")
     search_fields = ("id",)
-    ordering_fields = ("created_at", "total", "status", "doc_number")
+    ordering_fields = ("created_at", "paid_at", "sold_at", "total", "status", "doc_number")
     # id — стабильный порядок при равном created_at, иначе страницы пересекаются.
     ordering = ("-created_at", "-id")
     pagination_class = PosSalesLimitPagination
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = super().get_queryset().annotate(sold_at=Coalesce("paid_at", "created_at"))
         qs = _apply_sale_date_filters(qs, self.request)
 
         number = (self.request.query_params.get("number") or "").strip()
@@ -4434,6 +4451,16 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
                     qs = qs.filter(status__in=status_list)
             else:
                 qs = qs.filter(status=raw_statuses)
+
+        # Без статусов из списка (например `exclude_status=new` — открытые корзины)
+        # или `only_finished=true` — то же самое одним флагом.
+        exclude_param = (self.request.query_params.get("exclude_status") or "").strip()
+        if exclude_param:
+            excluded = [x.strip() for x in exclude_param.split(",") if x.strip()]
+            if excluded:
+                qs = qs.exclude(status__in=excluded)
+        if (self.request.query_params.get("only_finished") or "").strip().lower() in ("1", "true", "yes"):
+            qs = qs.exclude(status=Sale.Status.NEW)
 
         users_param = self.request.query_params.get("users")
         if users_param:

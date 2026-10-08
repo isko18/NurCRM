@@ -21,7 +21,11 @@ VALID_PRESETS = {
     "not_sold_90d",
     "negative_stock",
     "stock_below_min",
+    "low_stock",
 }
+
+# Порог «мало» для товаров без своего minimum_quantity (preset=low_stock).
+LOW_STOCK_DEFAULT_THRESHOLD = Decimal("5")
 
 # Обратная совместимость с кириллическими slug (старый фронт)
 _PRESET_ALIASES = {
@@ -120,7 +124,7 @@ def _price_field(price_type: str) -> str | None:
     return mapping.get((price_type or "").strip().lower())
 
 
-def _apply_preset(qs, preset: str):
+def _apply_preset(qs, preset: str, low_stock_threshold=None):
     today = timezone.localdate()
 
     if preset == "discounted":
@@ -132,6 +136,7 @@ def _apply_preset(qs, preset: str):
         "out_of_stock",
         "negative_stock",
         "stock_below_min",
+        "low_stock",
     ):
         qs = qs.exclude(kind=Product.Kind.SERVICE)
 
@@ -152,6 +157,16 @@ def _apply_preset(qs, preset: str):
         return qs.filter(quantity__lt=0)
     if preset == "not_sold_90d":
         return _apply_not_sold_within(qs, 90)
+    if preset == "low_stock":
+        # «Заканчивается»: остаток ≤ своего минимума, а если минимум не задан — ≤ порога (по умолчанию 5).
+        threshold = _parse_decimal(low_stock_threshold)
+        if threshold is None or threshold < 0:
+            threshold = LOW_STOCK_DEFAULT_THRESHOLD
+        has_min = Q(minimum_quantity__isnull=False, minimum_quantity__gt=0)
+        return qs.filter(
+            (has_min & Q(quantity__lte=F("minimum_quantity")))
+            | (~has_min & (Q(quantity__isnull=True) | Q(quantity__lte=threshold)))
+        )
     if preset == "stock_below_min":
         return qs.filter(
             minimum_quantity__isnull=False,
@@ -218,7 +233,7 @@ def apply_product_list_filters(qs, query_params):
 
     preset = _normalize_preset(query_params.get("preset"))
     if preset:
-        qs = _apply_preset(qs, preset)
+        qs = _apply_preset(qs, preset, query_params.get("low_stock_threshold"))
 
     price_type = (query_params.get("price_type") or "").strip().lower()
     price_condition = (query_params.get("price_condition") or "eq").strip().lower()
