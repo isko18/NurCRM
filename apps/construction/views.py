@@ -310,8 +310,7 @@ class CashboxListCreateView(CompanyBranchScopedMixin, generics.ListCreateAPIView
                 # flows inside open shifts
                 shift_flows = (
                     CashFlow.objects
-                    .filter(shift_id__in=all_open_ids)
-                    .money()
+                    .filter(shift_id__in=all_open_ids, status=CashFlow.Status.APPROVED, request_kind__isnull=True)
                     .values("shift_id")
                     .annotate(
                         income=Sum(

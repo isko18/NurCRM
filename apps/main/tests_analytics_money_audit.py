@@ -95,12 +95,13 @@ class CashFlowMoneyAnalyticsTests(TestCase):
         self.flow("income", "700", source_kind="pos_prepayment", source_id="s4", payment_method="debt")
         self.flow("income", "1000", source_kind="pos_sale", source_id="s5", payment_method="offset")
         self.assertEqual(self.finance()["income_total"], "300.00")
+        self.assertEqual(self.cashbox.get_summary()["income_total"], Decimal("300.00"))
 
     # H6: закупки и возвраты не в OPEX
     def test_pnl_opex_excludes_purchases_and_returns(self):
         self.flow("expense", "50000", source_kind="procurement_receipt", name="Закупки")
         self.flow("expense", "1000", source_kind="pos_sale_return", source_id="s6")
-        self.flow("expense", "3000", source_kind="manual", name="Аренда офиса")
+        self.flow("expense", "3000", source_kind="manual", name="аренда офиса")
         self.flow("expense", "700", source_kind="manual", name="Хозтовары")
         opex = self.pnl()["opex"]
         self.assertEqual((opex["rent"], opex["other"], opex["total"]), ("3000.00", "700.00", "3700.00"))
@@ -110,7 +111,7 @@ class CashFlowMoneyAnalyticsTests(TestCase):
         self.flow("income", "1000", source_kind="pos_sale", source_id="s7", payment_method="cash")
         self.flow("expense", "100", source_kind="pos_sale_return", source_id="s7", payment_method="cash")
         self.flow("income", "100", source_kind="pos_sale_return", source_id="s7", name="Наличные остались в кассе")
-        self.flow("expense", "10000", source_kind="manual", name="Аренда и налог")
+        self.flow("expense", "10000", source_kind="manual", name="аренда и налог")
         self.flow("income", "3000", source_kind="pos_prepayment", source_id="s8", payment_method="cash")
         res = self.cashflow()
         self.assertEqual(res["inflow"]["sales_cash"], "4000.00")
@@ -277,6 +278,7 @@ class CheckoutAndExchangeFlowsTests(KassaBase):
         cards = AnalyticsView()._finance(_req(self.owner), self.company, None, period)["cards"]
         self.assertEqual(cards["net_flow"], "1000.00")
         self.assertEqual(self.shift.calc_live_totals(refresh=True)["expected_cash"], drawer_before)
+        self.assertEqual(self.cashbox.get_summary()["income_total"], Decimal("1000.00"))
 
 
 class CashFlowEmployeeRightsTests(KassaBase):

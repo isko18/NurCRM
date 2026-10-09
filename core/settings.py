@@ -189,7 +189,7 @@ else:
             'ENGINE': 'django.db.backends.postgresql',
             'NAME': os.environ.get('DB_NAME', 'nurcrm2'),
             'USER': os.environ.get('DB_USER', 'nuruser'),
-            'PASSWORD': os.environ.get('DB_PASSWORD', 'nurpass2025'),
+            'PASSWORD': os.environ.get('DB_PASSWORD', ''),
             'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
             'PORT': os.environ.get('DB_PORT', '6432'),
             'CONN_MAX_AGE': 0,

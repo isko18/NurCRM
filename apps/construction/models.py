@@ -930,13 +930,21 @@ class CashFlowQuerySet(models.QuerySet):
     # Старые source_kind, вышедшие из choices: дубль, если есть каноническая строка с тем же source_id.
     LEGACY_KINDS = ("sale", "debt_payment")
 
+    NON_MONEY_METHODS = ("offset", "debt")
+
     def money(self):
         """
         Движения, которые считаются деньгами: одобренные и не строки заявок
         на правку/отмену (у тех request_kind заполнен, а исходное движение
-        правится или отклоняется само).
+        правится или отклоняется само), без неденежных способов оплаты (offset, debt)
+        и без технических поправок наличного ящика при возврате/обмене
+        (source_kind=pos_sale_return + income).
         """
-        return self.filter(status=CashFlow.Status.APPROVED, request_kind__isnull=True)
+        return (
+            self.filter(status=CashFlow.Status.APPROVED, request_kind__isnull=True)
+            .exclude(payment_method__in=self.NON_MONEY_METHODS)
+            .exclude(source_kind="pos_sale_return", type=CashFlow.Type.INCOME)
+        )
 
     def without_raw_twins(self):
         """
