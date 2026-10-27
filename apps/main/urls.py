@@ -3,7 +3,10 @@ from django.urls import path, include
 from apps.main.mass_incoming_views import ProductMassIncomingAPIView
 from .views import *
 from .price_check import ProductCatalogVersionView, ProductPriceCheckView
+from .product_changes import ProductChangesView
 from .pos_views import *
+from apps.construction.views_buhgalter import AuditLogView
+from apps.construction.views_admin import TrashListView, TrashRestoreView
 from .kassa_stage3 import (
     AppointmentDetailAPIView,
     AppointmentListCreateAPIView,
@@ -112,7 +115,13 @@ from apps.main.part12_views import (
 )
 
 
+from apps.main.views_payables import SupplierPayablesAPIView
+
 urlpatterns = [
+    # ТЗ «Админка»: журнал действий (тот же, что construction/audit-log/) и корзина удалённого
+    path("audit-log/", AuditLogView.as_view(), name="main-audit-log"),
+    path("trash/", TrashListView.as_view(), name="main-trash"),
+    path("trash/<str:type>/<str:object_id>/restore/", TrashRestoreView.as_view(), name="main-trash-restore"),
     # Приложение клиентов: поиск по телефону, QR, перенос бонусов, магазин в приложении, приглашения
     path("", include("apps.clientapp.staff_urls")),
 
@@ -149,6 +158,7 @@ urlpatterns = [
     path('products/compact-list/', ProductCompactListView.as_view(), name='product-compact-list'),
     path('products/price-check/', ProductPriceCheckView.as_view(), name='product-price-check'),
     path('products/catalog-version/', ProductCatalogVersionView.as_view(), name='product-catalog-version'),
+    path('products/changes/', ProductChangesView.as_view(), name='product-changes'),
     path('products/scale-export/', WeightProductsScaleExportAPIView.as_view(), name='product-scale-export'),
     path('products/create-by-barcode/', ProductCreateByBarcodeAPIView.as_view(), name='product-create-by-barcode'),
     path("products/barcode-duplicates/", BarcodeDuplicatesAPIView.as_view(), name="product-barcode-duplicates"),
@@ -239,6 +249,7 @@ urlpatterns = [
 
     # 🔹 Уведомления
     path('notifications/', NotificationListView.as_view(), name='notification-list'),
+    path('notifications/unread-count/', NotificationUnreadCountView.as_view(), name='notification-unread-count'),
     path('notifications/mark-all-read/', MarkAllNotificationsReadView.as_view(), name='mark-all-notifications-read'),
     # алиас: часть клиентов зовёт read-all/ (см. realtime-notifications-backend.md)
     path('notifications/read-all/', MarkAllNotificationsReadView.as_view(), name='notifications-read-all'),
@@ -426,6 +437,7 @@ urlpatterns = [
     # -------------------------
     # Поставщики -> товары -> оприходование
     # -------------------------
+    path("suppliers/payables/", SupplierPayablesAPIView.as_view(), name="supplier-payables"),
     path("suppliers/", SupplierListAPIView.as_view(), name="supplier-list"),
     path("suppliers/receipts/", SupplierReceiptListAPIView.as_view(), name="supplier-receipts"),
     path("suppliers/receipts/<uuid:pk>/", SupplierReceiptRetrieveAPIView.as_view(), name="supplier-receipt-detail"),

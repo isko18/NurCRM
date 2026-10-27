@@ -19,7 +19,7 @@ from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import permissions, serializers, status
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -46,6 +46,36 @@ Q2 = Decimal("0.01")
 ZERO = Decimal("0.00")
 
 
+class PriceChangedError(APIException):
+    """
+    Б-03 (27.10.2026): цена строки чека не совпадает с текущей ценой каталога, а клиент
+    прислал заголовок X-NurMarket-Strict-Price: 1. Чек не проводится, касса получает
+    актуальные цены и пересчитывает чек.
+    """
+
+    status_code = status.HTTP_409_CONFLICT
+    default_code = "price_changed"
+
+    def __init__(self, mismatch):
+        super().__init__({
+            "code": "price_changed",
+            "detail": "Цены изменились. Обновите каталог и пересчитайте чек.",
+            "price_mismatch": mismatch,
+        })
+
+
+def _strict_price(request) -> bool:
+    headers = getattr(request, "headers", None) or {}
+    raw = headers.get("X-NurMarket-Strict-Price")
+    if raw is None:
+        # pos/checkout/batch/ подставляет обычный dict: ключи там в том регистре, в каком пришли.
+        for k, v in dict(headers).items():
+            if str(k).lower() == "x-nurmarket-strict-price":
+                raw = v
+                break
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _idempotency_key(request, required=True):
     key = (request.headers.get("Idempotency-Key") or request.data.get("idempotency_key") or "").strip()
     if not key and required:
@@ -70,6 +100,8 @@ class QuickCheckoutItemSerializer(serializers.Serializer):
     custom = serializers.BooleanField(required=False, default=False)
     product = serializers.UUIDField(required=False, allow_null=True)
     sale_package = serializers.UUIDField(required=False, allow_null=True)
+    # Продажа упаковкой: qty — число упаковок, цена — цена упаковки (обрабатывает apps.possync.packs)
+    sale_package_id = serializers.UUIDField(required=False, allow_null=True)
     variant = serializers.UUIDField(required=False, allow_null=True)
     performer = serializers.UUIDField(required=False, allow_null=True)
     name = serializers.CharField(required=False, allow_blank=True, max_length=255)
@@ -77,6 +109,14 @@ class QuickCheckoutItemSerializer(serializers.Serializer):
     price = MoneyField(required=False, allow_null=True)
     discount = MoneyField(required=False, allow_null=True, default=ZERO)
     is_wholesale = serializers.BooleanField(required=False, default=False)
+    # Б-03 (27.10.2026): кассир сознательно продал не по цене каталога — не считать расхождением.
+    price_override = serializers.BooleanField(required=False, default=False)
+
+    # ТЗ 11.5: принимается псевдоним quantity.
+    def to_internal_value(self, data):
+        if isinstance(data, dict) and data.get("qty") in (None, "") and data.get("quantity") not in (None, ""):
+            data = {**data, "qty": data["quantity"]}
+        return super().to_internal_value(data)
 
     def validate(self, attrs):
         if attrs["qty"] <= 0:
@@ -93,6 +133,15 @@ class QuickCheckoutItemSerializer(serializers.Serializer):
         return attrs
 
 
+class CheckoutItemSerializer(QuickCheckoutItemSerializer):
+    """Строка чека POS checkout: qty/quantity обязательны (раньше молча ставилась 1 шт.)."""
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict) and all(data.get(k) in (None, "") for k in ("qty", "quantity")):
+            raise serializers.ValidationError({"qty": "Укажите количество (qty или quantity)."})
+        return super().to_internal_value(data)
+
+
 class QuickCheckoutPaymentSerializer(serializers.Serializer):
     method = serializers.ChoiceField(choices=Sale.PaymentMethod.choices, default=Sale.PaymentMethod.CASH)
     received = MoneyField(required=False, allow_null=True)
@@ -102,11 +151,17 @@ class QuickCheckoutPaymentSerializer(serializers.Serializer):
     prepayment_method = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     payments = serializers.ListField(child=serializers.DictField(), required=False)
 
+    def to_internal_value(self, data):
+        # ТЗ 12.9: старое имя cash_received принимается как received.
+        if isinstance(data, dict) and data.get("received") in (None, "") and data.get("cash_received") not in (None, ""):
+            data = {**data, "received": data["cash_received"]}
+        return super().to_internal_value(data)
+
 
 class QuickCheckoutSerializer(serializers.Serializer):
     shift = serializers.UUIDField(required=False, allow_null=True)
     client = serializers.UUIDField(required=False, allow_null=True)
-    items = QuickCheckoutItemSerializer(many=True, allow_empty=False)
+    items = CheckoutItemSerializer(many=True, allow_empty=False)
     order_discount_total = MoneyField(required=False, allow_null=True)
     order_discount_percent = serializers.DecimalField(
         max_digits=5, decimal_places=2, required=False, allow_null=True, min_value=0, max_value=100
@@ -122,6 +177,8 @@ class QuickCheckoutSerializer(serializers.Serializer):
     print_receipt = serializers.BooleanField(required=False, default=False)
     allow_minus = serializers.BooleanField(required=False, default=False)
     is_wholesale = serializers.BooleanField(required=False, default=False)
+    # Б-03: все цены чека заданы сознательно (не сверять с каталогом).
+    price_override = serializers.BooleanField(required=False, default=False)
     # BE2-10: продажа, сделанная без связи и досланная позже.
     offline = serializers.BooleanField(required=False, default=False)
     offline_created_at = serializers.DateTimeField(required=False, allow_null=True)
@@ -129,6 +186,11 @@ class QuickCheckoutSerializer(serializers.Serializer):
     # серверу — продажа идёт в смену этой кассы, открытую в это время, иначе в техническую смену дня.
     sold_at = serializers.DateTimeField(required=False, allow_null=True)
     cashbox = serializers.UUIDField(required=False, allow_null=True)
+    # Удалённые строки корзины (веб-касса) — пишутся в CartItemDeletionLog (apps.possync.deletions)
+    deleted_items = serializers.ListField(child=serializers.DictField(), required=False, allow_empty=True, max_length=500)
+    # График долга (веб-касса): создаётся вместе со сделкой (apps.possync.schedule)
+    debt_schedule = serializers.JSONField(required=False, allow_null=True)
+    schedule_version = serializers.CharField(required=False, allow_null=True, allow_blank=True)
 
     def to_internal_value(self, data):
         items = data.get("items")
@@ -400,7 +462,12 @@ class PosQuickCheckoutAPIView(APIView):
                 )
                 max_dp = getattr(company, "max_discount_percent", None)
                 limit_discounts = max_dp is not None and not _is_admin_for_discounts(user)
+                self._price_mismatch = []
+                self._price_override_all = bool(data.get("price_override"))
                 self._add_items(cart, data["items"], limit_discounts, max_dp)
+                if self._price_mismatch and _strict_price(request):
+                    # Строгий режим (новая касса, онлайн): чек не проводим, отдаём актуальные цены.
+                    raise PriceChangedError(self._price_mismatch)
 
                 bonus = money(data.get("bonus_redeemed") or ZERO)
                 self._apply_order_discount(cart, data, bonus, limit_discounts, max_dp)
@@ -431,6 +498,8 @@ class PosQuickCheckoutAPIView(APIView):
                         sale=sale,
                         user=user,
                     )
+                # Хук для проверок после создания чека (лимиты долга и т.п.): исключение откатывает всю транзакцию.
+                self.after_sale_created(request, sale, client, data)
                 sale.idempotency_key = key
                 Sale.objects.filter(pk=sale.pk).update(
                     idempotency_key=key,
@@ -454,9 +523,25 @@ class PosQuickCheckoutAPIView(APIView):
         for k in ("cashflows", "receipt_print_path", "ekassa", "payments"):
             if k in resp.data:
                 body[k] = resp.data[k]
+        # Б-03: расхождения цен строк с каталогом — в ответ и в журнал продажи.
+        mismatch = list(getattr(self, "_price_mismatch", None) or [])
+        body["price_mismatch"] = mismatch
+        if mismatch:
+            try:
+                from apps.construction import audit as admin_audit
+
+                admin_audit.log_request(
+                    request, "price_mismatch", "sale", sale.pk, str(sale.doc_number or ""),
+                    after={"items": mismatch}, company=company,
+                )
+            except Exception:
+                pass
         return Response(body, status=status.HTTP_201_CREATED)
 
     # --- helpers ---
+
+    def after_sale_created(self, request, sale, client, data):
+        """Переопределяется в apps.possync: проверки внутри транзакции продажи."""
 
     def _add_items(self, cart, items, limit_discounts, max_dp):
         from apps.main.pos_views import _q2, default_unit_price_for_package
@@ -464,6 +549,8 @@ class PosQuickCheckoutAPIView(APIView):
         product_ids = [it["product"] for it in items if not it.get("custom")]
         products = {p.id: p for p in Product.objects.filter(company_id=cart.company_id, id__in=product_ids)}
         performers = resolve_performers(cart.company_id, [it.get("performer") for it in items])
+        if not hasattr(self, "_price_mismatch"):
+            self._price_mismatch = []
         for idx, it in enumerate(items):
             qty = qty3(it["qty"])
             performer = performers.get(it.get("performer"))
@@ -528,6 +615,25 @@ class PosQuickCheckoutAPIView(APIView):
                     raise ValidationError(
                         {"items": {idx: f"Цена продажи не может быть ниже закупочной ({min_price})."}}
                     )
+            # Б-03 (27.10.2026): цена строки не совпадает с текущей ценой каталога и клиент не
+            # сказал, что это сознательно (price_override / скидка / оптовая цена) — запоминаем
+            # расхождение. Продажа проходит (оффлайн-досылка со старым каталогом), в ответе
+            # будет price_mismatch; со строгим заголовком X-NurMarket-Strict-Price — 409.
+            if (
+                it.get("price") is not None
+                and price != default_price
+                and discount <= 0
+                and not it.get("price_override")
+                and not getattr(self, "_price_override_all", False)
+                and not (is_wholesale and wholesale_price > 0 and price == wholesale_price)
+            ):
+                self._price_mismatch.append({
+                    "index": idx,
+                    "product_id": str(product.id),
+                    "name": product.name,
+                    "sent": str(price),
+                    "current": str(default_price),
+                })
             CartItem(
                 company=cart.company,
                 branch=cart.branch,
