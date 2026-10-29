@@ -1,0 +1,817 @@
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+
+from django.db.models import Sum, Count, Value as V, F, DecimalField, Subquery, OuterRef, Q
+from django.db.models.functions import Coalesce, TruncDate, TruncWeek, TruncMonth
+from django.utils import timezone
+
+from django.db.models.expressions import ExpressionWrapper
+
+from apps.users.models import User
+from apps.construction.models import CashFlow
+from .models import (
+    ManufactureSubreal,
+    Acceptance,
+    ReturnFromAgent,
+    Inventory,
+    Sale,
+    SaleItem,
+    Client,
+    ClientDeal,
+    DealInstallment,
+    Product,
+    ItemMake,
+)
+
+try:
+    from apps.warehouse.models import Document as WarehouseStockDocument
+except Exception:  # pragma: no cover - склад может быть отключён в тестах без миграций
+    WarehouseStockDocument = None
+
+try:
+    from apps.warehouse.models import MoneyDocument as WarehouseMoneyDocument, Counterparty as WarehouseCounterparty
+except Exception:  # pragma: no cover
+    WarehouseMoneyDocument = None
+    WarehouseCounterparty = None
+
+try:
+    from apps.building.models import BuildingDebtLedgerEntry
+except Exception:  # pragma: no cover - building может быть отключён в тестах без миграций
+    BuildingDebtLedgerEntry = None
+
+
+# ─────────────────────────────────────────────────────────────
+# typed zeros (важно: mixed types fix)
+# ─────────────────────────────────────────────────────────────
+MONEY_FIELD = DecimalField(max_digits=12, decimal_places=2)
+ZERO_MONEY = V(Decimal("0.00"), output_field=MONEY_FIELD)
+
+# quantity у SaleItem часто DecimalField → нужен Decimal-ноль
+QTY_FIELD = DecimalField(max_digits=14, decimal_places=3)
+ZERO_QTY = V(Decimal("0.000"), output_field=QTY_FIELD)
+
+
+# ─────────────────────────────────────────────────────────────
+# helpers
+# ─────────────────────────────────────────────────────────────
+def _trunc_by_group(field_name: str, group_by: str):
+    gb = (group_by or "day").strip().lower()
+    if gb == "week":
+        return TruncWeek(field_name)
+    if gb == "month":
+        return TruncMonth(field_name)
+    return TruncDate(field_name)
+
+
+def _dt_range(date_from: date, date_to: date):
+    """
+    (inclusive) date_from 00:00  -> (exclusive) (date_to+1) 00:00
+    """
+    tz = timezone.get_current_timezone()
+    dt_from = timezone.make_aware(datetime.combine(date_from, datetime.min.time()), tz)
+    dt_to_excl = timezone.make_aware(
+        datetime.combine(date_to + timedelta(days=1), datetime.min.time()),
+        tz,
+    )
+    return dt_from, dt_to_excl
+
+
+def _money_str(x) -> str:
+    if x is None:
+        return "0.00"
+    if isinstance(x, Decimal):
+        return str(x)
+    try:
+        return str(Decimal(str(x)))
+    except Exception:
+        return str(x)
+
+
+# ─────────────────────────────────────────────────────────────
+# main: owner overall analytics (FIXED)
+# ─────────────────────────────────────────────────────────────
+def build_owner_analytics_payload(*, company, branch, period, date_from, date_to, group_by="day"):
+    """
+    Общая аналитика владельца по компании.
+    Возвращает: period + summary + charts
+    """
+    dt_from, dt_to_excl = _dt_range(date_from, date_to)
+
+    # ======================================================
+    # Transfers (all)
+    # ======================================================
+    sub_qs = ManufactureSubreal.objects.filter(
+        company=company,
+        created_at__gte=dt_from,
+        created_at__lt=dt_to_excl,
+    )
+    if branch is not None:
+        sub_qs = sub_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию (без фильтра по branch)
+
+    transfers_count = sub_qs.count()
+    items_transferred = sub_qs.aggregate(
+        s=Coalesce(Sum("qty_transferred"), V(0))
+    )["s"] or 0
+
+    trunc_transfers = _trunc_by_group("created_at", group_by)
+    transfers_by_period_qs = (
+        sub_qs
+        .annotate(period=trunc_transfers)
+        .values("period")
+        .annotate(
+            transfers_count=Count("id"),
+            items_transferred=Coalesce(Sum("qty_transferred"), V(0)),
+        )
+        .order_by("period")
+    )
+    transfers_by_date = [
+        {
+            "date": row["period"],
+            "transfers_count": row["transfers_count"],
+            "items_transferred": row["items_transferred"],
+        }
+        for row in transfers_by_period_qs
+    ]
+
+    top_users_by_transfers_qs = (
+        sub_qs
+        .values("agent_id", "agent__first_name", "agent__last_name", "agent__role")
+        .annotate(
+            transfers_count=Count("id"),
+            items_transferred=Coalesce(Sum("qty_transferred"), V(0)),
+        )
+        .order_by("-items_transferred")[:10]
+    )
+    top_users_by_transfers = [
+        {
+            "user_id": str(r["agent_id"]),
+            "user_name": (
+                f"{(r['agent__first_name'] or '').strip()} {(r['agent__last_name'] or '').strip()}".strip()
+                or "Пользователь"
+            ),
+            "role": r.get("agent__role"),
+            "transfers_count": r["transfers_count"],
+            "items_transferred": r["items_transferred"],
+        }
+        for r in top_users_by_transfers_qs
+    ]
+
+    # ======================================================
+    # Acceptances (all)
+    # ======================================================
+    acc_qs = Acceptance.objects.filter(
+        company=company,
+        accepted_at__gte=dt_from,
+        accepted_at__lt=dt_to_excl,
+    )
+    if branch is not None:
+        acc_qs = acc_qs.filter(
+            Q(subreal__branch=branch) | Q(subreal__branch__isnull=True)
+        )
+    # branch is None → видим всю компанию
+
+    acceptances_count = acc_qs.count()
+
+    # ======================================================
+    # Defective items (возвраты от агентов, принятые)
+    # ======================================================
+    returns_qs = ReturnFromAgent.objects.filter(
+        company=company,
+        status=ReturnFromAgent.Status.ACCEPTED,
+        returned_at__gte=dt_from,
+        returned_at__lt=dt_to_excl,
+    )
+    if branch is not None:
+        returns_qs = returns_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
+
+    defective_items_qty = returns_qs.aggregate(s=Coalesce(Sum("qty"), V(0)))["s"] or 0
+
+    # Раздельный учёт: обычные возвраты (на склад) vs брак (списание).
+    # is_defect=False — качественный возврат; is_defect=True — брак.
+    regular_returns_qs = returns_qs.filter(is_defect=False)
+    defects_qs = returns_qs.filter(is_defect=True)
+
+    returns_agg = regular_returns_qs.aggregate(
+        qty=Coalesce(Sum("qty"), V(0)),
+        amount=Coalesce(Sum("amount"), ZERO_MONEY),
+    )
+    defects_agg = defects_qs.aggregate(
+        qty=Coalesce(Sum("qty"), V(0)),
+        amount=Coalesce(Sum("amount"), ZERO_MONEY),
+    )
+    returns_qty = returns_agg["qty"] or 0
+    returns_amount_dec = returns_agg["amount"] or Decimal("0.00")
+    defects_qty = defects_agg["qty"] or 0
+    defects_amount_dec = defects_agg["amount"] or Decimal("0.00")
+
+    # ======================================================
+    # Inventory (инвентаризация, подтверждённая за период)
+    # ======================================================
+    inventory_qs = Inventory.objects.filter(
+        company=company,
+        status=Inventory.Status.CONFIRMED,
+        created_at__gte=dt_from,
+        created_at__lt=dt_to_excl,
+    )
+    if branch is not None:
+        inventory_qs = inventory_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    inventory_agg = inventory_qs.aggregate(
+        surplus=Coalesce(Sum("surplus_qty"), ZERO_QTY),
+        shortage=Coalesce(Sum("shortage_qty"), ZERO_QTY),
+    )
+    inventory_surplus_qty = inventory_agg["surplus"] or Decimal("0.000")
+    inventory_shortage_qty = inventory_agg["shortage"] or Decimal("0.000")
+
+    def _returns_by_date(qs):
+        trunc = _trunc_by_group("returned_at", group_by)
+        rows = (
+            qs.annotate(period=trunc)
+            .values("period")
+            .annotate(
+                qty=Coalesce(Sum("qty"), V(0)),
+                amount=Coalesce(Sum("amount"), ZERO_MONEY),
+            )
+            .order_by("period")
+        )
+        return [
+            {
+                "date": r["period"],
+                "qty": r["qty"],
+                "amount": _money_str(r["amount"] or Decimal("0.00")),
+            }
+            for r in rows
+        ]
+
+    def _top_agents(qs):
+        rows = (
+            qs.values(
+                "returned_by_id",
+                "returned_by__first_name",
+                "returned_by__last_name",
+            )
+            .annotate(
+                qty=Coalesce(Sum("qty"), V(0)),
+                amount=Coalesce(Sum("amount"), ZERO_MONEY),
+            )
+            .order_by("-qty")[:10]
+        )
+        return [
+            {
+                "agent_id": str(r["returned_by_id"]) if r.get("returned_by_id") else None,
+                "agent_name": (
+                    f"{(r['returned_by__first_name'] or '').strip()} {(r['returned_by__last_name'] or '').strip()}".strip()
+                    or "Пользователь"
+                ),
+                "qty": r["qty"],
+                "amount": _money_str(r["amount"] or Decimal("0.00")),
+            }
+            for r in rows
+        ]
+
+    returns_by_date = _returns_by_date(regular_returns_qs)
+    defects_by_date = _returns_by_date(defects_qs)
+    top_agents_by_returns = _top_agents(regular_returns_qs)
+    top_agents_by_defects = _top_agents(defects_qs)
+
+    # ======================================================
+    # Sales (paid, all)
+    # ======================================================
+    sales_qs = Sale.objects.filter(
+        company=company,
+        status=Sale.Status.PAID,
+        created_at__gte=dt_from,
+        created_at__lt=dt_to_excl,
+    )
+    if branch is not None:
+        sales_qs = sales_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
+
+    sales_count = sales_qs.count()
+
+    # FIX: правильный Decimal-ноль с output_field
+    sales_amount_dec = sales_qs.aggregate(
+        s=Coalesce(Sum("total"), ZERO_MONEY)
+    )["s"] or Decimal("0.00")
+    discounts_total_dec = sales_qs.aggregate(
+        s=Coalesce(Sum("discount_total"), ZERO_MONEY)
+    )["s"] or Decimal("0.00")
+
+    items_qs = SaleItem.objects.filter(sale__in=sales_qs)
+
+    items_net_revenue = ExpressionWrapper(
+        (F("quantity") * F("unit_price")) - Coalesce(F("line_discount"), ZERO_MONEY),
+        output_field=MONEY_FIELD,
+    )
+
+    trunc_sales = _trunc_by_group("sale__created_at", group_by)
+    sales_by_period_qs = (
+        items_qs
+        .annotate(period=trunc_sales)
+        .values("period")
+        .annotate(
+            sales_count=Count("sale_id", distinct=True),
+
+            # FIX: quantity может быть DecimalField → Sum(quantity)=Decimal → нужен ZERO_QTY
+            items_sold=Coalesce(Sum("quantity", output_field=QTY_FIELD), ZERO_QTY),
+
+            # FIX: Coalesce для Decimal только с ZERO_MONEY
+            amount=Coalesce(
+                Sum(items_net_revenue, output_field=MONEY_FIELD),
+                ZERO_MONEY,
+            ),
+        )
+        .order_by("period")
+    )
+    sales_by_date = [
+        {
+            "date": row["period"],
+            "sales_count": row["sales_count"],
+            "sales_amount": _money_str(row["amount"] or Decimal("0.00")),
+        }
+        for row in sales_by_period_qs
+    ]
+
+    top_products_qs = (
+        items_qs
+        .values("product_id", "product__name")
+        .annotate(
+            # FIX: quantity → Decimal
+            qty=Coalesce(Sum("quantity", output_field=QTY_FIELD), ZERO_QTY),
+            amount=Coalesce(
+                Sum(items_net_revenue, output_field=MONEY_FIELD),
+                ZERO_MONEY,
+            ),
+        )
+        .order_by("-amount")[:10]
+    )
+    top_products_by_sales = [
+        {
+            "product_id": str(r["product_id"]),
+            "product_name": r["product__name"],
+            # qty может быть Decimal — не убивай точность принудительным int, если она нужна
+            # если точно нужна целая — оставь int(...)
+            "qty": float(r["qty"] or Decimal("0.000")),
+            "amount": _money_str(r["amount"] or Decimal("0.00")),
+        }
+        for r in top_products_qs
+    ]
+
+    top_users_by_sales_qs = (
+        sales_qs
+        .values("user_id", "user__first_name", "user__last_name", "user__role")
+        .annotate(
+            sales_count=Count("id"),
+            # FIX: Decimal-ноль
+            amount=Coalesce(Sum("total"), ZERO_MONEY),
+        )
+        .order_by("-amount")[:10]
+    )
+    top_users_by_sales = [
+        {
+            "user_id": str(r["user_id"]),
+            "user_name": (
+                f"{(r['user__first_name'] or '').strip()} {(r['user__last_name'] or '').strip()}".strip()
+                or "Пользователь"
+            ),
+            "role": r.get("user__role"),
+            "sales_count": r["sales_count"],
+            "sales_amount": _money_str(r["amount"] or Decimal("0.00")),
+        }
+        for r in top_users_by_sales_qs
+    ]
+
+    # distribution by products (percent)
+    sales_amount_float = float(sales_amount_dec) if sales_amount_dec else 0.0
+    sales_distribution_by_product = []
+    if sales_amount_float > 0:
+        for row in top_products_by_sales:
+            amt = float(Decimal(row["amount"]))
+            sales_distribution_by_product.append({
+                "product_id": row["product_id"],
+                "product_name": row["product_name"],
+                "amount": row["amount"],
+                "percent": round(amt * 100.0 / sales_amount_float, 2),
+            })
+
+    # Эффективная закупочная для COGS: снапшот строки, иначе текущая закупка товара (как при создании SaleItem)
+    _unit_purchase = Coalesce(
+        F("purchase_price_snapshot"),
+        F("product__purchase_price"),
+        V(Decimal("0"), output_field=MONEY_FIELD),
+    )
+
+    # ======================================================
+    # Gross profit (валовая прибыль): revenue − COGS; маржа % = прибыль / выручка × 100
+    # ======================================================
+    # Выручка должна учитывать скидки по строкам (line_discount), иначе валовая прибыль завышается.
+    revenue_expr = ExpressionWrapper(
+        (F("quantity") * F("unit_price")) - Coalesce(F("line_discount"), ZERO_MONEY),
+        output_field=MONEY_FIELD,
+    )
+    items_agg = items_qs.aggregate(
+        revenue=Coalesce(
+            Sum(revenue_expr, output_field=MONEY_FIELD),
+            ZERO_MONEY,
+        ),
+        cogs=Coalesce(
+            Sum(F("quantity") * _unit_purchase, output_field=MONEY_FIELD),
+            ZERO_MONEY,
+        ),
+    )
+    # Выручка = продажи (Sale.total), не сумма строк (чтобы соответствовать "просто продажи − закупка").
+    revenue_dec = sales_amount_dec or Decimal("0.00")
+    cogs_dec = items_agg["cogs"] or Decimal("0.00")
+    gross_profit_dec = revenue_dec - cogs_dec
+    gross_margin_pct = Decimal("0.00")
+    if revenue_dec and revenue_dec > 0:
+        gross_margin_pct = (gross_profit_dec / revenue_dec * Decimal("100")).quantize(Decimal("0.01"))
+
+    trunc_gp = _trunc_by_group("sale__created_at", group_by)
+    gross_profit_by_period_qs = (
+        items_qs.annotate(period=trunc_gp)
+        .values("period")
+        .annotate(
+            revenue_p=Coalesce(
+                Sum(revenue_expr, output_field=MONEY_FIELD),
+                ZERO_MONEY,
+            ),
+            cogs_p=Coalesce(
+                Sum(F("quantity") * _unit_purchase, output_field=MONEY_FIELD),
+                ZERO_MONEY,
+            ),
+        )
+        .order_by("period")
+    )
+    gross_profit_by_date = [
+        {
+            "date": row["period"],
+            "revenue": _money_str(row["revenue_p"] or Decimal("0.00")),
+            "cost_of_goods_sold": _money_str(row["cogs_p"] or Decimal("0.00")),
+            "gross_profit": _money_str(
+                (row["revenue_p"] or Decimal("0.00")) - (row["cogs_p"] or Decimal("0.00"))
+            ),
+        }
+        for row in gross_profit_by_period_qs
+    ]
+
+    # ======================================================
+    # Stock value (стоимость склада): sum(quantity * purchase_price)
+    # ======================================================
+    products_qs = Product.objects.filter(company=company).exclude(kind=Product.Kind.SERVICE)
+    if branch is not None:
+        # унифицировано с CompanyBranchRestrictedMixin: филиал + глобальные товары
+        products_qs = products_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
+    stock_value_dec = (
+        products_qs.aggregate(
+            v=Coalesce(
+                Sum(
+                    Coalesce(F("quantity"), V(Decimal("0"), output_field=QTY_FIELD))
+                    * F("purchase_price"),
+                    output_field=MONEY_FIELD,
+                ),
+                ZERO_MONEY,
+            )
+        )["v"]
+        or Decimal("0.00")
+    )
+
+    # Стоимость склада по розничной цене: sum(quantity * price)
+    stock_retail_value_dec = (
+        products_qs.aggregate(
+            v=Coalesce(
+                Sum(
+                    Coalesce(F("quantity"), V(Decimal("0"), output_field=QTY_FIELD))
+                    * F("price"),
+                    output_field=MONEY_FIELD,
+                ),
+                ZERO_MONEY,
+            )
+        )["v"]
+        or Decimal("0.00")
+    )
+
+    # Стоимость сырья: sum(quantity * price) по ItemMake
+    item_make_qs = ItemMake.objects.filter(company=company)
+    if branch is not None:
+        # унифицировано с CompanyBranchRestrictedMixin
+        item_make_qs = item_make_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
+
+    raw_material_value_dec = (
+        item_make_qs.aggregate(
+            v=Coalesce(
+                Sum(
+                    Coalesce(F("quantity"), V(Decimal("0"), output_field=QTY_FIELD))
+                    * F("price"),
+                    output_field=MONEY_FIELD,
+                ),
+                ZERO_MONEY,
+            )
+        )["v"]
+        or Decimal("0.00")
+    )
+
+    # ======================================================
+    # Total debt (общий долг по клиентам):
+    #   sum((deal.amount - deal.prepayment) - paid_per_deal_installment)
+    # ======================================================
+    deals_qs = ClientDeal.objects.filter(company=company, kind=ClientDeal.Kind.DEBT)
+    if branch is not None:
+        deals_qs = deals_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
+
+    paid_subq = (
+        DealInstallment.objects.filter(deal_id=OuterRef("pk"))
+        .values("deal_id")
+        .annotate(s=Sum("paid_amount"))
+        .values("s")[:1]
+    )
+
+    client_deals_receivable_dec = (
+        deals_qs.annotate(paid=Coalesce(Subquery(paid_subq), V(Decimal("0.00"), output_field=MONEY_FIELD)))
+        .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
+        .aggregate(t=Sum("remaining"))["t"]
+        or Decimal("0.00")
+    )
+
+    # Продажи POS/маркет «в долг» (клиент должен компании)
+    sales_debt_qs = Sale.objects.filter(company=company, status=Sale.Status.DEBT)
+    if branch is not None:
+        sales_debt_qs = sales_debt_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
+
+    # Важно: чтобы не было двойного учёта одной и той же задолженности,
+    # исключаем POS-долги по клиентам, у которых уже есть активная рассрочка (ClientDeal.Kind.DEBT) с остатком > 0.
+    # Иначе получается "остаток по сделке" + "весь чек в долг" (пример: 12 + 24 = 36).
+    deals_active_client_ids = list(
+        deals_qs.annotate(paid=Coalesce(Subquery(paid_subq), V(Decimal("0.00"), output_field=MONEY_FIELD)))
+        .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
+        .filter(remaining__gt=0)
+        .exclude(client_id__isnull=True)
+        .values_list("client_id", flat=True)
+        .distinct()
+    )
+    if deals_active_client_ids:
+        sales_debt_qs = sales_debt_qs.exclude(client_id__in=deals_active_client_ids)
+    pos_sales_receivable_dec = sales_debt_qs.aggregate(s=Coalesce(Sum("total"), ZERO_MONEY))["s"] or Decimal(
+        "0.00"
+    )
+
+    accounts_receivable_dec = client_deals_receivable_dec + pos_sales_receivable_dec
+
+    # Кредиторская задолженность:
+    # - поставщики (склад): считаем сальдо по контрагентам как в сверке склада
+    #   company_owes_counterparty = max( -( (doc_debit + money_expense) - (doc_credit + money_receipt) ), 0 )
+    # - долги поставщикам из строительного реестра (building debt ledger)
+    accounts_payable_dec = Decimal("0.00")
+    if WarehouseStockDocument is not None and WarehouseMoneyDocument is not None and WarehouseCounterparty is not None:
+        # контрагенты-поставщики компании
+        cp_qs = WarehouseCounterparty.objects.filter(company=company).filter(
+            Q(type=WarehouseCounterparty.Type.SUPPLIER) | Q(type=WarehouseCounterparty.Type.BOTH)
+        )
+        if branch is not None:
+            cp_qs = cp_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        # branch is None → видим всю компанию
+
+        # товарные документы (проведённые) с контрагентом
+        trade_doc_types = (
+            WarehouseStockDocument.DocType.SALE,
+            WarehouseStockDocument.DocType.PURCHASE,
+            WarehouseStockDocument.DocType.SALE_RETURN,
+            WarehouseStockDocument.DocType.PURCHASE_RETURN,
+        )
+        doc_debit_types = (WarehouseStockDocument.DocType.SALE, WarehouseStockDocument.DocType.PURCHASE_RETURN)
+        doc_credit_types = (WarehouseStockDocument.DocType.PURCHASE, WarehouseStockDocument.DocType.SALE_RETURN)
+
+        docs_qs = WarehouseStockDocument.objects.filter(
+            status=WarehouseStockDocument.Status.POSTED,
+            doc_type__in=trade_doc_types,
+            counterparty__in=cp_qs,
+            warehouse_from__company=company,
+        )
+        if branch is not None:
+            docs_qs = docs_qs.filter(
+                Q(warehouse_from__branch=branch)
+                | Q(warehouse_from__branch__isnull=True)
+            )
+        # branch is None → видим всю компанию
+
+        docs_agg = docs_qs.aggregate(
+            doc_debit=Coalesce(Sum("total", filter=Q(doc_type__in=doc_debit_types)), ZERO_MONEY),
+            doc_credit=Coalesce(Sum("total", filter=Q(doc_type__in=doc_credit_types)), ZERO_MONEY),
+        )
+        doc_debit = docs_agg["doc_debit"] or Decimal("0.00")
+        doc_credit = docs_agg["doc_credit"] or Decimal("0.00")
+
+        money_qs = WarehouseMoneyDocument.objects.filter(
+            company=company,
+            status=WarehouseMoneyDocument.Status.POSTED,
+            counterparty__in=cp_qs,
+            doc_type__in=(
+                WarehouseMoneyDocument.DocType.MONEY_RECEIPT,
+                WarehouseMoneyDocument.DocType.MONEY_EXPENSE,
+            ),
+        )
+        if branch is not None:
+            money_qs = money_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+        # branch is None → видим всю компанию
+
+        money_agg = money_qs.aggregate(
+            m_rec=Coalesce(Sum("amount", filter=Q(doc_type=WarehouseMoneyDocument.DocType.MONEY_RECEIPT)), ZERO_MONEY),
+            m_paid=Coalesce(Sum("amount", filter=Q(doc_type=WarehouseMoneyDocument.DocType.MONEY_EXPENSE)), ZERO_MONEY),
+        )
+        m_rec = money_agg["m_rec"] or Decimal("0.00")
+        m_paid = money_agg["m_paid"] or Decimal("0.00")
+
+        # balance > 0: контрагент должен компании; balance < 0: компания должна контрагенту
+        balance = (doc_debit + m_paid) - (doc_credit + m_rec)
+        accounts_payable_dec = (-balance) if balance < 0 else Decimal("0.00")
+        if accounts_payable_dec < 0:
+            accounts_payable_dec = Decimal("0.00")
+
+    # Кредиторка по CRM-поставщикам (Client.type=SUPPLIERS):
+    # считаем остаток по сделкам в долг (ClientDeal.Kind.DEBT) как обязательство компании.
+    supplier_deals_qs = ClientDeal.objects.filter(
+        company=company,
+        kind=ClientDeal.Kind.DEBT,
+        client__type=Client.StatusClient.SUPPLIERS,
+    )
+    if branch is not None:
+        supplier_deals_qs = supplier_deals_qs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
+
+    supplier_paid_subq = (
+        DealInstallment.objects.filter(deal_id=OuterRef("pk"))
+        .values("deal_id")
+        .annotate(s=Sum("paid_amount"))
+        .values("s")[:1]
+    )
+    supplier_payable_dec = (
+        supplier_deals_qs
+        .annotate(paid=Coalesce(Subquery(supplier_paid_subq), V(Decimal("0.00"), output_field=MONEY_FIELD)))
+        .annotate(remaining=(F("amount") - F("prepayment")) - F("paid"))
+        .aggregate(t=Coalesce(Sum("remaining"), ZERO_MONEY))["t"]
+        or Decimal("0.00")
+    )
+    if supplier_payable_dec and supplier_payable_dec > 0:
+        accounts_payable_dec += supplier_payable_dec
+
+    if BuildingDebtLedgerEntry is not None:
+        building_agg = BuildingDebtLedgerEntry.objects.filter(
+            company=company,
+            status=BuildingDebtLedgerEntry.Status.APPROVED,
+            direction=BuildingDebtLedgerEntry.Direction.PAYABLE,
+            counterparty_type=BuildingDebtLedgerEntry.CounterpartyType.SUPPLIER,
+        ).aggregate(
+            charges=Coalesce(
+                Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.CHARGE)),
+                ZERO_MONEY,
+            ),
+            payments=Coalesce(
+                Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.PAYMENT)),
+                ZERO_MONEY,
+            ),
+            barter=Coalesce(
+                Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.BARTER)),
+                ZERO_MONEY,
+            ),
+            writeoff=Coalesce(
+                Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.WRITEOFF)),
+                ZERO_MONEY,
+            ),
+            adjustments=Coalesce(
+                Sum("amount", filter=Q(entry_type=BuildingDebtLedgerEntry.EntryType.ADJUSTMENT)),
+                ZERO_MONEY,
+            ),
+        )
+        building_accounts_payable_dec = (
+            (building_agg["charges"] or Decimal("0.00"))
+            - (building_agg["payments"] or Decimal("0.00"))
+            - (building_agg["barter"] or Decimal("0.00"))
+            - (building_agg["writeoff"] or Decimal("0.00"))
+            + (building_agg["adjustments"] or Decimal("0.00"))
+        )
+        if building_accounts_payable_dec > 0:
+            accounts_payable_dec += building_accounts_payable_dec
+
+    # ======================================================
+    # Expense breakdown (статья расходов): CashFlow by name
+    # ======================================================
+    cfqs = CashFlow.objects.filter(
+        company=company,
+        type=CashFlow.Type.EXPENSE,
+        status=CashFlow.Status.APPROVED,
+        created_at__gte=dt_from,
+        created_at__lt=dt_to_excl,
+    )
+    if branch is not None:
+        cfqs = cfqs.filter(Q(branch=branch) | Q(branch__isnull=True))
+    # branch is None → видим всю компанию
+    expense_breakdown_qs = (
+        cfqs.values("name")
+        .annotate(
+            total=Coalesce(Sum("amount"), ZERO_MONEY),
+            count=Count("id"),
+        )
+        .order_by("-total")
+    )
+    expense_breakdown = [
+        {
+            "name": r["name"] or "Без названия",
+            "total": _money_str(r["total"]),
+            "count": r["count"],
+        }
+        for r in expense_breakdown_qs
+    ]
+
+    # ======================================================
+    # Прочие расходы и чистая прибыль: gross_profit − расходы кассы за период.
+    # Закупки не вычитаются повторно: в производстве они не проводятся через кассу
+    # (SupplierReceipt / Acceptance не создают CashFlow), поэтому в COGS и в cfqs
+    # не может попасть одна и та же сумма.
+    # ======================================================
+    other_expenses_dec = cfqs.aggregate(
+        s=Coalesce(Sum("amount"), ZERO_MONEY)
+    )["s"] or Decimal("0.00")
+    net_profit_dec = gross_profit_dec - other_expenses_dec
+    net_margin_pct = Decimal("0.00")
+    if revenue_dec and revenue_dec > 0:
+        net_margin_pct = (net_profit_dec / revenue_dec * Decimal("100")).quantize(Decimal("0.01"))
+
+    users_count = User.objects.filter(company=company).count()
+
+    # summary — ключи для карточек дашборда (подписи UI):
+    # users_count — пользователи компании; transfers_count / items_transferred — перемещения за период;
+    # acceptances_count — приёмки; defective_items — брак (возвраты агента, принятые); sales_count / sales_amount / discounts_total — продажи;
+    # revenue, cost_of_goods_sold, gross_profit, gross_margin_percent — выручка по строкам чека − COGS, маржа %;
+    # other_expenses_total — расходы кассы (approved) за период; net_profit / net_margin_percent — валовая − эти расходы;
+    # stock_value (=stock_purchase_value), stock_retail_value — Σ(quantity×цена) по Product (без kind=service);
+    # raw_material_value — Σ(quantity×price) по ItemMake; accounts_receivable (+ разбивка *_client_deals / *_pos_sales);
+    # accounts_payable — кредиторская (склад + building); total_debt — остаток рассрочки ClientDeal(kind=debt).
+    return {
+        "period": {
+            "type": period,
+            "date_from": date_from,
+            "date_to": date_to,
+            "group_by": group_by,
+        },
+        "summary": {
+            "users_count": users_count,
+            "transfers_count": transfers_count,
+            "acceptances_count": acceptances_count,
+            "items_transferred": items_transferred,
+            "defective_items": defective_items_qty,
+            # Раздельно: возвраты (на склад) и брак (списание), только accepted.
+            "returns_qty": returns_qty,
+            "returns_amount": _money_str(returns_amount_dec),
+            "defects_qty": defects_qty,
+            "defects_amount": _money_str(defects_amount_dec),
+            # Инвентаризация: излишки / недостачи за период (подтверждённые)
+            "inventory_surplus_qty": float(inventory_surplus_qty),
+            "inventory_shortage_qty": float(inventory_shortage_qty),
+            "sales_count": sales_count,
+            "sales_amount": _money_str(sales_amount_dec),
+            "discounts_total": _money_str(discounts_total_dec),
+            # Валовая прибыль (оплаченные продажи за период): выручка − себестоимость
+            "revenue": _money_str(revenue_dec),
+            "cost_of_goods_sold": _money_str(cogs_dec),
+            "gross_profit": _money_str(gross_profit_dec),
+            "gross_margin_percent": _money_str(gross_margin_pct),
+            # Чистая прибыль: валовая − прочие расходы кассы (аренда, ЗП, транспорт и т.п.)
+            "other_expenses_total": _money_str(other_expenses_dec),
+            "net_profit": _money_str(net_profit_dec),
+            "net_margin_percent": _money_str(net_margin_pct),
+            # склад
+            "stock_value": _money_str(stock_value_dec),  # закупочная стоимость остатков
+            "stock_purchase_value": _money_str(stock_value_dec),  # alias для новой карточки
+            "stock_retail_value": _money_str(stock_retail_value_dec),
+            # сырьё
+            "raw_material_value": _money_str(raw_material_value_dec),
+            # Дебиторская: долги клиентов (CRM-сделки + продажи «в долг»)
+            "accounts_receivable": _money_str(accounts_receivable_dec),
+            "accounts_receivable_client_deals": _money_str(client_deals_receivable_dec),
+            "accounts_receivable_pos_sales": _money_str(pos_sales_receivable_dec),
+            # Кредиторская: долг перед поставщиками по закупкам в кредит (склад)
+            "accounts_payable": _money_str(accounts_payable_dec),
+            # Совместимость: раньше только остаток по рассрочке ClientDeal
+            "total_debt": _money_str(client_deals_receivable_dec),
+        },
+        "charts": {
+            "sales_by_date": sales_by_date,
+            "gross_profit_by_date": gross_profit_by_date,
+            "transfers_by_date": transfers_by_date,
+            # Динамика и срезы по агентам для возвратов/брака (раздельно).
+            "returns_by_date": returns_by_date,
+            "defects_by_date": defects_by_date,
+            "top_agents_by_returns": top_agents_by_returns,
+            "top_agents_by_defects": top_agents_by_defects,
+            "top_products_by_sales": top_products_by_sales,
+            "top_users_by_sales": top_users_by_sales,
+            "top_users_by_transfers": top_users_by_transfers,
+            "sales_distribution_by_product": sales_distribution_by_product,
+            "expense_breakdown": expense_breakdown,
+        },
+    }

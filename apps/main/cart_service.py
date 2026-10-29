@@ -188,8 +188,9 @@ def add_item_to_cart(
             item.unit_price = base_price
             update_f.append("unit_price")
         if discount_total is not None:
-            item.line_discount = (Decimal(str(getattr(item, "line_discount", 0) or 0)) + line_disc)
-            update_f.append("line_discount")
+            item.manual_discount = item.manual_discount_base() + line_disc
+            item.line_discount = item.manual_discount
+            update_f += ["line_discount", "manual_discount"]
         item.save(update_fields=update_f)
     else:
         item = CartItem.objects.create(
@@ -200,6 +201,7 @@ def add_item_to_cart(
             quantity=quantity,
             unit_price=base_price,
             line_discount=line_disc,
+            manual_discount=line_disc,
         )
 
     cart.recalc()

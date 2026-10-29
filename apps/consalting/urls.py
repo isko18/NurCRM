@@ -1,4 +1,5 @@
 from django.urls import path
+from .greenapi_views import GreenApiWebhookConsaltingView
 from .views import (
     ServicesConsaltingListCreateView,
     ServicesConsaltingRetrieveUpdateDestroyView,
@@ -9,10 +10,13 @@ from .views import (
     ConsaltingMessengerAnalyticsView,
     ConsaltingSourceAnalyticsView,
     ConsaltingManagerAnalyticsView,
+    ConsaltingDebtsAnalyticsView,
     SalaryConsaltingListCreateView,
     SalaryConsaltingRetrieveUpdateDestroyView,
     RequestsConsaltingListCreateView,
     RequestsConsaltingRetrieveUpdateDestroyView,
+    RequestsConsaltingAcceptView,
+    RequestsConsaltingDeclineView,
     BookingConsaltingListCreateView,
     BookingConsaltingRetrieveUpdateDestroyView,
     ClientConsaltingListCreateView,
@@ -28,11 +32,15 @@ from .views import (
     FunnelStageReorderView,
     FunnelUserPreferenceView,
     LeadConsaltingListCreateView,
+    LeadConsaltingCountersView,
+    LeadConsaltingAnalyticsView,
     LeadConsaltingRetrieveUpdateDestroyView,
     LeadMoveStageView,
     LeadClaimView,
     LeadReleaseView,
     LeadAssignView,
+    LeadDeferView,
+    LeadResumeView,
     LeadTransferOwnerView,
     LeadMarkMessagesReadView,
     LeadTransferView,
@@ -82,6 +90,9 @@ from .views import (
     LeadDistributionSettingsView,
     WhatsAppInboundWebhookView,
     SubscriptionPaymentPayView,
+    SubscriptionPayPeriodsView,
+    SubscriptionExtendView,
+    SubscriptionAmountUpdateView,
     ClientSubscriptionsListView,
     SubscriptionMatrixView,
     EmployeeStatsView,
@@ -104,6 +115,19 @@ from .views import (
     CashRequestRejectView,
     CashOperationsListView,
     CashConfirmationSettingsView,
+    RegionalFunnelRoutingView,
+    RegionalFunnelRegionsListView,
+    RegionalFunnelRedistributeView,
+    ClientTenantAccountView,
+    ClientProvisionTenantView,
+    ClientLinkTenantView,
+    TenantAccountLookupView,
+    ConsultingCashboxListCreateView,
+    ConsultingCashboxDetailView,
+    ClientLookupView,
+    LeadAdSpendListCreateView,
+    LeadAdSpendDetailView,
+    LeadAdSpendBulkView,
 )
 from .wazzup_views import (
     WazzupAccountConsaltingViewSet,
@@ -118,7 +142,9 @@ urlpatterns = [
     # ===== Клиенты & Абонентская матрица =====
     path('subscription-matrix/', SubscriptionMatrixView.as_view(), name='subscription-matrix'),
     path('clients/subscription-matrix/', SubscriptionMatrixView.as_view(), name='clients-subscription-matrix'),
+    path('clients/lookup/', ClientLookupView.as_view(), name='consalting-clients-lookup'),
     # ===== Входящие лиды и авто-распределение =====
+    path('regions/', RegionalFunnelRegionsListView.as_view(), name='consalting-regions'),
     path('inbound-leads/', InboundLeadListCreateView.as_view(), name='inbound-leads-list-create'),
     path('inbound-leads/counters/', InboundLeadCountersView.as_view(), name='inbound-leads-counters'),
     path('inbound-leads/analytics/', InboundLeadAnalyticsView.as_view(), name='inbound-leads-analytics'),
@@ -129,6 +155,8 @@ urlpatterns = [
     path('inbound-leads/<uuid:pk>/won/', InboundLeadWonView.as_view(), name='inbound-leads-won'),
     path('inbound-leads/<uuid:pk>/lost/', InboundLeadLostView.as_view(), name='inbound-leads-lost'),
     path('lead-distribution/', LeadDistributionSettingsView.as_view(), name='lead-distribution'),
+    path('regional-funnel-routing/', RegionalFunnelRoutingView.as_view(), name='regional-funnel-routing'),
+    path('regional-funnel-routing/redistribute/', RegionalFunnelRedistributeView.as_view(), name='regional-funnel-routing-redistribute'),
     path('integrations/whatsapp/webhook/', WhatsAppInboundWebhookView.as_view(), name='whatsapp-inbound-webhook'),
 
     # ===== Зарплатная система =====
@@ -156,6 +184,7 @@ urlpatterns = [
     path('analytics/messenger/', ConsaltingMessengerAnalyticsView.as_view(), name='consalting-analytics-messenger'),
     path('analytics/sources/', ConsaltingSourceAnalyticsView.as_view(), name='consalting-analytics-sources'),
     path('analytics/managers/', ConsaltingManagerAnalyticsView.as_view(), name='consalting-analytics-managers'),
+    path('analytics/debts/', ConsaltingDebtsAnalyticsView.as_view(), name='consalting-analytics-debts'),
     path('sales/', SaleConsaltingListCreateView.as_view(), name='sales-list-create'),
     path('sales/analytics/', SaleConsaltingAnalyticsView.as_view(), name='sales-analytics'),
     path('sales/<uuid:pk>/', SaleConsaltingRetrieveUpdateDestroyView.as_view(), name='sales-rud'),
@@ -165,6 +194,8 @@ urlpatterns = [
 
     path('requests/', RequestsConsaltingListCreateView.as_view(), name='requests-list-create'),
     path('requests/<uuid:pk>/', RequestsConsaltingRetrieveUpdateDestroyView.as_view(), name='requests-rud'),
+    path('requests/<uuid:pk>/accept/', RequestsConsaltingAcceptView.as_view(), name='requests-accept'),
+    path('requests/<uuid:pk>/decline/', RequestsConsaltingDeclineView.as_view(), name='requests-decline'),
 
     path('bookings/', BookingConsaltingListCreateView.as_view(), name='bookings-list-create'),
     path('bookings/<uuid:pk>/', BookingConsaltingRetrieveUpdateDestroyView.as_view(), name='bookings-detail'),
@@ -172,6 +203,10 @@ urlpatterns = [
     # ===== Клиенты =====
     path('clients/', ClientConsaltingListCreateView.as_view(), name='clients-list-create'),
     path('clients/<uuid:pk>/', ClientConsaltingRetrieveUpdateDestroyView.as_view(), name='clients-rud'),
+    path('clients/<uuid:pk>/tenant-account/', ClientTenantAccountView.as_view(), name='client-tenant-account'),
+    path('clients/<uuid:pk>/provision-tenant/', ClientProvisionTenantView.as_view(), name='client-provision-tenant'),
+    path('clients/<uuid:pk>/link-tenant/', ClientLinkTenantView.as_view(), name='client-link-tenant'),
+    path('tenant-accounts/lookup/', TenantAccountLookupView.as_view(), name='tenant-account-lookup'),
 
     # ===== Воронка продаж =====
     path('funnels/', FunnelConsaltingListCreateView.as_view(), name='funnels-list-create'),
@@ -192,12 +227,16 @@ urlpatterns = [
 
     # ===== Лиды (карточки) =====
     path('leads/', LeadConsaltingListCreateView.as_view(), name='leads-list-create'),
+    path('leads/counters/', LeadConsaltingCountersView.as_view(), name='leads-counters'),
+    path('leads/analytics/', LeadConsaltingAnalyticsView.as_view(), name='leads-analytics'),
     path('leads/archived/', LeadArchivedListView.as_view(), name='leads-archived'),
     path('leads/<uuid:pk>/', LeadConsaltingRetrieveUpdateDestroyView.as_view(), name='leads-rud'),
     path('leads/<uuid:pk>/move-stage/', LeadMoveStageView.as_view(), name='leads-move-stage'),
     path('leads/<uuid:pk>/claim/', LeadClaimView.as_view(), name='leads-claim'),
     path('leads/<uuid:pk>/release/', LeadReleaseView.as_view(), name='leads-release'),
     path('leads/<uuid:pk>/assign/', LeadAssignView.as_view(), name='leads-assign'),
+    path('leads/<uuid:pk>/defer/', LeadDeferView.as_view(), name='leads-defer'),
+    path('leads/<uuid:pk>/resume/', LeadResumeView.as_view(), name='leads-resume'),
     path('leads/<uuid:pk>/transfer-owner/', LeadTransferOwnerView.as_view(), name='leads-transfer-owner'),
     path('leads/<uuid:pk>/mark-read/', LeadMarkMessagesReadView.as_view(), name='leads-mark-read'),
     path('leads/<uuid:pk>/transfer/', LeadTransferView.as_view(), name='leads-transfer'),
@@ -223,11 +262,11 @@ urlpatterns = [
 
     # ===== WhatsApp / Wazzup Сообщения (Устранение 404) =====
     path('wazzup-messages/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'list'}), name='wazzup-consalting-messages-list'),
-    path('wazzup-messages/<uuid:pk>/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'retrieve'}), name='wazzup-consalting-messages-detail'),
+    path('wazzup-messages/<str:pk>/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update', 'put': 'update', 'delete': 'destroy'}), name='wazzup-consalting-messages-detail'),
     path('whatsapp-messages/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'list'}), name='whatsapp-consalting-messages-list'),
-    path('whatsapp-messages/<uuid:pk>/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'retrieve'}), name='whatsapp-consalting-messages-detail'),
+    path('whatsapp-messages/<str:pk>/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update', 'put': 'update', 'delete': 'destroy'}), name='whatsapp-consalting-messages-detail'),
     path('messages/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'list'}), name='messages-consalting-list'),
-    path('messages/<uuid:pk>/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'retrieve'}), name='messages-consalting-detail'),
+    path('messages/<str:pk>/', WhatsAppMessageConsaltingViewSet.as_view({'get': 'retrieve', 'patch': 'partial_update', 'put': 'update', 'delete': 'destroy'}), name='messages-consalting-detail'),
 
     path('chats/', WazzupChatListView.as_view(), name='wazzup-chats-list'),
     path('wazzup-chats/', WazzupChatListView.as_view(), name='wazzup-chats-list-alias'),
@@ -241,13 +280,17 @@ urlpatterns = [
     path('wazzup/credentials/', WazzupCredentialsView.as_view(), name='wazzup-credentials'),
     path('wazzup-credentials/', WazzupCredentialsView.as_view(), name='wazzup-credentials-alias'),
     path('wazzup/webhook/', WazzupWebhookConsaltingView.as_view(), name='wazzup-consalting-webhook'),
+    path('greenapi/webhook/', GreenApiWebhookConsaltingView.as_view(), name='greenapi-consalting-webhook'),
     path('wazzup/upload/', WazzupAccountConsaltingViewSet.as_view({'post': 'upload_media_list'}), name='wazzup-upload-alias'),
     path('wazzup-accounts/upload/', WazzupAccountConsaltingViewSet.as_view({'post': 'upload_media_list'}), name='wazzup-consalting-account-upload-list'),
     path('wazzup-accounts/', WazzupAccountConsaltingViewSet.as_view({'get': 'list', 'post': 'create'}), name='wazzup-consalting-accounts'),
     path('wazzup-accounts/<uuid:pk>/', WazzupAccountConsaltingViewSet.as_view({'get': 'retrieve', 'put': 'update', 'delete': 'destroy'}), name='wazzup-consalting-account-detail'),
     path('wazzup-accounts/<uuid:pk>/setup-webhook/', WazzupAccountConsaltingViewSet.as_view({'post': 'setup_webhook'}), name='wazzup-consalting-account-setup-webhook'),
-    # ===== Абонентская плата и матрица (§5.4, §5.5) =====
+    # ===== Абонентская плата и матрица (§5.4, §5.4a, §5.5) =====
     path('subscription-payments/<uuid:pk>/pay/', SubscriptionPaymentPayView.as_view(), name='subscription-payment-pay'),
+    path('subscriptions/<uuid:pk>/pay-periods/', SubscriptionPayPeriodsView.as_view(), name='subscription-pay-periods'),
+    path('subscriptions/<uuid:pk>/extend/', SubscriptionExtendView.as_view(), name='subscription-extend'),
+    path('subscriptions/<uuid:pk>/', SubscriptionAmountUpdateView.as_view(), name='subscription-amount-update'),
     path('clients/<uuid:client_id>/subscriptions/', ClientSubscriptionsListView.as_view(), name='client-subscriptions'),
     path('subscription-matrix/', SubscriptionMatrixView.as_view(), name='subscription-matrix'),
     path('clients/subscription-matrix/', SubscriptionMatrixView.as_view(), name='subscription-matrix-alias'),
@@ -273,12 +316,17 @@ urlpatterns = [
     path('sales/cancellations/', SaleCancellationsReportView.as_view(), name='sales-cancellations-report'),
 
     # ===== Подтверждение поступлений в кассе (§9.4) =====
+    path('cashbox/cashboxes/', ConsultingCashboxListCreateView.as_view(), name='cashbox-cashboxes-list-create'),
+    path('cashbox/cashboxes/<uuid:pk>/', ConsultingCashboxDetailView.as_view(), name='cashbox-cashboxes-detail'),
     path('cashbox/requests/', CashRequestsListView.as_view(), name='cashbox-requests'),
     path('cashbox/requests/counters/', CashRequestsCountersView.as_view(), name='cashbox-requests-counters'),
     path('cashbox/requests/<uuid:pk>/confirm/', CashRequestConfirmView.as_view(), name='cashbox-request-confirm'),
     path('cashbox/requests/<uuid:pk>/reject/', CashRequestRejectView.as_view(), name='cashbox-request-reject'),
     path('cashbox/operations/', CashOperationsListView.as_view(), name='cashbox-operations'),
     path('cashbox/confirmation-settings/', CashConfirmationSettingsView.as_view(), name='cashbox-confirmation-settings'),
+
+    # ===== Финансы лидов: рекламный отчёт (§8) =====
+    path('lead-ad-spend/', LeadAdSpendListCreateView.as_view(), name='lead-ad-spend-list-create'),
+    path('lead-ad-spend/bulk/', LeadAdSpendBulkView.as_view(), name='lead-ad-spend-bulk'),
+    path('lead-ad-spend/<uuid:pk>/', LeadAdSpendDetailView.as_view(), name='lead-ad-spend-detail'),
 ]
-
-

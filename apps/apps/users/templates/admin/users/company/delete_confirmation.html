@@ -1,0 +1,42 @@
+{% extends "admin/base_site.html" %}
+{% load i18n admin_urls static %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+<a href="{% url 'admin:index' %}">{% translate 'Home' %}</a>
+&rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+&rsaquo; <a href="{% url 'admin:users_company_changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+&rsaquo; <a href="{% url 'admin:users_company_change' object.pk %}">{{ object }}</a>
+&rsaquo; Подтверждение удаления
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main" style="max-width: 800px; margin: 20px 0;">
+    <h1 style="color: #2c3e50; font-size: 24px; margin-bottom: 20px;">Вы уверены, что хотите удалить компанию "{{ object.name }}"?</h1>
+    
+    <div style="background-color: #fdf2e9; border-left: 4px solid #e67e22; padding: 15px; margin-bottom: 25px; border-radius: 4px;">
+        <p style="color: #d35400; font-weight: bold; margin: 0 0 10px 0; font-size: 15px;">
+            ⚠️ ВНИМАНИЕ: Каскадное удаление данных компании
+        </p>
+        <p style="color: #555; margin: 0; font-size: 13px; line-height: 1.5;">
+            При подтверждении из системы будут навсегда удалены ВСЕ данные этой компании:
+        </p>
+        <ul style="margin: 8px 0 0 20px; color: #555; font-size: 13px; line-height: 1.5;">
+            <li>Склады, остатки товаров и история их движений</li>
+            <li>Все документы, чеки, продажи, покупки и списания</li>
+            <li>Кассы, статьи расходов/доходов и контрагенты</li>
+            <li>Все связанные филиалы и учетные записи сотрудников компании</li>
+            <li>Данные смежных сервисов (Кафе, Барбершоп, Строительство)</li>
+        </ul>
+    </div>
+
+    <form method="post">
+        {% csrf_token %}
+        <div class="submit-row" style="display: flex; gap: 15px; align-items: center; background: none; border: none; padding: 0;">
+            <input type="submit" value="Да, я уверен (Подтвердить удаление)" class="default" style="background: #e74c3c; color: white; border: none; padding: 12px 24px; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: bold;">
+            <a href="{% url 'admin:users_company_changelist' %}" class="button cancel-link" style="background: #7f8c8d; color: white; text-decoration: none; padding: 12px 24px; border-radius: 4px; display: inline-block; font-size: 14px;">Отменить</a>
+        </div>
+    </form>
+</div>
+{% endblock %}

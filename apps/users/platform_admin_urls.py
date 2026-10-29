@@ -1,4 +1,5 @@
 from django.urls import path
+from apps.clientapp.staff_views import PlatformClientAppShopHideAPIView, PlatformClientAppWeeklyReportAPIView
 from .platform_admin_views import (
     PlatformAdminMetaAPIView,
     PlatformAdminCompanyListAPIView,
@@ -12,6 +13,8 @@ from .platform_admin_views import (
 
 urlpatterns = [
     path('meta/', PlatformAdminMetaAPIView.as_view(), name='platform-admin-meta'),
+    path('client-app/weekly-report/', PlatformClientAppWeeklyReportAPIView.as_view(), name='platform-admin-client-app-report'),
+    path('client-app/shops/<str:company_id>/', PlatformClientAppShopHideAPIView.as_view(), name='platform-admin-client-app-shop'),
     path('companies/', PlatformAdminCompanyListAPIView.as_view(), name='platform-admin-companies-list'),
     path('companies/<str:pk>/subscription/', PlatformAdminCompanySubscriptionAPIView.as_view(), name='platform-admin-companies-subscription'),
     path('companies/<str:company_id>/users/', PlatformAdminCompanyUserListCreateAPIView.as_view(), name='platform-admin-companies-users'),

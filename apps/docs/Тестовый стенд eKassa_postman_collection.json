@@ -1,0 +1,818 @@
+{
+	"info": {
+		"_postman_id": "ca148fde-c539-4259-a4f3-b758b7ba3a49",
+		"name": "Тестовый стенд eKassa 1.11",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "9905808"
+	},
+	"item": [
+		{
+			"name": "Login",
+			"protocolProfileBehavior": {
+				"disabledSystemHeaders": {
+					"accept": true,
+					"content-type": true
+				}
+			},
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					},
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n\"email\": \"Тут пишете логин\",\r\n\"password\": \"тут пишете пароль\"\r\n}\r\n",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/auth/login",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"auth",
+						"login"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Logout",
+			"protocolProfileBehavior": {
+				"disableBodyPruning": true
+			},
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/logout",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"logout"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Get pos by fiscal number",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n\"fiscal_number\": \"{{fiscal_number}}\",\r\n\"html\": \"true\",\r\n\"css\": \"true\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/get_pos_by_fiscal_number",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"get_pos_by_fiscal_number"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Get base catalogue",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n\"fiscal_number\": \"{{fiscal_number}}\",\r\n\"html\": \"true\",\r\n\"css\": \"true\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/get_base_catalogue_by_fiscal_number",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"get_base_catalogue_by_fiscal_number"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Shift state",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n\"fiscal_number\": \"{{fiscal_number}}\",\r\n\"html\": \"true\",\r\n\"css\": \"true\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/shift_state_by_fiscal_number",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"shift_state_by_fiscal_number"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Shift open",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n\"fiscal_number\": \"{{fiscal_number}}\",\r\n\"html\": \"true\",\r\n\"css\": \"true\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/shift_open_by_fiscal_number",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"shift_open_by_fiscal_number"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Shift close",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n\"fiscal_number\": \"{{fiscal_number}}\",\r\n\"html\": \"true\",\r\n\"css\": \"true\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/shift_close_by_fiscal_number",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"shift_close_by_fiscal_number"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Shift контрольная лента",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n\"fiscal_number\": \"{{fiscal_number}}\",\r\n\"shift_number\": 2,\r\n\"html\": \"true\",\r\n\"css\": \"true\"\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/shift_control_by_fiscal_number",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"shift_control_by_fiscal_number"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Cash operation",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n\"fiscal_number\": \"{{fiscal_number}}\",\r\n\"html\": \"true\",\r\n\"css\": \"false\",\r\n\"operation_type\": 5,\r\n\"amount\": 10000\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/cash_operation_by_fiscal_number",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"cash_operation_by_fiscal_number"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Receipt",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n    \"fiscal_number\": \"{{fiscal_number}}\",\r\n    \"txt\": true,\r\n    \"cash\": true,\r\n    \"operation\": \"INCOME\",\r\n    \"customerContact\":\"dalmacom@gmail.com\",\r\n    \"received\" : 1500,\r\n        \"goods\": [ \r\n            {\r\n                \"calcItemAttributeCode\": 1,\r\n                \"name\": \"Товар\",\r\n                \"sgtin\": \"778\",\r\n                \"price\": 1000,\r\n                \"quantity\": 1,\r\n                \"unit\": \"шт.\",\r\n                \"st\": 0,\r\n                \"vat\": 0\r\n            }\r\n\r\n        ] \r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/v2/receipt",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"v2",
+						"receipt"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Receipt resend",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n    \"fiscal_number\": \"{{fiscal_number}}\",\r\n    \"id\": \"98c14b52-92b9-42aa-9464-1743d1da4361\"\r\n}\r\n",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/v2/receipt",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"v2",
+						"receipt"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Receipt Dublicate",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n    \"fiscal_number\": \"{{fiscal_number}}\",\r\n    \"txt\": true,\r\n    \"fd_number\": 7\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/duplicate",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"duplicate"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Customers поиск",
+			"protocolProfileBehavior": {
+				"disabledSystemHeaders": {
+					"content-type": true
+				}
+			},
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n    \"fiscal_number\": \"{{fiscal_number}}\",\r\n    \"phone\": \"77\"\r\n}\r\n"
+				},
+				"url": {
+					"raw": "{{host}}/api/customers",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"customers"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Info tax-systems",
+			"protocolProfileBehavior": {
+				"disableBodyPruning": true
+			},
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/info/tax-systems",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"info",
+						"tax-systems"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Info tax-rates",
+			"protocolProfileBehavior": {
+				"disableBodyPruning": true
+			},
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/info/tax-rates",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"info",
+						"tax-rates"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Info gns-departments",
+			"protocolProfileBehavior": {
+				"disableBodyPruning": true
+			},
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/info/gns-departments",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"info",
+						"gns-departments"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Info entrepreneurship-objects",
+			"protocolProfileBehavior": {
+				"disableBodyPruning": true
+			},
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/info/entrepreneurship-objects",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"info",
+						"entrepreneurship-objects"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Info calc-item-attributes",
+			"protocolProfileBehavior": {
+				"disableBodyPruning": true
+			},
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/info/calc-item-attributes",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"info",
+						"calc-item-attributes"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Info business-activities",
+			"protocolProfileBehavior": {
+				"disableBodyPruning": true
+			},
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "Authorization",
+						"value": "{{Authorization}}",
+						"type": "text"
+					},
+					{
+						"key": "Accept",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{host}}/api/info/business-activities",
+					"host": [
+						"{{host}}"
+					],
+					"path": [
+						"api",
+						"info",
+						"business-activities"
+					]
+				}
+			},
+			"response": []
+		}
+	],
+	"auth": {
+		"type": "bearer"
+	},
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "Authorization",
+			"value": "Bearer 37059|lTqx0n3B20y9ik6LJBfJkFXeuErwvw8sG0nJS0AT",
+			"type": "string"
+		},
+		{
+			"key": "fiscal_number",
+			"value": "0000003213047999",
+			"type": "string"
+		},
+		{
+			"key": "host",
+			"value": "https://ofddev.ekassa.kg",
+			"type": "string"
+		},
+		{
+			"key": "inn",
+			"value": "00000000000005",
+			"type": "string"
+		}
+	]
+}

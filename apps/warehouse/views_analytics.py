@@ -252,4 +252,11 @@ class WarehouseOwnerPartnerAnalyticsAPIView(CompanyBranchRestrictedMixin, APIVie
             group_by=group_by,
             all_branches=all_branches,
         )
+        # stock-partnership §7.13: название филиала и список филиалов партнёра
+        data = dict(data)
+        data["branch_name"] = partner_branch.name if partner_branch else None
+        data["partner_branches"] = [
+            {"id": str(b.id), "name": b.name}
+            for b in Branch.objects.filter(company=partner).order_by("name").only("id", "name")
+        ]
         return Response(data)

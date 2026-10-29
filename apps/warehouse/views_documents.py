@@ -2,11 +2,15 @@ from rest_framework import status, permissions, filters
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from apps.users.permissions import read_only_guard
 from rest_framework import generics
 from django.shortcuts import get_object_or_404
 from django.db.models import Q, Prefetch
+from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 
+import logging
+from datetime import timedelta
 from decimal import Decimal
 
 from . import models, serializers_documents, services, services_money
@@ -20,7 +24,28 @@ from .views import (
     ProductCatalogPagination,
 )
 from .filters import ProductFilter
+from .validators import WarehouseGuardMixin, ensure_unique_counterparty
 from apps.utils import _is_owner_like
+
+logger = logging.getLogger(__name__)
+
+
+def _truthy(raw) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in ("true", "1", "yes", "y", "on")
+
+
+def _service_error_response(exc):
+    return Response(services.error_payload(exc), status=services.error_status(exc))
+
+
+def _raise_service_error(exc):
+    from rest_framework.exceptions import PermissionDenied
+
+    if services.error_status(exc) == 403:
+        raise PermissionDenied(services.error_payload(exc))
+    raise DRFValidationError(services.error_payload(exc))
 
 
 def _agent_allowed_for_company(agent_user, company):
@@ -36,6 +61,7 @@ def _agent_allowed_for_company(agent_user, company):
     ).exists()
 
 
+@read_only_guard("can_edit_documents")
 class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = serializers_documents.DocumentSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
@@ -99,9 +125,39 @@ class DocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAP
         # Необязательная фильтрация по операционной дате документа:
         # ?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD (по полю date, не created_at).
         qs = services_money.apply_requested_date_range(qs, "date", self)
+        qs = self._apply_extra_filters(qs)
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
+        return qs
+
+    def _apply_extra_filters(self, qs):
+        """
+        ?posted_negative=true — проведённые в минус (B02);
+        ?stale_days=N — «зависшие»: ждут кассу / заявка дольше N дней (B43);
+        ?base_document=<uuid> — возвраты по документу (B04).
+        """
+        params = self.request.query_params
+        if "posted_negative" in params:
+            if _truthy(params.get("posted_negative")):
+                qs = qs.filter(posted_negative_at__isnull=False)
+            else:
+                qs = qs.filter(posted_negative_at__isnull=True)
+        raw_stale = (params.get("stale_days") or "").strip()
+        if raw_stale:
+            try:
+                days = max(0, int(raw_stale))
+            except ValueError:
+                raise DRFValidationError({"stale_days": "Укажите целое число дней."})
+            border = timezone.now() - timedelta(days=days)
+            qs = qs.filter(
+                Q(status=models.Document.Status.CASH_PENDING)
+                & (Q(cash_request__requested_at__lte=border) | Q(cash_request__isnull=True, updated_at__lte=border))
+                | Q(status=models.Document.Status.SALE_REQUEST, updated_at__lte=border)
+            )
+        raw_base = (params.get("base_document") or "").strip()
+        if raw_base:
+            qs = qs.filter(base_document_id=raw_base)
         return qs
 
     def _enforce_wholesale_permission(self, serializer, user):
@@ -242,15 +298,14 @@ class DocumentTransferListCreateView(_DocumentTypedListCreateView):
         doc = serializer.instance
         if doc and doc.status == doc.Status.DRAFT:
             try:
-                allow_negative = self.request.data.get("allow_negative", False)
-                if isinstance(allow_negative, str):
-                    allow_negative = allow_negative.lower() in ("true", "1", "yes")
-                services.post_document(doc, allow_negative=allow_negative)
+                allow_negative = _truthy(self.request.data.get("allow_negative", False))
+                services.post_document(doc, allow_negative=allow_negative, user=self.request.user)
                 doc.refresh_from_db()
             except Exception as e:
-                raise DRFValidationError({"detail": str(e)})
+                _raise_service_error(e)
 
 
+@read_only_guard("can_edit_documents")
 class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = serializers_documents.DocumentSerializer
     
@@ -275,6 +330,39 @@ class DocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDe
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
         return qs
+
+    def perform_destroy(self, instance):
+        """
+        Удалить можно только черновик без движений и денег (documents-delete-draft.md).
+        Проведённый документ сначала распроводят: иначе его движения пропали бы из
+        истории, а остатки и касса остались бы изменёнными.
+        """
+        doc = instance
+        if doc.status != models.Document.Status.DRAFT:
+            raise DRFValidationError({"detail": "Удалить можно только черновик. Сначала отмените проведение."})
+        try:
+            services.ensure_period_open(
+                company=services.document_company(doc), dates=[doc.date], user=self.request.user
+            )
+        except Exception as e:
+            _raise_service_error(e)
+        if doc.is_sale_request or models.AgentRequestCart.objects.filter(sale_document=doc).exists():
+            raise DRFValidationError({"detail": "Заявку агента нельзя удалить как черновик."})
+        if doc.moves.exists() or doc.agent_moves.exists():
+            raise DRFValidationError({"detail": "У документа есть движения товара — удаление запрещено."})
+        if models.MoneyDocument.objects.filter(source_document=doc).exists():
+            raise DRFValidationError({"detail": "У документа есть денежный документ — удаление запрещено."})
+        if models.CashApprovalRequest.objects.filter(document=doc).exclude(
+            status=models.CashApprovalRequest.Status.REJECTED
+        ).exists():
+            raise DRFValidationError({"detail": "По документу есть запрос в кассу — удаление запрещено."})
+        if doc.salary_accruals.exists():
+            raise DRFValidationError({"detail": "По документу начислена зарплата — удаление запрещено."})
+        logger.info(
+            "warehouse document deleted: id=%s number=%s type=%s by user=%s",
+            doc.pk, doc.number, doc.doc_type, getattr(self.request.user, "pk", None),
+        )
+        doc.delete()
 
 
 class DocumentScanView(CompanyBranchRestrictedMixin, APIView):
@@ -425,6 +513,7 @@ class AgentDocumentDetailView(DocumentDetailView):
         return qs.filter(agent=self.request.user)
 
 
+@read_only_guard("can_edit_documents")
 class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
     serializer_class = serializers_documents.DocumentSerializer
     
@@ -449,9 +538,12 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
         # 2. Если документ ожидает решения кассы (CASH_PENDING), утверждаем кассовый запрос до POSTED
         if doc.status == doc.Status.CASH_PENDING:
             try:
-                services.approve_cash_request(doc, decided_by=request.user)
+                services.approve_cash_request(
+                    doc, decided_by=request.user,
+                    allow_negative_cash=_truthy(request.data.get("allow_negative_cash")),
+                )
             except Exception as e:
-                return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+                return _service_error_response(e)
             doc.refresh_from_db()
             return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
 
@@ -489,13 +581,22 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
             allow_negative = request.data.get('allow_negative', False)
             if isinstance(allow_negative, str):
                 allow_negative = allow_negative.lower() in ('true', '1', 'yes')
-            services.post_document(doc, allow_negative=allow_negative)
+            # Осознанное повторение такого же документа (редкий, но законный случай):
+            # ?allow_duplicate=true снимает защиту от дубля.
+            allow_duplicate = request.data.get('allow_duplicate', False)
+            if isinstance(allow_duplicate, str):
+                allow_duplicate = allow_duplicate.lower() in ('true', '1', 'yes')
+            services.post_document(
+                doc,
+                allow_negative=allow_negative,
+                user=request.user,
+                allow_duplicate=bool(allow_duplicate),
+                allow_negative_cash=_truthy(request.data.get("allow_negative_cash")),
+            )
             doc.refresh_from_db()
 
-            # Если при проведении наличной продажи документ перешёл в CASH_PENDING:
-            # - Для владельца/админа по умолчанию auto_approve = True
-            # - Для агента по умолчанию auto_approve = False (нужно решение кассы)
-            # - Если в запросе передан auto_approve_cash, учитываем его значение.
+            # Если при проведении наличной продажи документ перешёл в CASH_PENDING (включено подтверждение кассы):
+            # Если в запросе явно передан auto_approve_cash, учитываем его значение.
             raw_auto_approve = request.data.get("auto_approve_cash", None)
             if raw_auto_approve is not None:
                 if isinstance(raw_auto_approve, str):
@@ -503,7 +604,7 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
                 else:
                     auto_approve_cash = bool(raw_auto_approve)
             else:
-                auto_approve_cash = _is_owner_like(request.user)
+                auto_approve_cash = False
 
             if doc.status == doc.Status.CASH_PENDING and auto_approve_cash:
                 try:
@@ -512,11 +613,12 @@ class DocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
                     logger.warning("Auto approve cash request failed: %s", e)
 
         except Exception as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return _service_error_response(e)
         doc.refresh_from_db()
         return Response(self.get_serializer(doc).data)
 
 
+@read_only_guard("can_edit_documents")
 class DocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
     serializer_class = serializers_documents.DocumentSerializer
     
@@ -533,10 +635,27 @@ class DocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
 
     def post(self, request, pk=None):
         doc = self.get_object()
+        if (
+            doc.doc_type == models.Document.DocType.TRANSFER
+            and doc.warehouse_from_id and doc.warehouse_to_id
+            and doc.warehouse_from.company_id != doc.warehouse_to.company_id
+        ):
+            # stock-partnership §7.11 (D7): межкомпанейское — только получатель (у него списывается товар)
+            from apps.warehouse.views_partnership import user_can_manage_partnership
+
+            if not user_can_manage_partnership(request.user, doc.warehouse_to.company):
+                return Response(
+                    {"detail": "Отменить межкомпанейское перемещение может только получатель."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
         try:
-            services.unpost_document(doc)
+            services.unpost_document(
+                doc,
+                user=request.user,
+                allow_negative=_truthy(request.data.get("allow_negative")),
+            )
         except Exception as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return _service_error_response(e)
         return Response(self.get_serializer(doc).data)
 
 
@@ -557,9 +676,12 @@ class DocumentCashApproveView(CompanyBranchRestrictedMixin, generics.GenericAPIV
         doc = self.get_object()
         note = (request.data.get("note") or "").strip()
         try:
-            services.approve_cash_request(doc, decided_by=request.user, note=note)
+            services.approve_cash_request(
+                doc, decided_by=request.user, note=note,
+                allow_negative_cash=_truthy(request.data.get("allow_negative_cash")),
+            )
         except Exception as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return _service_error_response(e)
         doc.refresh_from_db()
         return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
 
@@ -586,6 +708,40 @@ class DocumentCashRejectView(CompanyBranchRestrictedMixin, generics.GenericAPIVi
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         doc.refresh_from_db()
         return Response(self.get_serializer(doc).data, status=status.HTTP_200_OK)
+
+
+class DocumentReturnableView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    """
+    QA B04: сколько можно вернуть по продаже/закупу.
+    GET /api/warehouse/documents/{id}/returnable/
+    → {"items": [{"base_item", "product", "name", "sold", "returned", "returnable", "price"}]}
+    """
+
+    serializer_class = serializers_documents.DocumentSerializer
+
+    def get_queryset(self):
+        qs = models.Document.objects.select_related("warehouse_from", "warehouse_to", "counterparty")
+        qs = DocumentListCreateView._filter_company_branch(self, qs)
+        if not _is_owner_like(self.request.user):
+            qs = qs.filter(agent=self.request.user)
+        return qs
+
+    def get(self, request, pk=None):
+        doc = self.get_object()
+        if doc.doc_type not in (models.Document.DocType.SALE, models.Document.DocType.PURCHASE):
+            return Response(
+                {"detail": "Возврат оформляется только по продаже или закупу.", "code": "return_base_invalid"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response({
+            "document": str(doc.pk),
+            "number": doc.number,
+            "status": doc.status,
+            "counterparty": str(doc.counterparty_id) if doc.counterparty_id else None,
+            "paid": str(services._base_document_paid_amount(doc)),
+            "refunded": str(services._returns_cash_refunded(doc)),
+            "items": services.returnable_items(doc),
+        })
 
 
 class CashApprovalRequestListView(CompanyBranchRestrictedMixin, generics.ListAPIView):
@@ -655,9 +811,12 @@ class CashApprovalRequestApproveView(CompanyBranchRestrictedMixin, generics.Gene
         note = (ser.validated_data.get("note") or "").strip()
 
         try:
-            services.approve_cash_request(cash_request.document, decided_by=request.user, note=note)
+            services.approve_cash_request(
+                cash_request.document, decided_by=request.user, note=note,
+                allow_negative_cash=_truthy(request.data.get("allow_negative_cash")),
+            )
         except Exception as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return _service_error_response(e)
 
         cash_request.refresh_from_db()
         out = serializers_documents.CashApprovalRequestSerializer(cash_request, context={"request": request}).data
@@ -702,6 +861,7 @@ class CashApprovalRequestRejectView(CompanyBranchRestrictedMixin, generics.Gener
         return Response(out, status=status.HTTP_200_OK)
 
 
+@read_only_guard("can_edit_documents")
 class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
     """
     Быстрое перемещение товара (создает документ TRANSFER и сразу проводит).
@@ -743,6 +903,7 @@ class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
             warehouse_from=wh_from,
             warehouse_to=wh_to,
             comment=ser.validated_data.get("comment") or "",
+            created_by=request.user,
         )
 
         for it in ser.validated_data["items"]:
@@ -754,14 +915,32 @@ class DocumentTransferCreateAPIView(CompanyBranchRestrictedMixin, APIView):
             item.save()
 
         try:
-            services.post_document(doc)
+            services.post_document(
+                doc, user=request.user, allow_negative=_truthy(request.data.get("allow_negative"))
+            )
         except Exception as e:
-            raise DRFValidationError({"detail": str(e)})
+            _raise_service_error(e)
 
         out = serializers_documents.DocumentSerializer(doc, context={"request": request}).data
         return Response(out, status=status.HTTP_201_CREATED)
 
 
+class GenerateBarcodeView(CompanyBranchRestrictedMixin, APIView):
+    """
+    QA B30: следующий свободный внутренний штрихкод EAN-13 (префикс 20) компании.
+    GET /api/warehouse/products/generate-barcode/ → {"barcode": "2000000000017"}
+    """
+
+    def get(self, request, *args, **kwargs):
+        from .validators import generate_internal_barcode
+
+        company = self._company()
+        if company is None:
+            raise DRFValidationError({"company": "Компания не найдена."})
+        return Response({"barcode": generate_internal_barcode(company)})
+
+
+@read_only_guard("can_edit_products")
 class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = serializers_documents.ProductSimpleSerializer
     filter_backends = [DjangoFilterBackend]
@@ -801,6 +980,7 @@ class ProductListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPI
         return qs
 
 
+@read_only_guard("can_edit_products")
 class ProductDetailView(ProtectedProductDeleteMixin, CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = serializers_documents.ProductSimpleSerializer
 
@@ -815,7 +995,7 @@ class ProductDetailView(ProtectedProductDeleteMixin, CompanyBranchRestrictedMixi
         return self._filter_qs_company_branch(qs)
 
 
-class WarehouseListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
+class WarehouseListCreateView(WarehouseGuardMixin, CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
     serializer_class = serializers_documents.WarehouseSimpleSerializer
     
     def get_queryset(self):
@@ -824,7 +1004,7 @@ class WarehouseListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateA
         return self._filter_qs_company_branch(qs)
 
 
-class WarehouseDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
+class WarehouseDetailView(WarehouseGuardMixin, CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
     serializer_class = serializers_documents.WarehouseSimpleSerializer
     
     def get_queryset(self):
@@ -850,6 +1030,21 @@ class CounterpartyPagination(PageNumberPagination):
             if val in ("all", "0", "-1"):
                 return self.max_page_size
         return super().get_page_size(request)
+
+
+# Значения, включающие режим «только не оплатившие» (должники).
+_UNPAID_FLAGS = {"1", "true", "yes", "unpaid", "debt", "debtors", "not_paid"}
+
+
+def _wants_only_unpaid(request) -> bool:
+    qp = getattr(request, "query_params", None) or {}
+    raw = (
+        qp.get("only_unpaid")
+        or qp.get("unpaid")
+        or qp.get("payment_status")
+        or ""
+    ).strip().lower()
+    return raw in _UNPAID_FLAGS
 
 
 class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCreateAPIView):
@@ -885,31 +1080,47 @@ class CounterpartyListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
         finally:
             self._counterparty_analytics_map = None
 
+    def _unpaid_counterparty_ids(self, on_date):
+        """
+        Контрагенты с непогашенным долгом на дату: сальдо на конец периода
+        по дебету больше, чем по кредиту (трактовка — как в акте сверки).
+        """
+        period_map = services_money.counterparty_period_balances(
+            self, date_from=on_date, date_to=on_date, per_counterparty=True,
+        )
+        return [
+            cid for cid, row in period_map.items()
+            if (row["closing_debit"] - row["closing_credit"]) > 0
+        ]
+
     def get_queryset(self):
         qs = filter_qs_company_branch_or_global(self, models.Counterparty.objects.all())
         user = self.request.user
         if not _is_owner_like(user):
             qs = qs.filter(agent=user)
         date_from, date_to = services_money.get_requested_date_range(self)
-        if date_from or date_to:
-            doc_qs = models.Document.objects.filter(counterparty_id__isnull=False)
-            doc_qs = self._filter_qs_company_branch(
-                doc_qs,
-                company_field="warehouse_from__company_id",
-                branch_field="warehouse_from__branch",
-            )
-            doc_qs = services_money.apply_requested_date_range(doc_qs, "date", self)
-
-            money_qs = self._filter_qs_company_branch(models.MoneyDocument.objects.filter(counterparty_id__isnull=False))
-            money_qs = services_money.apply_requested_date_range(money_qs, "date", self)
-
-            qs = qs.filter(
-                Q(pk__in=doc_qs.values("counterparty_id")) | Q(pk__in=money_qs.values("counterparty_id"))
-            ).distinct()
+        only_unpaid = _wants_only_unpaid(self.request)
+        if only_unpaid:
+            # Режим одного дня: показываем только тех, кто не оплатил (есть долг
+            # на конец выбранной даты), включая тех, у кого в этот день движений не было.
+            on_date = date_to or date_from or timezone.localdate()
+            return qs.filter(pk__in=self._unpaid_counterparty_ids(on_date)).distinct()
+        # Период НЕ сужает состав списка: страница «Контрагенты» — это ещё и
+        # справочник, и контрагент без документов должен остаться в нём с нулями
+        # (иначе при выборе месяца из таблицы пропадают сотни живых клиентов).
+        # Суммы строк при этом сходятся с карточками: нулевые строки ничего не
+        # добавляют. Период влияет только на цифры в строках, а состав сужает
+        # лишь режим одного дня (only_unpaid).
         return qs
 
     def perform_create(self, serializer):
         user = self.request.user
+        # B16: дубли по телефону/ИНН запрещены, по имени — только с force_duplicate_name.
+        ensure_unique_counterparty(
+            company=self._company(),
+            data=serializer.validated_data,
+            force_duplicate_name=_truthy(self.request.data.get("force_duplicate_name")),
+        )
         if _is_owner_like(user):
             company = self._company()
             agent = serializer.validated_data.get("agent")
@@ -944,6 +1155,12 @@ class CounterpartyDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpda
     def perform_update(self, serializer):
         user = self.request.user
         instance = serializer.instance
+        ensure_unique_counterparty(
+            company=instance.company or self._company(),
+            data=serializer.validated_data,
+            instance=instance,
+            force_duplicate_name=_truthy(self.request.data.get("force_duplicate_name")),
+        )
         if _is_owner_like(user):
             company = getattr(instance, "company", None) or self._company()
             agent = serializer.validated_data.get("agent")
@@ -998,12 +1215,67 @@ class CounterpartyBalanceSummaryView(CompanyBranchRestrictedMixin, APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+        counterparty_ids = None
+
+        # Фильтр по агенту — тот же, что в списке контрагентов (?agent=<uuid>),
+        # иначе карточки считаются по всем контрагентам и не сходятся с таблицей.
+        # Агент (не владелец) видит итоги только по своим контрагентам.
+        agent_raw = (request.query_params.get("agent") or "").strip()
+        user = request.user
+        if not _is_owner_like(user):
+            agent_raw = ""  # не-владелец не может подставить чужого агента
+        if agent_raw or not _is_owner_like(user):
+            agent_qs = filter_qs_company_branch_or_global(self, models.Counterparty.objects.all())
+            if counterparty_type:
+                agent_qs = agent_qs.filter(type=counterparty_type)
+            agent_qs = agent_qs.filter(agent_id=agent_raw or user.pk)
+            try:
+                counterparty_ids = list(agent_qs.values_list("id", flat=True))
+            except (ValueError, DjangoValidationError):
+                return Response(
+                    {"detail": "Параметр agent должен быть UUID."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if _wants_only_unpaid(request):
+            # Тот же режим, что и в списке контрагентов: только не оплатившие
+            # (сальдо на конец периода по дебету больше, чем по кредиту).
+            per_cp = services_money.counterparty_period_balances(
+                self, date_from=date_to, date_to=date_to,
+                counterparty_type=counterparty_type, counterparty_ids=counterparty_ids,
+                per_counterparty=True,
+            )
+            counterparty_ids = [
+                cid for cid, r in per_cp.items()
+                if (r["closing_debit"] - r["closing_credit"]) > 0
+            ]
+
         row = services_money.counterparty_period_balances(
             self, date_from=date_from, date_to=date_to,
-            counterparty_type=counterparty_type, per_counterparty=False,
+            counterparty_type=counterparty_type, counterparty_ids=counterparty_ids,
+            per_counterparty=False,
         )
+        # net = дебет − кредит: «сколько в итоге должен». Дебет — начислено
+        # (отгрузки, выдачи денег), кредит — погашено (оплаты, возвраты).
+        # Положительный net — должен контрагент, отрицательный — переплата.
+        def _block(prefix):
+            debit = row[f"{prefix}_debit"]
+            credit = row[f"{prefix}_credit"]
+            net = debit - credit
+            return {"debit": str(debit), "credit": str(credit), "net": str(net)}
+
+        closing_net = row["closing_debit"] - row["closing_credit"]
         return Response({
-            "opening": {"debit": str(row["opening_debit"]), "credit": str(row["opening_credit"])},
-            "turnover": {"debit": str(row["turnover_debit"]), "credit": str(row["turnover_credit"])},
-            "closing": {"debit": str(row["closing_debit"]), "credit": str(row["closing_credit"])},
+            "opening": _block("opening"),
+            "turnover": _block("turnover"),
+            "closing": _block("closing"),
+            "totals": {
+                "debt_total": str(row["opening_debit"] + row["turnover_debit"]),
+                "paid_total": str(row["opening_credit"] + row["turnover_credit"]),
+                "debt_remaining": str(closing_net),
+                # Стороны берём как есть, без свёртки между контрагентами:
+                # долг одного не гасится переплатой другого (§2.3 ТЗ).
+                "counterparties_owe": str(row["closing_debit"]),
+                "company_owes": str(row["closing_credit"]),
+            },
         }, status=status.HTTP_200_OK)

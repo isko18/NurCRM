@@ -188,6 +188,18 @@ def notify_user(user_id, event_type, payload):
     _send(groups, event_name, envelope, _NOTIFY_HANDLER)
 
 
+def notify_company(company_id, event_type, payload):
+    """Шлёт событие воронки в комнату компании и персонально автору (§17.8)."""
+    if not company_id:
+        return
+    groups = [company_group(company_id)]
+    if isinstance(payload, dict):
+        owner_id = payload.get("owner_user") or payload.get("owner_user_id")
+        if owner_id:
+            groups.extend([user_group(owner_id), f"user_{owner_id}"])
+    _send(groups, event_type, payload, _BOARD_HANDLER)
+
+
 # ===== обратная совместимость: вызывается из signals.py для событий воронки =====
 
 def push(lead, event_type, payload=None):

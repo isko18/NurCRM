@@ -12,6 +12,7 @@ from django.utils import timezone as dj_tz
 from django.utils.dateparse import parse_datetime, parse_date
 
 from apps.main.models import (
+    SizeChart,
     Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review,
     ProductInventorySession, ProductInventoryItem,
     Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand,
@@ -22,7 +23,7 @@ from apps.main.models import (
     ReturnFromAgent, ProductImage, PromoRule, AgentRequestCart, AgentRequestItem,
     ProductPackage, ProductCharacteristics, DealPayment, AgentSaleAllocation,
     ProductRecipeItem, ProductPromotionTier, ProductAlternateBarcode, MarketSaleEmployeePayProfile,
-    SupplierReceipt, SupplierReceiptItem,
+    SupplierReceipt, SupplierReceiptItem, ProductExpiryBatch,
     SupplierReturn, SupplierReturnItem,
     KnowledgeBaseCourse, KnowledgeBaseLesson,
     FinishedToRawTransfer,
@@ -32,6 +33,7 @@ from apps.main.models import (
     ProductionRecord,
     SupplierPurchase,
     PosPrinterSetting,
+    MarketCustomerDisplaySettings,
 )
 
 from apps.consalting.models import ServicesConsalting
@@ -117,13 +119,18 @@ def _active_branch(serializer: serializers.Serializer):
     elif hasattr(req, "GET"):
         branch_id = req.GET.get("branch")
 
-    if branch_id and branch_id.strip():
+    if branch_id and str(branch_id).strip():
+        branch_val = str(branch_id).strip()
+        if branch_val.lower() == "main":
+            setattr(req, "branch", None)
+            return None
         try:
+            from django.core.exceptions import ValidationError as DjangoValidationError
             from apps.users.models import Branch  # на случай круговой импорта
-            br = Branch.objects.get(id=branch_id, company_id=company_id)
+            br = Branch.objects.get(id=branch_val, company_id=company_id)
             setattr(req, "branch", br)
             return br
-        except (Branch.DoesNotExist, ValueError):
+        except (Branch.DoesNotExist, ValueError, DjangoValidationError):
             pass
 
     # ----- 3. Глобальный режим по компании -----
@@ -154,7 +161,7 @@ class ProductImageReadSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProductImage
-        fields = ["id", "image_url", "alt", "is_primary", "created_at"]
+        fields = ["id", "image_url", "alt", "is_primary", "color", "created_at"]
         read_only_fields = fields  # всё только на чтение тут
 
     def get_image_url(self, obj):
@@ -799,7 +806,7 @@ class ProductImageSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProductImage
-        fields = ["id", "image", "image_url", "alt", "is_primary", "created_at"]
+        fields = ["id", "image", "image_url", "alt", "is_primary", "color", "created_at"]
         read_only_fields = ["id", "image_url", "created_at"]
 
     def get_image_url(self, obj):
@@ -970,7 +977,7 @@ def sync_product_promotion_tiers(product, raw, *, stock_enabled: bool, partial: 
 def sync_product_alternate_barcodes(product: Product, raw):
     """
     Полная замена списка доп. штрихкодов для товара.
-    raw — list[str] | None (пустой список очищает).
+    raw — list[str | dict] | None (пустой список очищает).
     """
     from django.core.cache import cache
 
@@ -979,7 +986,14 @@ def sync_product_alternate_barcodes(product: Product, raw):
     seen = set()
     norm = []
     for x in raw or []:
-        b = (str(x or "").strip())
+        if isinstance(x, dict):
+            b = str(x.get("barcode") or "").strip()
+            n = str(x.get("name") or "").strip()
+            raw_qty = x.get("quantity")
+        else:
+            b = str(x or "").strip()
+            n = ""
+            raw_qty = None
         if not b:
             continue
         if b in seen:
@@ -987,22 +1001,39 @@ def sync_product_alternate_barcodes(product: Product, raw):
                 "alternate_barcodes": f"Дубликат в списке: {b}.",
             })
         seen.add(b)
-        norm.append(b)
 
-    for b in norm:
+        qty = None
+        if raw_qty is not None and str(raw_qty).strip() != "":
+            try:
+                val = float(raw_qty)
+                if val <= 0 or not val.is_integer():
+                    raise ValueError()
+                qty = int(val)
+            except (ValueError, TypeError):
+                raise serializers.ValidationError({
+                    "alternate_barcodes": f"Количество в доп. штрихкоде '{b}' должно быть положительным числом."
+                })
+
+        norm.append((b, n, qty))
+
+    for b, n, _ in norm:
         if main and b == main:
             raise serializers.ValidationError({
                 "alternate_barcodes": f"Доп. штрихкод «{b}» совпадает с основным штрихкодом товара.",
             })
-        if Product.objects.filter(company_id=company_id, barcode=b).exclude(pk=product.pk).exists():
+        other = Product.objects.filter(company_id=company_id, barcode=b).exclude(pk=product.pk).only("name", "code").first()
+        if other is not None:
+            code = f" (код {other.code})" if other.code else ""
             raise serializers.ValidationError({
-                "alternate_barcodes": f"Штрихкод «{b}» уже используется как основной у другого товара.",
+                "alternate_barcodes": f"Штрихкод «{b}» уже есть у товара «{other.name}»{code} как основной.",
             })
-        if ProductAlternateBarcode.objects.filter(company_id=company_id, barcode=b).exclude(
+        alt = ProductAlternateBarcode.objects.filter(company_id=company_id, barcode=b).exclude(
             product_id=product.pk
-        ).exists():
+        ).select_related("product").first()
+        if alt is not None:
+            code = f" (код {alt.product.code})" if alt.product.code else ""
             raise serializers.ValidationError({
-                "alternate_barcodes": f"Штрихкод «{b}» уже зарегистрирован как дополнительный у другого товара.",
+                "alternate_barcodes": f"Штрихкод «{b}» уже есть у товара «{alt.product.name}»{code} как дополнительный.",
             })
 
     old_codes = list(product.alternate_barcodes.values_list("barcode", flat=True))
@@ -1010,14 +1041,14 @@ def sync_product_alternate_barcodes(product: Product, raw):
     if norm:
         ProductAlternateBarcode.objects.bulk_create(
             [
-                ProductAlternateBarcode(product=product, company_id=company_id, barcode=b)
-                for b in norm
+                ProductAlternateBarcode(product=product, company_id=company_id, barcode=b, name=n, quantity=q)
+                for b, n, q in norm
             ]
         )
     for old in old_codes:
         if old:
             cache.delete(f"product_barcode:{company_id}:{old}")
-    for b in norm:
+    for b, _, _ in norm:
         cache.delete(f"product_barcode:{company_id}:{b}")
 
 
@@ -1076,6 +1107,21 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     # ====== рецепт (сырьё + расход на 1 ед.) ======
     recipe = RecipeItemReadSerializer(source="recipe_items", many=True, read_only=True)
 
+    # ТЗ Н-33: таблица размеров товара (id из showcase/size-charts/)
+    size_chart = serializers.PrimaryKeyRelatedField(
+        queryset=SizeChart.objects.all(), required=False, allow_null=True
+    )
+
+    def validate_size_chart(self, value):
+        if value is not None:
+            req = self.context.get("request")
+            cid = getattr(getattr(req, "user", None), "company_id", None) or getattr(
+                getattr(getattr(req, "user", None), "owned_company", None), "id", None
+            )
+            if cid and value.company_id != cid:
+                raise serializers.ValidationError("Таблица размеров другой компании.")
+        return value
+
     # ====== клиент ======
     client = serializers.PrimaryKeyRelatedField(
         queryset=Client.objects.all(),
@@ -1114,7 +1160,6 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         allow_null=True,
     )
     alternate_barcodes = serializers.ListField(
-        child=serializers.CharField(max_length=64),
         write_only=True,
         required=False,
         allow_null=True,
@@ -1156,6 +1201,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
     country = serializers.CharField(required=False, allow_blank=True)
     expiration_date = serializers.DateField(required=False, allow_null=True)
+    shelf_life_days = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    expiry_batches = serializers.SerializerMethodField(read_only=True)
 
     # ==== ПЛУ ====
     plu = serializers.IntegerField(required=False, allow_null=True)
@@ -1189,6 +1236,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         allow_null=True,
         allow_blank=True,
     )
+    # Без default: не переданное поле не сбрасывается при PUT; при создании — default модели.
+    upsell_priority = serializers.IntegerField(required=False, min_value=0, max_value=100)
+    upsell_excluded = serializers.BooleanField(required=False)
     cashflows = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
@@ -1197,6 +1247,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "id", "company", "branch",
             "kind",
             "hotkey_group",
+            "upsell_priority",
+            "upsell_excluded",
             "code", "article",
             "name", "description", "barcode",
             "brand", "brand_name",
@@ -1212,8 +1264,11 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "wholesale_price",
             "discount_percent",
             "plu",
+            "duration_min",
+            "performer_commission_percent",
             "country",
             "expiration_date",
+            "shelf_life_days", "expiry_batches",
             "status", "status_display",
             "client", "client_name",
             "supplier_ids", "suppliers",
@@ -1231,7 +1286,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "total_price",
             "purchase_batches",
             "cashflows",
+            "size_chart",  # ТЗ Н-33
         ]
+
         read_only_fields = [
             "id", "created_at", "updated_at",
             "company", "branch",
@@ -1250,6 +1307,12 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         ]
 
     def get_cashflows(self, obj):
+        # В списке товаров вью кладёт в контекст готовую карту по всей странице
+        # (один запрос вместо запроса на каждый товар — было ~100 на страницу).
+        batch = self.context.get("cashflows_by_product")
+        if batch is not None:
+            return batch.get(str(obj.id), [])
+
         from apps.construction.models import CashFlow
         from apps.construction.auto_cashflow import serialize_auto_cashflows
         cfs = CashFlow.objects.filter(company_id=obj.company_id, source_id=str(obj.id))
@@ -1266,6 +1329,24 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "price": {"required": False, "allow_null": True},
             "description": {"required": False, "allow_blank": True, "allow_null": True},
         }
+
+    def get_expiry_batches(self, obj):
+        # Если партии уже загружены prefetch-ем — фильтруем в памяти, иначе
+        # .filter() на менеджере сделал бы отдельный запрос на каждый товар.
+        cached = obj.__dict__.get("_prefetched_objects_cache", {}).get("expiry_batches")
+        if cached is not None:
+            batches = [
+                b for b in cached
+                if b.status == ProductExpiryBatch.Status.ACTIVE
+                and (b.remaining_quantity or 0) > 0
+            ]
+            batches.sort(key=lambda b: (b.expires_at is None, b.expires_at, b.received_at))
+            batches = batches[:10]
+        else:
+            batches = obj.expiry_batches.filter(
+                status=ProductExpiryBatch.Status.ACTIVE, remaining_quantity__gt=0
+            ).order_by(F("expires_at").asc(nulls_last=True), "received_at")[:10]
+        return ProductExpiryBatchSerializer(batches, many=True).data
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1318,9 +1399,11 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         qs = ProductAlternateBarcode.objects.filter(company_id=company_id, barcode=b)
         if pk:
             qs = qs.exclude(product_id=pk)
-        if qs.exists():
+        alt = qs.select_related("product").first()
+        if alt is not None:
+            code = f" (код {alt.product.code})" if alt.product.code else ""
             raise serializers.ValidationError(
-                "Этот штрих-код уже используется как дополнительный у другого товара."
+                f"Штрихкод «{b}» уже есть у товара «{alt.product.name}»{code} как дополнительный."
             )
         return b
 
@@ -1568,6 +1651,14 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             pup = self._safe_decimal(getattr(pkg, "piece_unit_price", None), self._Q2)
             setattr(pkg, "piece_unit_price", pup)
 
+    def to_internal_value(self, data):
+        # «Калькуляция», задача 4: is_promo — понятное имя для stock («Акционный товар»).
+        # Принимаем его вместо stock; если пришли оба — главный stock (старое имя).
+        if hasattr(data, "get") and "is_promo" in data and "stock" not in data:
+            data = data.copy() if hasattr(data, "copy") else dict(data)
+            data["stock"] = data.get("is_promo")
+        return super().to_internal_value(data)
+
     def to_representation(self, instance):
         # чистим проблемные Decimal перед сериализацией, чтобы избежать InvalidOperation
         self._sanitize_decimal_fields(instance)
@@ -1576,12 +1667,24 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         except InvalidOperation:
             self._sanitize_decimal_fields(instance)
             data = super().to_representation(instance)
+        if "stock" in data:
+            data["is_promo"] = data["stock"]
+        if hasattr(self, "_price_changed"):
+            data["price_changed"] = self._price_changed
         try:
-            data["alternate_barcodes"] = list(
-                instance.alternate_barcodes.order_by("barcode").values_list("barcode", flat=True)
-            )
+            data["alternate_barcodes"] = [
+                {"barcode": item.barcode, "name": item.name, "quantity": item.quantity}
+                for item in instance.alternate_barcodes.order_by("barcode")
+            ]
         except Exception:
             data["alternate_barcodes"] = []
+        if self.context.get("include_variants"):  # ТЗ Н-33: ?include=variants
+            from apps.main.kassa_stage3 import ProductVariantSerializer
+
+            data["variants"] = ProductVariantSerializer(
+                sorted(instance.variants.all(), key=lambda v: (v.sort_order, v.size, v.color)), many=True,
+                context={"product": instance},
+            ).data
         return data
 
     # ==== CREATE / UPDATE ====
@@ -1735,6 +1838,22 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         promotion_raw = validated_data.pop("promotion_rules_input", None) if promotion_in else None
         alt_in = "alternate_barcodes" in getattr(self, "initial_data", {})
         alternate_raw = validated_data.pop("alternate_barcodes", None) if alt_in else None
+        # ТЗ 11.6: characteristics (read-only в схеме) принимаем из тела PATCH, как в create-manual.
+        chars_raw = getattr(self, "initial_data", {}).get("characteristics") if hasattr(getattr(self, "initial_data", None), "get") else None
+        if isinstance(chars_raw, dict):
+            chars_ser = ProductCharacteristicsSerializer(
+                instance=getattr(instance, "characteristics", None), data=chars_raw, partial=True
+            )
+            chars_ser.is_valid(raise_exception=True)
+            chars_obj, _ = ProductCharacteristics.objects.update_or_create(
+                product=instance,
+                defaults={
+                    "company": instance.company,
+                    "branch": instance.branch,
+                    **chars_ser.validated_data,
+                },
+            )
+            instance.characteristics = chars_obj  # сбросить кэш, чтобы ответ показал новые значения
         if promotion_in and promotion_raw:
             try:
                 pr_rows = parse_product_promotion_tiers_payload(promotion_raw)
@@ -1760,8 +1879,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         if item_make_data is not None:
             instance.item_make.set(item_make_data)
 
-        # Products in main are company-level catalog items; keep them visible company-wide.
-        instance.branch = branch
+        # Филиал товара при редактировании не меняем: раньше здесь был сброс
+        # instance.branch = None, из-за которого товар филиала «переезжал» на главный
+        # склад и падал с IntegrityError (uq_company_main_barcode_not_empty).
 
         # ===== цены: двусторонняя логика =====
         has_purchase = "purchase_price" in validated_data
@@ -1782,16 +1902,25 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             markup_percent = self._to_dec(validated_data["markup_percent"])
             price = self._calc_price(purchase_price, markup_percent)
 
-        # 3) иначе пришёл только purchase_price -> пересчитываем разумно
+        # 3) иначе пришёл только purchase_price -> цена продажи не меняется,
+        #    наценка пересчитывается к текущей цене. Пересчёт цены от наценки —
+        #    только по явному "recalc_price": true (ТЗ Н-04: иначе 11 → 1 → 11
+        #    давало цену 165 вместо 15).
         elif has_purchase:
-            if Decimal(instance.markup_percent or 0) != Decimal("0"):
+            raw_recalc = getattr(self, "initial_data", {}).get("recalc_price")
+            if str(raw_recalc).lower() in ("true", "1") and Decimal(instance.markup_percent or 0) != Decimal("0"):
                 price = self._calc_price(purchase_price, markup_percent)
             else:
                 markup_percent = self._calc_markup(purchase_price, price)
 
+        old_price = instance.price
         instance.purchase_price = purchase_price
         instance.markup_percent = markup_percent
         instance.price = price
+        # save() пересчитывает цену от наценки; цена здесь уже согласована —
+        # не даём округлению наценки сдвинуть её на копейки.
+        instance._manual_price = True
+        self._price_changed = Decimal(str(old_price or 0)) != Decimal(str(price or 0))
 
         # ===== PATCH-friendly обновление остальных полей =====
         updatable_fields = (
@@ -1824,6 +1953,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
                     )
                 else:
                     setattr(instance, field, validated_data[field])
+
+        if "size_chart" in validated_data:  # ТЗ Н-33
+            instance.size_chart = validated_data["size_chart"]
 
         if "stock" in validated_data:
             instance.stock = validated_data["stock"]
@@ -1859,6 +1991,11 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
         if supplier_ids is not None:
             instance.suppliers.set(supplier_ids)
+        elif instance.client_id:
+            try:
+                instance.suppliers.add(instance.client)
+            except Exception:
+                pass
 
         # PACKAGES перезаписываем ТОЛЬКО если реально пришли в PATCH
         if packages_data is not None:
@@ -2110,17 +2247,33 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     class Meta:
         model = Client
         fields = [
-            'id', 'company', 'branch',
+            'id', 'company', 'branch', 'sector',
             'type', 'full_name', 'phone', 'email', 'date', 'status',
             'llc', 'inn', 'okpo', 'score', 'bik', 'address',
             'salesperson', 'salesperson_display',
             'service', 'service_display',
+            'telegram_chat_id', 'bonus_balance',
             'created_at', 'updated_at'
         ]
         read_only_fields = [
             'id', 'company', 'branch', 'created_at', 'updated_at',
-            'salesperson_display', 'service_display'
+            'salesperson_display', 'service_display', 'bonus_balance'
         ]
+        # ТЗ 12.16: телефон обязателен всем, кроме поставщиков (см. validate)
+        extra_kwargs = {'phone': {'required': False, 'allow_blank': True}}
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        inst = getattr(self, 'instance', None)
+        client_type = attrs.get('type', getattr(inst, 'type', None))
+        # проверяем при создании или когда телефон явно присылают (старых клиентов без телефона не трогаем)
+        if inst is None or 'phone' in attrs:
+            phone = (attrs.get('phone') or '').strip()
+            if not phone and client_type != Client.StatusClient.SUPPLIERS:
+                raise serializers.ValidationError({'phone': 'Укажите телефон.'})
+        if inst is None:
+            attrs.setdefault('phone', '')
+        return attrs
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2148,6 +2301,13 @@ class DealInstallmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSer
         decimal_places=2,
         read_only=True,
     )
+    is_overdue = serializers.BooleanField(read_only=True)
+    overdue_days = serializers.IntegerField(read_only=True)
+    overdue_amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+    )
 
     class Meta:
         model = DealInstallment
@@ -2158,11 +2318,15 @@ class DealInstallmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSer
             "deal",
             "number",
             "due_date",
+            "promised_date",
             "amount",
             "balance_after",
             "paid_on",
             "paid_amount",
             "remaining_for_period",
+            "is_overdue",
+            "overdue_days",
+            "overdue_amount",
         )
         read_only_fields = fields
 
@@ -2177,6 +2341,37 @@ class DealPaymentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
     installment_number = serializers.IntegerField(source="installment.number", read_only=True)
 
     created_by = serializers.ReadOnlyField(source="created_by.id")
+    # ТЗ Н-11: кто принял/выплатил и из какой кассы (касса — по связанному движению денег)
+    created_by_name = serializers.SerializerMethodField()
+    cashbox = serializers.SerializerMethodField()
+    cashbox_name = serializers.SerializerMethodField()
+
+    def get_created_by_name(self, obj):
+        u = obj.created_by
+        if u is None:
+            return None
+        full = f"{getattr(u, 'first_name', '') or ''} {getattr(u, 'last_name', '') or ''}".strip()
+        return full or getattr(u, "email", None)
+
+    def _cashflow(self, obj):
+        cache = self.context.setdefault("_deal_pay_cf", {})
+        if obj.pk not in cache:
+            from django.db.models import Q
+            from apps.construction.models import CashFlow
+            cache[obj.pk] = (
+                CashFlow.objects.select_related("cashbox")
+                .filter(Q(idempotency_key=f"deal-pay:{obj.pk}") | Q(source_id=str(obj.pk)))
+                .order_by("created_at").first()
+            )
+        return cache[obj.pk]
+
+    def get_cashbox(self, obj):
+        cf = self._cashflow(obj)
+        return str(cf.cashbox_id) if cf and cf.cashbox_id else None
+
+    def get_cashbox_name(self, obj):
+        cf = self._cashflow(obj)
+        return cf.cashbox.name if cf and cf.cashbox_id else None
 
     class Meta:
         model = DealPayment
@@ -2193,7 +2388,11 @@ class DealPaymentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             "idempotency_key",
             "created_by",
             "note",
+            "payment_method",
             "created_at",
+            "created_by_name",
+            "cashbox",
+            "cashbox_name",
         )
         read_only_fields = fields
 
@@ -2211,7 +2410,7 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
     daily_payment = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     remaining_debt = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
 
-    schedule_version = serializers.CharField(required=False, default="v1")
+    schedule_version = serializers.CharField(required=False, default="v2")
     debt_months = serializers.IntegerField(required=False, allow_null=True)
     interval_days = serializers.IntegerField(required=False, default=1, allow_null=True)
     interval_months = serializers.IntegerField(required=False, default=1, allow_null=True)
@@ -2325,7 +2524,9 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         if target_sale and not instance:
             existing = ClientDeal.objects.filter(sale=target_sale).first()
             if existing:
-                raise serializers.ValidationError({"sale_id": f"По этой продаже уже создана сделка (ID: {existing.id})."})
+                attrs["_existing_deal"] = existing
+                instance = existing
+                self.instance = existing
 
         # прод: если уже есть платежи — условия сделки нельзя менять
         if instance and instance.pk and instance.payments.exists():
@@ -2342,14 +2543,29 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
         amount = attrs.get("amount", getattr(instance, "amount", None))
         prepayment = attrs.get("prepayment", getattr(instance, "prepayment", None))
         kind = attrs.get("kind", getattr(instance, "kind", None))
+
+        # Срок — либо в днях, либо в месяцах. XOR смотрим по телу запроса, а не по сделке:
+        # сделку, созданную при продаже в долг, касса дополняет графиком, и там уже может
+        # стоять debt_days=30 по умолчанию. Прислали только один вид срока — второй сбрасываем.
+        sent_days = attrs.get("debt_days") is not None
+        sent_months = attrs.get("debt_months") is not None
+        if sent_days and sent_months:
+            raise serializers.ValidationError(
+                {"debt_months": "Нельзя одновременно указывать debt_days и debt_months."}
+            )
+        if sent_months:
+            attrs["debt_days"] = None
+        elif sent_days:
+            attrs["debt_months"] = None
+
         debt_days = attrs.get("debt_days", getattr(instance, "debt_days", None))
         debt_months = attrs.get("debt_months", getattr(instance, "debt_months", None))
 
-        sch_ver = attrs.get("schedule_version") or (instance.schedule_version if instance else "v1")
-        if str(sch_ver).strip().lower() in ("v2", "2"):
-            attrs["schedule_version"] = "v2"
-        else:
+        sch_ver = attrs.get("schedule_version") or (instance.schedule_version if instance else "v2")
+        if str(sch_ver).strip().lower() in ("v1", "1"):
             attrs["schedule_version"] = "v1"
+        else:
+            attrs["schedule_version"] = "v2"
 
         errors = {}
 
@@ -2395,40 +2611,85 @@ class ClientDealSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializ
     def create(self, validated_data):
         custom_inst = validated_data.pop("installments", None)
         validated_data.pop("sale_id", None)
+
+        existing = validated_data.pop("_existing_deal", None)
+        if existing:
+            return self.update(existing, validated_data)
+
+        instance = ClientDeal(**validated_data)
+        if custom_inst and isinstance(custom_inst, (list, tuple)):
+            instance._custom_installments = custom_inst
+
         try:
-            instance = super().create(validated_data)
+            instance.save()
         except DjangoValidationError as e:
             msg = e.message_dict if hasattr(e, "message_dict") else (e.messages if hasattr(e, "messages") else str(e))
             raise serializers.ValidationError(msg)
 
-        if custom_inst and isinstance(custom_inst, (list, tuple)):
-            instance._custom_installments = custom_inst
-            instance.rebuild_installments(custom_installments=custom_inst)
         return instance
 
     def update(self, instance, validated_data):
         custom_inst = validated_data.pop("installments", None)
         validated_data.pop("sale_id", None)
+
+        if custom_inst and isinstance(custom_inst, (list, tuple)):
+            instance._custom_installments = custom_inst
+
+        for attr, val in validated_data.items():
+            setattr(instance, attr, val)
+
         try:
-            instance = super().update(instance, validated_data)
+            instance.save()
         except DjangoValidationError as e:
             msg = e.message_dict if hasattr(e, "message_dict") else (e.messages if hasattr(e, "messages") else str(e))
             raise serializers.ValidationError(msg)
 
-        if custom_inst and isinstance(custom_inst, (list, tuple)):
-            instance._custom_installments = custom_inst
-            instance.rebuild_installments(custom_installments=custom_inst)
         return instance
 
 
+
 # ===== Inputs for pay/refund endpoints =====
+class DealInstallmentRescheduleSerializer(serializers.Serializer):
+    idempotency_key = serializers.UUIDField(required=False, allow_null=True)
+    due_date = serializers.DateField(required=False, allow_null=True)
+    promised_date = serializers.DateField(required=False, allow_null=True)
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+
 class DealPayInputSerializer(serializers.Serializer):
     installment_id = serializers.UUIDField(required=False)  # если нет — возьмём первый не полностью оплаченный
     amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
     date = serializers.DateField(required=False)
     idempotency_key = serializers.UUIDField(required=True)
     note = serializers.CharField(required=False, allow_blank=True)
+    payment_method = serializers.CharField(required=False, allow_blank=True, allow_null=True, default="cash")
     cashbox_id = serializers.UUIDField(required=False, allow_null=True)
+    branch_id = serializers.UUIDField(required=False, allow_null=True)
+    cashbox_role = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    shift_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate_date(self, value):
+        if value and value > timezone.localdate():
+            raise serializers.ValidationError("Дата оплаты не может быть в будущем.")
+        return value
+
+
+class DealPayAnyInputSerializer(serializers.Serializer):
+    """Input for one atomic payment distributed across a client's debts."""
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    date = serializers.DateField(required=False)
+    idempotency_key = serializers.UUIDField(required=True)
+    note = serializers.CharField(required=False, allow_blank=True)
+    payment_method = serializers.CharField(required=False, allow_blank=True, allow_null=True, default="cash")
+    cashbox_id = serializers.UUIDField(required=False, allow_null=True)
+    branch_id = serializers.UUIDField(required=False, allow_null=True)
+    cashbox_role = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    shift_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate_date(self, value):
+        if value and value > timezone.localdate():
+            raise serializers.ValidationError("Дата оплаты не может быть в будущем.")
+        return value
 
 
 class DealRefundInputSerializer(serializers.Serializer):
@@ -2437,6 +2698,7 @@ class DealRefundInputSerializer(serializers.Serializer):
     date = serializers.DateField(required=False)
     idempotency_key = serializers.UUIDField(required=True)
     note = serializers.CharField(required=False, allow_blank=True)
+    payment_method = serializers.CharField(required=False, allow_blank=True, allow_null=True, default="cash")
 
 # ===========================
 # TransactionRecord
@@ -2527,6 +2789,7 @@ class DebtSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
             "name", "phone", "amount", "due_date",
             "paid_total", "balance",
             "cashflows",
+            "payment_method",
             "created_at", "updated_at",
         ]
         read_only_fields = ["id", "company", "branch", "paid_total", "balance", "cashflows", "created_at", "updated_at"]
@@ -2561,7 +2824,7 @@ class DebtPaymentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = DebtPayment
-        fields = ["id", "company", "branch", "debt", "amount", "paid_at", "note", "created_at"]
+        fields = ["id", "company", "branch", "debt", "amount", "paid_at", "note", "payment_method", "created_at"]
         read_only_fields = ["id", "company", "branch", "debt", "created_at"]
 
     def create(self, validated_data):
@@ -2577,8 +2840,9 @@ class DebtPaymentSerializer(serializers.ModelSerializer):
         amount = validated_data["amount"]
         paid_at = validated_data.get("paid_at")
         note = validated_data.get("note", "")
+        pm = validated_data.get("payment_method", "cash")
 
-        return debt.add_payment(amount=amount, paid_at=paid_at, note=note)
+        return debt.add_payment(amount=amount, paid_at=paid_at, note=note, payment_method=pm)
 
 # ===========================
 # ObjectItem / ObjectSale / ObjectSaleItem
@@ -2656,6 +2920,7 @@ class ProductNestedSerializer(serializers.ModelSerializer):
 class ProductListSerializer(serializers.ModelSerializer):
     image_url = serializers.SerializerMethodField()
     is_favorite = serializers.BooleanField(read_only=True)
+    shelf_life_days = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = Product
@@ -2664,7 +2929,10 @@ class ProductListSerializer(serializers.ModelSerializer):
             "price", "wholesale_price", "purchase_price",
             "quantity", "brand", "category",
             "hotkey_group",
+            "upsell_priority", "upsell_excluded",
             "image_url", "is_favorite",
+            "expiration_date",
+            "shelf_life_days",
         ]
 
     def get_image_url(self, obj):
@@ -3182,6 +3450,26 @@ class SupplierReceiptItemSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
     )
+    price = serializers.DecimalField(
+        max_digits=11,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+    )
+    selling_price = serializers.DecimalField(
+        max_digits=11,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+    )
+    # ТЗ Н-04: пересчитать цену продажи от новой закупки по текущей наценке.
+    recalc_price = serializers.BooleanField(required=False, default=False)
+    # ТЗ Н-27: приход по варианту (размер/цвет): всё количество строки — в этот вариант;
+    # либо раскладка variants=[{variant, qty}], сумма которой должна равняться qty строки.
+    variant = serializers.UUIDField(required=False, allow_null=True)
+    variants = serializers.ListField(
+        child=serializers.DictField(), required=False, allow_empty=True
+    )
 
 
 class SupplierReceiptCreateSerializer(serializers.Serializer):
@@ -3239,11 +3527,21 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
     returned_amount = serializers.SerializerMethodField()
     returned_qty = serializers.SerializerMethodField()
     has_returns = serializers.SerializerMethodField()
+    # ТЗ Н-10: способ оплаты прихода (выводится из сделки/расхода/журнала закупок)
+    payment_type = serializers.SerializerMethodField()
+    paid_amount = serializers.SerializerMethodField()
+    debt_amount = serializers.SerializerMethodField()
+    deal_id = serializers.SerializerMethodField()
+    cashbox = serializers.SerializerMethodField()
+    cashbox_name = serializers.SerializerMethodField()
+    shift = serializers.SerializerMethodField()
+    order_id = serializers.UUIDField(read_only=True, allow_null=True)  # ТЗ Н-29
 
     class Meta:
         model = SupplierReceipt
         fields = [
             "id",
+            "order_id",
             "company",
             "branch",
             "supplier_id",
@@ -3258,8 +3556,49 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
             "returned_amount",
             "returned_qty",
             "has_returns",
+            "payment_type",
+            "paid_amount",
+            "debt_amount",
+            "deal_id",
+            "cashbox",
+            "cashbox_name",
+            "shift",
+            "discount",  # ТЗ Н-33
+            "discount_percent",
+            "extra_costs",
             "items",
         ]
+
+    def _pay_info(self, obj):
+        from apps.main.views import _receipt_payment_info
+        cache = self.context.get("receipt_info")
+        if cache is None:
+            cache = self.context["receipt_info"] = {}
+        key = str(obj.id)
+        if key not in cache:
+            cache.update(_receipt_payment_info([obj]))
+        return cache.get(key) or {}
+
+    def get_payment_type(self, obj):
+        return self._pay_info(obj).get("payment_type")
+
+    def get_paid_amount(self, obj):
+        return self._pay_info(obj).get("paid_amount")
+
+    def get_debt_amount(self, obj):
+        return self._pay_info(obj).get("debt_amount")
+
+    def get_deal_id(self, obj):
+        return self._pay_info(obj).get("deal_id")
+
+    def get_cashbox(self, obj):
+        return self._pay_info(obj).get("cashbox")
+
+    def get_cashbox_name(self, obj):
+        return self._pay_info(obj).get("cashbox_name")
+
+    def get_shift(self, obj):
+        return self._pay_info(obj).get("shift")
 
     def get_created_by_name(self, obj):
         u = obj.created_by
@@ -3401,6 +3740,27 @@ class SupplierReturnCreateSerializer(serializers.Serializer):
         if reason == SupplierReturn.Reason.OTHER and not comment:
             raise serializers.ValidationError({"comment": "Укажите комментарий при выборе причины 'Другое'."})
         return attrs
+
+
+class ProductExpiryBatchSerializer(serializers.ModelSerializer):
+    days_left = serializers.SerializerMethodField()
+    supplier_name = serializers.SerializerMethodField()
+    created_by_name = serializers.CharField(source="created_by.get_full_name", read_only=True)
+
+    class Meta:
+        model = ProductExpiryBatch
+        fields = ["id", "quantity", "remaining_quantity", "received_at", "expires_at", "days_left", "status", "source_kind", "source_id", "supplier_name", "created_by_name"]
+
+    def get_days_left(self, obj):
+        return (obj.expires_at - timezone.localdate()).days if obj.expires_at else None
+
+    def get_supplier_name(self, obj):
+        if obj.source_kind != "purchase" or not obj.source_id:
+            return None
+        try:
+            return SupplierReceipt.objects.select_related("supplier").get(id=obj.source_id).supplier.full_name
+        except (SupplierReceipt.DoesNotExist, ValueError):
+            return None
 
 
 class ProductPurchaseBatchSerializer(serializers.ModelSerializer):
@@ -4121,7 +4481,11 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
 
 class MarketSaleEmployeePayProfileSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
-    branch = serializers.ReadOnlyField(source="branch.id")
+    # ТЗ 12.21: branch можно передать явно (null = схема для всех филиалов) и он всегда возвращается.
+    # Не передан -> как раньше: активный филиал запроса или null.
+    branch = serializers.PrimaryKeyRelatedField(
+        queryset=Branch.objects.all(), required=False, allow_null=True
+    )
 
     class Meta:
         model = MarketSaleEmployeePayProfile
@@ -4133,6 +4497,7 @@ class MarketSaleEmployeePayProfileSerializer(CompanyBranchReadOnlyMixin, seriali
             "pay_scheme",
             "monthly_base_salary",
             "sales_percent",
+            "per_item_amount",
         ]
         read_only_fields = ["id", "company"]
 
@@ -4141,7 +4506,23 @@ class MarketSaleEmployeePayProfileSerializer(CompanyBranchReadOnlyMixin, seriali
         company = self._user_company()
         if company and hasattr(User, "company_id"):
             fields["user"].queryset = User.objects.filter(company_id=company.id)
+        if company and "branch" in fields:
+            fields["branch"].queryset = Branch.objects.filter(company_id=company.id)
         return fields
+
+    def create(self, validated_data):
+        company = self._user_company()
+        if company:
+            validated_data["company"] = company
+        if "branch" not in validated_data:
+            validated_data["branch"] = self._auto_branch()
+        return serializers.ModelSerializer.create(self, validated_data)
+
+    def update(self, instance, validated_data):
+        company = self._user_company()
+        if company:
+            validated_data["company"] = company
+        return serializers.ModelSerializer.update(self, instance, validated_data)
 
     def validate(self, attrs):
         data = super().validate(attrs)
@@ -4171,6 +4552,20 @@ class MarketSaleEmployeePayProfileSerializer(CompanyBranchReadOnlyMixin, seriali
                 raise serializers.ValidationError(
                     "Для схемы «Оклад + процент» задайте и оклад, и процент больше 0."
                 )
+        # ТЗ ч.13, 3: схемы «за проданный товар»
+        per_item = data.get("per_item_amount")
+        if per_item is None and self.instance:
+            per_item = self.instance.per_item_amount
+        per_item = per_item or Decimal("0")
+        PS = MarketSaleEmployeePayProfile.PayScheme
+        if scheme in (PS.PER_ITEM, PS.SALARY_PLUS_PER_ITEM, PS.PERCENT_PLUS_PER_ITEM) and per_item <= 0:
+            raise serializers.ValidationError(
+                {"per_item_amount": "Для этой схемы укажите сумму за проданный товар больше 0."}
+            )
+        if scheme == PS.SALARY_PLUS_PER_ITEM and base <= 0:
+            raise serializers.ValidationError({"monthly_base_salary": "Укажите оклад больше 0."})
+        if scheme == PS.PERCENT_PLUS_PER_ITEM and pct <= 0:
+            raise serializers.ValidationError({"sales_percent": "Укажите процент больше 0."})
         return data
 
 
@@ -4260,3 +4655,57 @@ class PosPrinterSettingSerializer(CompanyBranchReadOnlyMixin, serializers.ModelS
             "updated_at",
         )
         read_only_fields = ("id", "company", "created_at", "updated_at")
+
+
+class MarketCustomerDisplaySettingsSerializer(serializers.ModelSerializer):
+    enabled = serializers.BooleanField(
+        required=False,
+        error_messages={"invalid": "Must be a valid boolean."}
+    )
+    theme = serializers.ChoiceField(
+        choices=["dark", "light"],
+        required=False,
+        error_messages={"invalid_choice": "Допустимы dark или light"}
+    )
+    welcome_text = serializers.CharField(
+        max_length=200,
+        allow_blank=True,
+        allow_null=True,
+        required=False,
+        error_messages={"max_length": "Слишком длинный текст"}
+    )
+    slides = serializers.JSONField(required=False)
+
+    class Meta:
+        model = MarketCustomerDisplaySettings
+        fields = ("enabled", "welcome_text", "theme", "slides")
+
+    def validate_welcome_text(self, value):
+        if value is None:
+            return ""
+        return value
+
+    def validate_slides(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Каждый слайд должен содержать imageUrl")
+        clean_slides = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise serializers.ValidationError("Каждый слайд должен содержать imageUrl")
+            img = item.get("imageUrl")
+            if not isinstance(img, str) or not img.strip():
+                raise serializers.ValidationError("Каждый слайд должен содержать imageUrl")
+            clean_item = dict(item)
+            clean_item["imageUrl"] = img.strip()
+            if "caption" in clean_item and clean_item["caption"] is not None:
+                clean_item["caption"] = str(clean_item["caption"])
+            clean_slides.append(clean_item)
+        return clean_slides
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if ret.get("slides") is None:
+            ret["slides"] = []
+        if ret.get("welcome_text") is None:
+            ret["welcome_text"] = ""
+        return ret

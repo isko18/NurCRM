@@ -149,7 +149,7 @@ def outbound_bookkeeping(wa_message_id, user_id=None, channel_id=""):
 
 
 @shared_task(bind=True, acks_late=True, max_retries=3, default_retry_delay=5)
-def send_wazzup_message(self, wa_message_id, account_id, text, content_uri):
+def send_wazzup_message(self, wa_message_id, account_id, text, content_uri, media_type="", content_type=""):
     """Реальная отправка исходящего сообщения в Wazzup API вне HTTP-запроса.
 
     Гарантии:
@@ -187,7 +187,10 @@ def send_wazzup_message(self, wa_message_id, account_id, text, content_uri):
 
     def _finalize(status):
         wa_message.status = status
-        wa_message.save(update_fields=["message_id", "status"])
+        update_fields = ["message_id", "status"]
+        if hasattr(wa_message, "provider"):
+            update_fields.append("provider")
+        wa_message.save(update_fields=update_fields)
         cid = account.company_id if account else wa_message.company_id
         try:
             _broadcast_message_status(cid, wa_message, clean_phone)
@@ -199,66 +202,128 @@ def send_wazzup_message(self, wa_message_id, account_id, text, content_uri):
             except Exception:
                 pass
 
+    def _try_green_api_fallback(reason_str=""):
+        """Попытка резервной отправки через GREEN-API, если Wazzup не сработал."""
+        if not account or not getattr(account, "green_api_enabled", True):
+            logger.info("GreenAPI fallback skipped: disabled for account %s", account_id)
+            _finalize(S.FAILED)
+            return False
+
+        id_inst = (getattr(account, "green_api_id_instance", "") or "").strip()
+        tok_inst = (getattr(account, "green_api_token_instance", "") or "").strip()
+        if not id_inst or not tok_inst:
+            logger.warning("GreenAPI fallback skipped: credentials unconfigured for account %s", account_id)
+            _finalize(S.FAILED)
+            return False
+
+        base_url = (getattr(account, "green_api_url", "") or "https://api.greenapi.com").rstrip('/')
+        media_base_url = (getattr(account, "green_api_media_url", "") or base_url).rstrip('/')
+
+        formatted_phone = clean_phone
+        if not formatted_phone.endswith('@c.us') and not formatted_phone.endswith('@g.us'):
+            if formatted_phone.startswith('0') and len(formatted_phone) == 10:
+                formatted_phone = '996' + formatted_phone[1:]
+            elif len(formatted_phone) == 9:
+                formatted_phone = '996' + formatted_phone
+            chat_id = f"{formatted_phone}@c.us"
+        else:
+            chat_id = formatted_phone
+
+        logger.info(
+            "Attempting GreenAPI fallback for msg %s (reason: %s, instance: %s)",
+            wa_message_id, reason_str, id_inst
+        )
+
+        try:
+            if content_uri:
+                g_url = f"{media_base_url}/waInstance{id_inst}/sendFileByUrl/{tok_inst}"
+                filename = content_uri.split("/")[-1].split("?")[0] or "file"
+                g_payload = {
+                    "chatId": chat_id,
+                    "urlFile": content_uri,
+                    "fileName": filename,
+                }
+                if body:
+                    g_payload["caption"] = body
+            else:
+                g_url = f"{base_url}/waInstance{id_inst}/sendMessage/{tok_inst}"
+                g_payload = {
+                    "chatId": chat_id,
+                    "message": body,
+                }
+
+            g_res = requests.post(g_url, json=g_payload, timeout=12.0)
+            if g_res.status_code == 200:
+                g_data = g_res.json() if g_res.content else {}
+                id_msg = g_data.get("idMessage") or g_data.get("id")
+                if id_msg:
+                    wa_message.message_id = str(id_msg)
+                if hasattr(wa_message, "provider"):
+                    wa_message.provider = "greenapi"
+                logger.info("GreenAPI fallback SUCCESS for msg %s: idMessage=%s", wa_message_id, id_msg)
+                _finalize(S.SENT)
+                return True
+            else:
+                logger.error("GreenAPI fallback HTTP %s for msg %s: %s", g_res.status_code, wa_message_id, g_res.text)
+                _finalize(S.FAILED)
+                return False
+        except Exception as ge:
+            logger.error("GreenAPI fallback exception for msg %s: %s", wa_message_id, ge)
+            _finalize(S.FAILED)
+            return False
+
     # Предусловия: без аккаунта/телефона/содержимого отправить нельзя → FAILED
     body = (text or "").strip()
-    if not account or not getattr(account, "api_url", None) or not clean_phone:
-        logger.error("send_wazzup_message: bad preconditions (account/phone) for %s → FAILED", wa_message_id)
-        _finalize(S.FAILED)
-        return
-    if not body and not content_uri:
-        logger.error("send_wazzup_message: empty text and no media for %s → FAILED", wa_message_id)
+    if not clean_phone or (not body and not content_uri):
+        logger.error("send_wazzup_message: bad preconditions (phone/body) for %s → FAILED", wa_message_id)
         _finalize(S.FAILED)
         return
 
-    api_payload = {
-        "channelId": account.channel_id,
-        "chatId": clean_phone,
-        "chatType": account.integration_type,
-    }
-    if body:
-        api_payload["text"] = body
-    if content_uri:
-        api_payload["contentUri"] = content_uri
+    # Пробуем Wazzup если api_url и api_key присутствуют
+    wazzup_ok = False
+    if account and getattr(account, "api_url", None) and getattr(account, "api_key", None):
+        api_payload = {
+            "channelId": account.channel_id,
+            "chatId": clean_phone,
+            "chatType": account.integration_type,
+        }
+        # Wazzup v3 explicitly rejects requests containing both text and
+        # contentUri.  A media caption is persisted in CRM but is not part of
+        # this API request.
+        if body and not content_uri:
+            api_payload["text"] = body
+        if content_uri:
+            api_payload["contentUri"] = content_uri
+        api_payload["crmMessageId"] = str(wa_message.id)
 
-    url = f"{account.api_url.rstrip('/')}/v3/message"
-    headers = {
-        "Authorization": f"Bearer {account.api_key}",
-        "Content-Type": "application/json",
-    }
+        url = f"{account.api_url.rstrip('/')}/v3/message"
+        headers = {
+            "Authorization": f"Bearer {account.api_key}",
+            "Content-Type": "application/json",
+        }
 
-    try:
-        res = requests.post(url, json=api_payload, headers=headers, timeout=10.0)
-    except requests.RequestException as e:
         try:
-            raise self.retry(exc=e)
-        except self.MaxRetriesExceededError:
-            logger.error("send_wazzup_message: network failure (final) for %s: %s", wa_message_id, e)
-            _finalize(S.FAILED)
-            return
-
-    if res.status_code in (200, 201):
-        try:
-            data = res.json() if res.content else {}
-            wz_id = data.get("messageId") or data.get("id")
-            if wz_id:
-                wa_message.message_id = str(wz_id)
+            res = requests.post(url, json=api_payload, headers=headers, timeout=10.0)
+            if res.status_code in (200, 201):
+                data = res.json() if res.content else {}
+                wz_id = data.get("messageId") or data.get("id")
+                if wz_id:
+                    wa_message.message_id = str(wz_id)
+                if hasattr(wa_message, "provider"):
+                    wa_message.provider = "wazzup"
+                _finalize(S.SENT)
+                try:
+                    WazzupConsaltingService.mark_chat_read(account, clean_phone)
+                except Exception as e:
+                    logger.warning("mark_chat_read failed: %s", e)
+                wazzup_ok = True
+            else:
+                logger.warning("Wazzup HTTP %s for msg %s: %s", res.status_code, wa_message_id, res.text)
         except Exception as e:
-            logger.warning("send_wazzup_message: bad 200 body for %s: %s", wa_message_id, e)
-        _finalize(S.SENT)
-        try:
-            WazzupConsaltingService.mark_chat_read(account, clean_phone)
-        except Exception as e:
-            logger.warning("mark_chat_read failed: %s", e)
-    elif res.status_code == 429 or res.status_code >= 500:
-        # Rate limit / временный сбой Wazzup — ретраим, затем FAILED
-        try:
-            raise self.retry(exc=Exception(f"Wazzup {res.status_code}"))
-        except self.MaxRetriesExceededError:
-            logger.error("send_wazzup_message: %s (final) for %s: %s", res.status_code, wa_message_id, res.text)
-            _finalize(S.FAILED)
-    else:
-        logger.error("Wazzup API Error %s for %s: %s", res.status_code, wa_message_id, res.text)
-        _finalize(S.FAILED)
+            logger.warning("Wazzup request failed for msg %s: %s", wa_message_id, e)
+
+    if not wazzup_ok:
+        _try_green_api_fallback(reason_str="Wazzup failed or unconfigured")
 
 
 def _active_open_leads():
@@ -486,11 +551,12 @@ def process_subscription_schedules():
     logger.info("process_subscription_schedules: marked %s payments overdue", overdue_updated)
 
     # 2. Продление подписок (если менее 3 planned периодов)
-    active_subs = SubscriptionConsalting.objects.filter(status=SubscriptionConsalting.Status.ACTIVE)
+    active_subs = SubscriptionConsalting.objects.filter(
+        status=SubscriptionConsalting.Status.ACTIVE, autorenew=True
+    )
     for sub in active_subs:
         planned_cnt = sub.payments.filter(status=SubscriptionPaymentConsalting.Status.PLANNED).count()
         if planned_cnt < 3:
             generate_schedule(sub, horizon_months=12)
 
     return f"Processed subscriptions: {overdue_updated} overdue marked"
-

@@ -13,6 +13,8 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 from pathlib import Path
 from datetime import timedelta
 import os
+from corsheaders.defaults import default_headers
+import sys
 from typing import List
 
 from dotenv import load_dotenv
@@ -49,21 +51,33 @@ def _get_list_env(name: str, default: List[str]) -> List[str]:
 
 
 DEBUG = _get_bool_env("DJANGO_DEBUG", False)
-DEV_ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
+DEV_ALLOWED_HOSTS = ["*"]
 DEV_CORS_ORIGINS = [
+    "https://nurcrm.kg",
+    "https://www.nurcrm.kg",
+    "https://app.nurcrm.kg",
+    "https://www.app.nurcrm.kg",
+    "https://stage.nurcrm.kg",
+    "https://stageapp.nurcrm.kg",
+    "https://stroy.nurcrm.kg",
+    "https://www.stroy.nurcrm.kg",
+    "https://stroyapp.nurcrm.kg",
+    "https://buildos.kg",
+    "https://www.buildos.kg",
+    "https://beshtashta.kg",
+    "https://www.beshtashta.kg",
+    "https://nur-tech.kg",
+    "https://www.nur-tech.kg",
+    "https://app.nur-tech.kg",
+    "https://onec.nurcrm.kg",
     "http://localhost:3000",
     "http://localhost:5173",
+    "http://localhost:5174",
     "http://127.0.0.1:8000",
+    "http://127.0.0.1:5173",
 ]
-DEFAULT_ALLOWED_HOSTS = DEV_ALLOWED_HOSTS if DEBUG else ["nurcrm.kg", "app.nurcrm.kg"]
-DEFAULT_CORS_ORIGINS = (
-    DEV_CORS_ORIGINS
-    if DEBUG
-    else [
-        "https://nurcrm.kg",
-        "https://app.nurcrm.kg",
-    ]
-)
+DEFAULT_ALLOWED_HOSTS = ["*"]
+DEFAULT_CORS_ORIGINS = DEV_CORS_ORIGINS
 
 
 # Quick-start development settings - unsuitable for production
@@ -71,9 +85,13 @@ DEFAULT_CORS_ORIGINS = (
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-dev-only-change-me")
+# Ключ support.nurcrm.kg для конструктора тарифа «По договору» (apps/users/support_views.py). Пусто — выключено.
+NURCRM_SUPPORT_TOKEN = os.getenv("NURCRM_SUPPORT_TOKEN", "")
 
 # SECURITY WARNING: don't run with debug turned on in production!
 ALLOWED_HOSTS = _get_list_env("DJANGO_ALLOWED_HOSTS", DEFAULT_ALLOWED_HOSTS)
+if "testserver" not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append("testserver")
 CSRF_TRUSTED_ORIGINS = _get_list_env("DJANGO_CSRF_TRUSTED_ORIGINS", DEFAULT_CORS_ORIGINS)
 
 
@@ -112,12 +130,21 @@ INSTALLED_APPS = [
     'apps.ekassa',
     'apps.onec',
     'apps.releases',
+    'apps.possync',
+    'apps.integrations',
+    'apps.support',
+    'apps.clientapp',
+    'apps.inbox',  # ТЗ 26.10 Б-73…Б-87
     # 'apps.crm',
 ]
 
 MIDDLEWARE = [
-    'django.middleware.security.SecurityMiddleware',
     'corsheaders.middleware.CorsMiddleware',
+    # ТЗ-28 §2.4: сжатие JSON > 200 байт (каталог 10 000 товаров ~12 МБ → ~1,5 МБ).
+    'django.middleware.gzip.GZipMiddleware',
+    # ТЗ-28 §11.2–11.4: X-Request-Id, X-Server-Time, журнал медленных запросов.
+    'core.middleware.RequestMetaMiddleware',
+    'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -157,16 +184,26 @@ ASGI_APPLICATION = "core.asgi.application"
 #         'NAME': BASE_DIR / 'db.sqlite3',
 #     }
 # }
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'nurcrm2',
-        'USER': 'nuruser',
-        'PASSWORD': 'nurpass2025',
-        'HOST': '127.0.0.1',
-        'PORT': '5432',
+if os.environ.get('USE_SQLITE') == '1':
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'test_db.sqlite3',
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': os.environ.get('DB_NAME', 'nurcrm2'),
+            'USER': os.environ.get('DB_USER', 'nuruser'),
+            'PASSWORD': os.environ.get('DB_PASSWORD', ''),
+            'HOST': os.environ.get('DB_HOST', '127.0.0.1'),
+            'PORT': os.environ.get('DB_PORT', '6432'),
+            'CONN_MAX_AGE': 0,
+        }
+    }
+
 
 
 
@@ -242,9 +279,14 @@ CLIENT_ZIP_URL = os.getenv(
 )
 CLIENT_RELEASE_NOTES = os.getenv("CLIENT_RELEASE_NOTES", "Первый релиз")
 
+# ТЗ-28 §11.4: порог журнала медленных запросов, мс
+SLOW_REQUEST_MS = _get_int_env("SLOW_REQUEST_MS", 1000)
+
 REST_FRAMEWORK = {
+    'EXCEPTION_HANDLER': 'core.exceptions.api_exception_handler',
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'apps.integrations.authentication.ApiKeyAuthentication',
     ),
     'DEFAULT_THROTTLE_CLASSES': [
         'rest_framework.throttling.AnonRateThrottle',
@@ -303,11 +345,24 @@ SIMPLE_JWT = {
 # ВАЖНО: у каждого окружения ДОЛЖЕН быть свой broker (отдельная Redis-БД).
 # Prod/staging/onec раньше делили db0 и одну очередь `celery` — задачи
 # раздавались по кругу воркерам разных кодовых баз, которые их не знают, и
-# терялись ~50% (pending навсегда, сообщения не отправлялись). Задаётся через env.
-CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', os.getenv('REDIS_URL', 'redis://127.0.0.1:6379/1'))
 CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', CELERY_BROKER_URL)
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
+
+CELERY_IMPORTS = (
+    'apps.main.tasks',
+    'apps.main.telegram_bot.tasks',
+    'apps.main.recommendations_tasks',
+    'apps.main.rentals_tasks',
+    'apps.consalting.tasks',
+    'apps.construction.tasks',
+    'apps.integrations.tasks',
+    'apps.onec.tasks',
+    'apps.instagram.tasks',
+    'apps.support.tasks',
+    'apps.clientapp.tasks',
+)
 
 # Строгий режим машины состояний воронки консалтинга.
 # False (по умолчанию) — недопустимые переходы выполняются, но логируются.
@@ -318,6 +373,46 @@ CONSALTING_FUNNEL_STRICT = False
 from celery.schedules import crontab  # noqa: E402
 
 CELERY_BEAT_SCHEDULE = {
+    'support-daily-digest': {
+        'task': 'apps.support.tasks.send_daily_support_digest',
+        'schedule': crontab(hour=9, minute=0),
+    },
+    'support-process-pending': {
+        'task': 'apps.support.tasks.process_pending_reports',
+        'schedule': crontab(minute='*/2'),
+    },
+    'support-new-version-check': {
+        'task': 'apps.support.tasks.check_new_version_regressions',
+        'schedule': crontab(minute='*/10'),
+    },
+    'support-cleanup': {
+        'task': 'apps.support.tasks.cleanup_support_data',
+        'schedule': crontab(hour=4, minute=10),
+    },
+    'telegram-check-server-bots-webhooks': {
+        'task': 'apps.main.telegram_bot.tasks.check_server_bots_webhooks',
+        'schedule': crontab(minute=15),
+    },
+    'telegram-monitor-bot-queue': {
+        'task': 'apps.main.telegram_bot.tasks.monitor_bot_queue',
+        'schedule': crontab(minute='*'),
+    },
+    'recommendations-dispatch-pairs': {
+        'task': 'apps.main.recommendations_tasks.dispatch_recommendation_pairs',
+        'schedule': crontab(hour=0, minute=0),
+    },
+    'recommendations-purge-old-events': {
+        'task': 'apps.main.recommendations_tasks.purge_old_recommendation_events',
+        'schedule': crontab(hour=6, minute=30),
+    },
+    'rentals-send-overdue-notifications': {
+        'task': 'apps.main.rentals_tasks.send_overdue_rentals_notifications',
+        'schedule': crontab(hour=8, minute=0),
+    },
+    'rentals-purge-old-documents': {
+        'task': 'apps.main.rentals_tasks.purge_rental_documents_30_days',
+        'schedule': crontab(hour=3, minute=45),
+    },
     'consalting-scan-no-activity': {
         'task': 'apps.consalting.tasks.scan_no_activity',
         'schedule': crontab(minute='*/30'),
@@ -341,6 +436,11 @@ CELERY_BEAT_SCHEDULE = {
     # Ежедневная полная синхронизация каталога товаров с внешней системой.
     # Досылает все товары (product.updated), логирует товары без фото.
     # Запускается каждые 2 дня в 03:00 по Asia/Bishkek.
+    # Ключи идемпотентности кассы старше 7 суток (BE2-11).
+    'integrations-purge-idempotency-records': {
+        'task': 'apps.integrations.tasks.purge_idempotency_records',
+        'schedule': crontab(hour=4, minute=30),
+    },
     'main-catalog-webhook-sync': {
         'task': 'apps.main.tasks.catalog_webhook_sync',
         'schedule': crontab(hour=3, minute=0, day_of_month='*/2'),
@@ -351,7 +451,44 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'apps.construction.tasks.auto_close_stale_shifts',
         'schedule': crontab(minute=0),
     },
+    # Ежедневный дайджест товаров с истекающим/истёкшим сроком годности (08:00 Asia/Bishkek).
+    'main-product-expiry-digest': {
+        'task': 'apps.main.tasks.product_expiry_digest',
+        'schedule': crontab(hour=8, minute=0),
+    },
+    # Тарифные уведомления за 7/3/1 день до окончания подписки (09:00 Asia/Bishkek).
+    'main-send-tariff-notifications': {
+        'task': 'apps.main.tasks.send_tariff_notifications',
+        'schedule': crontab(hour=9, minute=0),
+    },
+    # Приложение клиентов: координаты магазинов по адресу (Nominatim, ≤1 запроса/с).
+    'clientapp-geocode-missing-shops': {
+        'task': 'apps.clientapp.tasks.geocode_missing_shops',
+        'schedule': crontab(minute='*/30'),
+    },
+    # Приложение клиентов: истёкшие входы через Telegram и QR-токены.
+    'clientapp-cleanup': {
+        'task': 'apps.clientapp.tasks.cleanup_client_app',
+        'schedule': crontab(hour=4, minute=40),
+    },
+    # Склад: ежедневный контроль остатков (карточка/регистр/Σ движений), только лог и алерт.
+    'warehouse-check-stock-consistency': {
+        'task': 'apps.warehouse.tasks.check_stock_consistency',
+        'schedule': crontab(hour=5, minute=20),
+    },
 }
+
+# ===========================
+# Приложение клиентов (/api/v1/)
+# ===========================
+# Отдельный бот входа (создать в @BotFather). Без токена/username вход отвечает 503 auth_unavailable.
+CLIENT_APP_TELEGRAM_BOT_TOKEN = os.getenv('CLIENT_APP_TELEGRAM_BOT_TOKEN', '')
+CLIENT_APP_TELEGRAM_WEBHOOK_SECRET = os.getenv('CLIENT_APP_TELEGRAM_WEBHOOK_SECRET', '')
+CLIENT_APP_BOT_USERNAME = os.getenv('CLIENT_APP_BOT_USERNAME', '')
+CLIENT_APP_QR_TTL_SECONDS = _get_int_env('CLIENT_APP_QR_TTL_SECONDS', 300)
+CLIENT_APP_REFERRAL_WINDOW_DAYS = _get_int_env('CLIENT_APP_REFERRAL_WINDOW_DAYS', 7)
+CLIENT_APP_REFERRAL_LINK_BASE = os.getenv('CLIENT_APP_REFERRAL_LINK_BASE', 'https://app.nurcrm.kg/r/')
+NOMINATIM_USER_AGENT = os.getenv('NOMINATIM_USER_AGENT', 'NurCRM-ClientApp/1.0 (+https://app.nurcrm.kg)')
 
 # ===========================
 # Кэширование (Redis)
@@ -390,10 +527,20 @@ CACHE_TIMEOUT_LONG = 3600  # 1 час - для статических данны
 CACHE_TIMEOUT_ANALYTICS = 600  # 10 минут - для аналитики агентов
 
 
-CORS_ORIGIN_ALLOW_ALL = _get_bool_env('CORS_ALLOW_ALL', False)
+CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_HEADERS = True
+CORS_ORIGIN_ALLOW_ALL = True
 CORS_ALLOW_CREDENTIALS = _get_bool_env('CORS_ALLOW_CREDENTIALS', True)
 
 CORS_ALLOWED_ORIGINS = _get_list_env('CORS_ALLOWED_ORIGINS', DEFAULT_CORS_ORIGINS)
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^https://.*\.nurcrm\.kg$",
+    r"^https://.*\.buildos\.kg$",
+    r"^https://.*\.beshtashta\.kg$",
+    r"^https://.*\.nur-tech\.kg$",
+    r"^http://localhost:\d+$",
+    r"^http://127\.0\.0\.1:\d+$",
+]
 
 SESSION_COOKIE_SAMESITE = os.getenv('SESSION_COOKIE_SAMESITE', 'Lax' if DEBUG else 'None')
 SESSION_COOKIE_SECURE = _get_bool_env('SESSION_COOKIE_SECURE', not DEBUG)
@@ -401,11 +548,28 @@ SESSION_COOKIE_HTTPONLY = True
 CSRF_COOKIE_SAMESITE = os.getenv('CSRF_COOKIE_SAMESITE', 'Lax' if DEBUG else 'None')
 CSRF_COOKIE_SECURE = _get_bool_env('CSRF_COOKIE_SECURE', not DEBUG)
 
-CORS_ALLOW_HEADERS = (
-    'content-disposition', 'accept-encoding',
-    'content-type', 'accept', 'origin', 'Authorization', 'access-control-allow-methods',
-    'Access-Control-Allow-Origin'
-)
+CORS_ALLOW_ALL_HEADERS = True
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'content-disposition',
+    'accept-encoding',
+    'content-type',
+    'accept',
+    'origin',
+    'authorization',
+    'access-control-allow-methods',
+    'access-control-allow-origin',
+    'x-csrftoken',
+    'x-requested-with',
+    'x-pos-device',
+    'idempotency-key',
+    'sentry-trace',
+    'baggage',
+    'cache-control',
+    'pragma',
+    'sec-ch-ua',
+    'sec-ch-ua-mobile',
+    'sec-ch-ua-platform',
+]
 
 CORS_ALLOW_METHODS = (
     "DELETE",
@@ -416,7 +580,7 @@ CORS_ALLOW_METHODS = (
     "PUT",
 )
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-SECURE_SSL_REDIRECT = _get_bool_env('SECURE_SSL_REDIRECT', not DEBUG)
+SECURE_SSL_REDIRECT = False if 'test' in sys.argv else _get_bool_env('SECURE_SSL_REDIRECT', not DEBUG)
 SECURE_HSTS_SECONDS = _get_int_env('SECURE_HSTS_SECONDS', 0 if DEBUG else 31536000)
 SECURE_HSTS_INCLUDE_SUBDOMAINS = _get_bool_env('SECURE_HSTS_INCLUDE_SUBDOMAINS', not DEBUG)
 SECURE_HSTS_PRELOAD = _get_bool_env('SECURE_HSTS_PRELOAD', not DEBUG)
@@ -466,6 +630,11 @@ LOGGING = {
         },
     },
     'loggers': {
+        'nurcrm.slow_requests': {
+            'handlers': ['console'],
+            'level': 'WARNING',
+            'propagate': False,
+        },
         'nurcrm.websocket.auth': {
             'handlers': ['console'],
             'level': _WS_LOG_LEVEL,
@@ -489,6 +658,17 @@ LOGGING = {
         'apps.cafe.views': {
             'handlers': ['console'],
             'level': _WS_LOG_LEVEL,
+            'propagate': False,
+        },
+        # httpx пишет полный URL запроса на INFO — в нём токены ботов и ключ ИИ.
+        'httpx': {
+            'handlers': ['console'],
+            'level': 'WARNING',
+            'propagate': False,
+        },
+        'httpcore': {
+            'handlers': ['console'],
+            'level': 'WARNING',
             'propagate': False,
         },
     },
@@ -515,3 +695,11 @@ EKASSA_ALLOW_TEST_RECEIPT = _get_bool_env("EKASSA_ALLOW_TEST_RECEIPT", DEBUG)
 WAZZUP_API_URL = os.getenv("WAZZUP_API_URL", "https://api.wazzup24.com")
 WAZZUP_DEFAULT_API_KEY = os.getenv("WAZZUP_DEFAULT_API_KEY", "")
 WAZZUP_DEFAULT_CHANNEL_ID = os.getenv("WAZZUP_DEFAULT_CHANNEL_ID", "")
+
+# Consulting CRM tenant provision default sector (Sector 'Магазин' / 'Маркет')
+CONSULTING_DEFAULT_CRM_SECTOR_ID = os.getenv("CONSULTING_DEFAULT_CRM_SECTOR_ID", "e9f05beb-5e14-4153-b523-4e1600c9b2e0")
+
+
+# ТЗ Н-32: квота медиа-хранилища на компанию (МБ) и шаблон ссылки на электронный чек
+COMPANY_MEDIA_QUOTA_MB = int(os.getenv("COMPANY_MEDIA_QUOTA_MB", "500"))
+RECEIPT_PUBLIC_URL_TEMPLATE = os.getenv("RECEIPT_PUBLIC_URL_TEMPLATE", "https://market.nurcrm.kg/receipt/{token}")

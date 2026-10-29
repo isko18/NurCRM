@@ -101,6 +101,7 @@ def _is_owner_like(user) -> bool:
     - суперюзер
     - staff
     - роль owner или admin
+    - владелец компании (owned_company)
     """
     if getattr(user, "is_superuser", False):
         return True
@@ -109,6 +110,11 @@ def _is_owner_like(user) -> bool:
     role = getattr(user, "role", None)
     if role in ("owner", "admin"):
         return True
+    try:
+        if getattr(user, "owned_company", None) is not None:
+            return True
+    except Exception:
+        pass
     return False
 
 

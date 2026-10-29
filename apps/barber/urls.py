@@ -15,6 +15,7 @@ urlpatterns = [
     path('visits/history/', views.VisitHistoryListView.as_view(), name='visit-history'),
 
     path('appointments/', views.AppointmentListCreateView.as_view(), name='appointment-list'),
+    path('appointments/summary/', views.AppointmentSummaryView.as_view(), name='appointment-summary'),
     path('appointments/<uuid:pk>/', views.AppointmentRetrieveUpdateDestroyView.as_view(), name='appointment-detail'),
     path('appointments/my/', views.MyAppointmentListView.as_view(), name='my-appointment-list'),
     path('appointments/my/<uuid:pk>/', views.MyAppointmentDetailView.as_view(), name='my-appointment-detail'),

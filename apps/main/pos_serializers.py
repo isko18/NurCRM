@@ -3,6 +3,7 @@ from rest_framework import serializers
 
 from apps.construction.models import Cashbox, CashShift
 from .models import (
+    ClientDeal,
     Product,
     Cart,
     CartItem,
@@ -117,6 +118,7 @@ class SaleItemSerializer(serializers.ModelSerializer):
     stock = serializers.SerializerMethodField()
     promotion_rules = serializers.SerializerMethodField()
     line_total = serializers.SerializerMethodField()
+    manual_discount_ignored = serializers.SerializerMethodField()
     display_name = serializers.SerializerMethodField()
     primary_image_url = serializers.SerializerMethodField(read_only=True)
     # Полный массив images[] в POS не нужен: на строке корзины показывается одна
@@ -129,6 +131,8 @@ class SaleItemSerializer(serializers.ModelSerializer):
     sale_package = serializers.UUIDField(source="sale_package_id", read_only=True, allow_null=True)
 
     kind = serializers.CharField(source="product.kind", read_only=True, default="product")
+    variant_size = serializers.CharField(source="variant.size", read_only=True, default=None)
+    variant_color = serializers.CharField(source="variant.color", read_only=True, default=None)
 
     class Meta:
         model = CartItem
@@ -139,17 +143,24 @@ class SaleItemSerializer(serializers.ModelSerializer):
             "is_weight", "is_adult",
             "stock", "promotion_rules",
             "quantity", "unit_price", "line_discount", "line_total",
+            "manual_discount", "discount_source", "promotion_id", "manual_discount_ignored",
             "price_manually_edited",
             "sale_package",
+            "variant", "variant_size", "variant_color",
+            "performer",
             "display_name",
             "primary_image_url",
+            "is_wholesale",
         )
         read_only_fields = (
             "id", "kind", "product_name", "barcode",
+            "variant", "variant_size", "variant_color", "performer",
             "stock", "promotion_rules", "line_total",
+            "manual_discount", "discount_source", "promotion_id", "manual_discount_ignored",
             "price_manually_edited",
             "display_name", "primary_image_url",
             "sale_package",
+            "is_wholesale",
         )
 
     def get_stock(self, obj):
@@ -160,6 +171,10 @@ class SaleItemSerializer(serializers.ModelSerializer):
         return get_attr(get_attr(obj, "product", None), "name", None) or (
             get_attr(obj, "custom_name", "") or ""
         )
+
+    def get_manual_discount_ignored(self, obj):
+        """Ручная скидка кассира не применена, потому что сработала акция (BE2-06)."""
+        return obj.discount_source == "promotion" and (obj.manual_discount or 0) > 0
 
     def get_line_total(self, obj):
         base = Decimal(str(obj.unit_price or 0)) * Decimal(str(obj.quantity or 0))
@@ -296,11 +311,13 @@ class ScanRequestSerializer(serializers.Serializer):
     sale_id = serializers.UUIDField(required=False, allow_null=True)
 
 class AddItemSerializer(serializers.Serializer):
+    variant_id = serializers.UUIDField(required=False, allow_null=True)
     product_id = serializers.UUIDField()
     # ✅ было IntegerField → стало Decimal 3 знака
     quantity = QtyField(required=False, default=Decimal("1.000"))
     unit_price = MoneyField(required=False)
     discount_total = MoneyField(required=False)
+    discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False)
     # Продажа поштучно из пачки: id упаковки ProductPackage (quantity_in_package = шт в пачке)
     sale_package_id = serializers.UUIDField(required=False, allow_null=True)
     # Разрешить продажу "в минус" (игнорировать проверку остатка).
@@ -310,12 +327,21 @@ class AddItemSerializer(serializers.Serializer):
     def validate(self, attrs):
         up = attrs.get("unit_price")
         disc = attrs.get("discount_total")
+        percent = attrs.get("discount_percent")
         qty = attrs.get("quantity", Decimal("1.000"))
 
         if up is not None and up < 0:
             raise serializers.ValidationError({"unit_price": "Должна быть ≥ 0."})
         if disc is not None and disc < 0:
             raise serializers.ValidationError({"discount_total": "Должна быть ≥ 0."})
+        if percent is not None and percent < 0:
+            raise serializers.ValidationError({"discount_percent": "Должна быть ≥ 0."})
+        if percent is not None and percent > 100:
+            raise serializers.ValidationError({"discount_percent": "Не больше 100%."})
+        if disc is not None and percent is not None:
+            raise serializers.ValidationError(
+                "Выберите либо фиксированную скидку (discount_total), либо скидку в процентах (discount_percent)."
+            )
 
         qty = qty3(Decimal(str(qty)))
         if qty <= 0:
@@ -332,14 +358,25 @@ class CartItemPatchSerializer(serializers.Serializer):
     )
     unit_price = MoneyField(required=False)
     discount_total = MoneyField(required=False)
+    discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False)
+    performer = serializers.UUIDField(required=False, allow_null=True)
 
     def validate(self, attrs):
         up = attrs.get("unit_price")
         disc = attrs.get("discount_total")
+        percent = attrs.get("discount_percent")
         if up is not None and up < 0:
             raise serializers.ValidationError({"unit_price": "Должна быть ≥ 0."})
         if disc is not None and disc < 0:
             raise serializers.ValidationError({"discount_total": "Должна быть ≥ 0."})
+        if percent is not None and percent < 0:
+            raise serializers.ValidationError({"discount_percent": "Должна быть ≥ 0."})
+        if percent is not None and percent > 100:
+            raise serializers.ValidationError({"discount_percent": "Не больше 100%."})
+        if disc is not None and percent is not None:
+            raise serializers.ValidationError(
+                "Выберите либо фиксированную скидку (discount_total), либо скидку в процентах (discount_percent)."
+            )
         return attrs
 
 
@@ -374,6 +411,41 @@ class CheckoutPaymentLineSerializer(serializers.Serializer):
     )
     amount = MoneyField()
 
+    def validate_method(self, value):
+        # «Зачёт» ставит только сервер (обмен, выдача заказ-наряда).
+        if value == Sale.PaymentMethod.OFFSET and not self.root.context.get("allow_offset"):
+            raise serializers.ValidationError("Способ оплаты недоступен.")
+        return value
+
+
+def _mixed_split_to_payments(attrs):
+    """
+    payment_method="mixed" + cash_amount/card_amount → строки payments[].
+    None — если разбивку не прислали (старое поведение).
+    """
+    if attrs.get("payment_method") != Sale.PaymentMethod.MIXED:
+        return None
+    cash_amount = attrs.get("cash_amount")
+    card_amount = attrs.get("card_amount")
+    if cash_amount is None and card_amount is None:
+        return None
+    if attrs.get("payments"):
+        raise serializers.ValidationError(
+            "Передайте либо payments[], либо cash_amount/card_amount, но не оба варианта."
+        )
+    cash_amount = cash_amount or Decimal("0.00")
+    card_amount = card_amount or Decimal("0.00")
+    if cash_amount < 0 or card_amount < 0:
+        raise serializers.ValidationError({"cash_amount": "Суммы не могут быть отрицательными."})
+    lines = []
+    if cash_amount > 0:
+        lines.append({"method": Sale.PaymentMethod.CASH, "amount": cash_amount})
+    if card_amount > 0:
+        lines.append({"method": attrs.get("card_method") or Sale.PaymentMethod.TRANSFER, "amount": card_amount})
+    if not lines:
+        raise serializers.ValidationError({"cash_amount": "Укажите суммы смешанной оплаты."})
+    return lines
+
 
 class CheckoutSerializer(serializers.Serializer):
     print_receipt = serializers.BooleanField(default=False)
@@ -389,6 +461,8 @@ class CheckoutSerializer(serializers.Serializer):
 
     # если смены нет — можно передать кассу (или автоподбор)
     cashbox_id = OptionalUUIDField(required=False, allow_null=True)
+    branch_id = OptionalUUIDField(required=False, allow_null=True)
+    cashbox_role = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
     # ✅ НОВОЕ: можно явно указать смену (нужно, когда 2 смены на 1 кассу)
     shift_id = OptionalUUIDField(required=False, allow_null=True)
@@ -399,37 +473,57 @@ class CheckoutSerializer(serializers.Serializer):
         allow_null=True,
     )
     cash_received = MoneyField(required=False, allow_null=True)
+    prepayment = MoneyField(required=False, allow_null=True)
+    prepayment_amount = MoneyField(required=False, allow_null=True)
     payments = CheckoutPaymentLineSerializer(many=True, required=False)
+    # Смешанная оплата одной строкой: payment_method="mixed" + cash_amount + card_amount
+    cash_amount = MoneyField(required=False, allow_null=True)
+    card_amount = MoneyField(required=False, allow_null=True)
+    card_method = serializers.ChoiceField(
+        choices=[
+            c for c in Sale.PaymentMethod.choices
+            if c[0] not in (
+                Sale.PaymentMethod.DEBT, Sale.PaymentMethod.MIXED, Sale.PaymentMethod.CASH, Sale.PaymentMethod.OFFSET
+            )
+        ],
+        required=False,
+        default=Sale.PaymentMethod.TRANSFER,
+    )
 
     # v2 отсрочка (extra-поля для кассы, не ведут к 400)
     schedule_version = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     debt_schedule = serializers.JSONField(required=False, allow_null=True)
+    prepayment_method = serializers.CharField(required=False, allow_null=True, allow_blank=True)
 
-    def _resolve_cashbox(self, cart: Cart, cashbox_id):
-        if not cashbox_id:
-            cb = (
-                Cashbox.objects
-                .filter(company_id=cart.company_id, branch_id=cart.branch_id)
-                .order_by("-created_at")
-                .first()
-                or Cashbox.objects
-                .filter(company_id=cart.company_id, branch__isnull=True)
-                .order_by("-created_at")
-                .first()
-            )
-            if cb:
-                return cb
-            raise serializers.ValidationError({"cashbox_id": "Нет кассы для этого филиала/компании."})
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            # AN-01: Поддержка вложенного объекта payment = { method: ..., received: ..., cash_amount: ..., card_amount: ..., prepayment_method: ... }
+            p = data.get("payment")
+            if isinstance(p, dict):
+                data = data.copy()
+                if "method" in p and "payment_method" not in data:
+                    data["payment_method"] = p["method"]
+                if "received" in p and "cash_received" not in data:
+                    data["cash_received"] = p["received"]
+                if "cash_amount" in p and "cash_amount" not in data:
+                    data["cash_amount"] = p["cash_amount"]
+                if "card_amount" in p and "card_amount" not in data:
+                    data["card_amount"] = p["card_amount"]
+                if "prepayment_method" in p and "prepayment_method" not in data:
+                    data["prepayment_method"] = p["prepayment_method"]
+        return super().to_internal_value(data)
 
-        cb = Cashbox.objects.filter(id=cashbox_id).first()
-        if not cb:
-            raise serializers.ValidationError({"cashbox_id": "Касса не найдена."})
-        if cb.company_id != cart.company_id:
-            raise serializers.ValidationError({"cashbox_id": "Касса другой компании."})
-        if (cb.branch_id or None) != (cart.branch_id or None):
-            raise serializers.ValidationError({"cashbox_id": "Касса другого филиала."})
-
-        return cb
+    def _resolve_cashbox(self, cart: Cart, cashbox_id, branch_id=None, cashbox_role=None):
+        from apps.construction.auto_cashflow import resolve_cashbox
+        ctx = {
+            "cashbox_id": cashbox_id,
+            "branch_id": branch_id or cart.branch_id,
+            "cashbox_role": cashbox_role,
+        }
+        cb = resolve_cashbox(company=cart.company, context=ctx, source_kind="pos_sale", require_cashbox=False)
+        if cb:
+            return cb
+        raise serializers.ValidationError({"cashbox_id": "Нет кассы для этого филиала/компании."})
 
     def _resolve_shift(self, cart: Cart, cashbox: Cashbox, user, shift_id):
         # 1) если shift_id явно передали — валидируем
@@ -474,6 +568,8 @@ class CheckoutSerializer(serializers.Serializer):
         cart = self.context.get("cart")
         if not cart:
             raise serializers.ValidationError("Serializer context должен содержать cart.")
+        if not cart.items.exists():
+            raise serializers.ValidationError({"code": "empty_sale", "detail": "В чеке нет позиций"})
 
         request = self.context.get("request")
         user = getattr(request, "user", None) if request else None
@@ -504,11 +600,24 @@ class CheckoutSerializer(serializers.Serializer):
             if comm_pct < 0 or comm_pct > 100:
                 raise serializers.ValidationError({"consultant_commission_percent": "Процент комиссии должен быть от 0 до 100."})
 
+        if attrs.get("payment_method") == Sale.PaymentMethod.OFFSET:
+            raise serializers.ValidationError({"payment_method": "Способ оплаты недоступен."})
+        split_payments = _mixed_split_to_payments(attrs)
+        if split_payments is not None:
+            attrs["payments"] = split_payments
+            attrs["payment_method"] = None
+
         payments = attrs.get("payments") or []
         cart.recalc()
         sale_total = (cart.total or Decimal("0.00")).quantize(Decimal("0.01"))
+        if sale_total <= Decimal("0.00") and not attrs.get("allow_minus"):
+            raise serializers.ValidationError({"code": "empty_sale", "detail": "Сумма чека должна быть больше нуля."})
         raw = getattr(self, "initial_data", None) or {}
-        payment_method_in_request = "payment_method" in raw and raw.get("payment_method") not in (None, "", "null")
+        payment_method_in_request = (
+            split_payments is None
+            and "payment_method" in raw
+            and raw.get("payment_method") not in (None, "", "null")
+        )
 
         if payments:
             if payment_method_in_request:
@@ -544,19 +653,53 @@ class CheckoutSerializer(serializers.Serializer):
             payment_method = attrs.get("payment_method") or Sale.PaymentMethod.CASH
             cash_received = attrs.get("cash_received")
 
-            if payment_method == Sale.PaymentMethod.DEBT and not attrs.get("client_id"):
-                raise serializers.ValidationError({"client_id": "При продаже в долг выбор клиента обязателен."})
+            if payment_method == Sale.PaymentMethod.DEBT:
+                if not attrs.get("client_id"):
+                    raise serializers.ValidationError({"client_id": "При продаже в долг выбор клиента обязателен."})
+                from apps.main.services_debt import normalize_debt_prepayment_method
 
-            if payment_method == Sale.PaymentMethod.CASH:
-                if cash_received is None:
-                    raise serializers.ValidationError({"cash_received": "Укажите сумму, принятую наличными."})
-                if cash_received < 0:
+                total_prepay = attrs.get("prepayment") or attrs.get("prepayment_amount")
+                if total_prepay is None:
+                    if attrs.get("cash_amount") is not None or attrs.get("card_amount") is not None:
+                        total_prepay = (attrs.get("cash_amount") or Decimal("0.00")) + (attrs.get("card_amount") or Decimal("0.00"))
+                    else:
+                        total_prepay = cash_received or Decimal("0.00")
+
+                if total_prepay < Decimal("0.00"):
                     raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
-            else:
-                if cash_received is None:
+                if total_prepay > sale_total:
+                    raise serializers.ValidationError({"cash_received": "Внесённая сумма не может быть больше суммы чека."})
+
+                raw_prepay_method = attrs.get("prepayment_method")
+                if total_prepay > Decimal("0.00") and raw_prepay_method is not None:
+                    prepay_method = normalize_debt_prepayment_method(raw_prepay_method)
+                else:
+                    prepay_method = "cash"
+
+                attrs["prepayment_method"] = prepay_method
+
+                if prepay_method == "cash":
+                    attrs["cash_amount"] = total_prepay
+                    attrs["card_amount"] = Decimal("0.00")
+                    attrs["cash_received"] = total_prepay
+                    attrs["card_method"] = None
+                else:
+                    attrs["cash_amount"] = Decimal("0.00")
+                    attrs["card_amount"] = total_prepay
                     attrs["cash_received"] = Decimal("0.00")
-                elif cash_received < 0:
-                    raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
+                    attrs["card_method"] = prepay_method
+            else:
+                attrs["prepayment_method"] = None
+                if payment_method == Sale.PaymentMethod.CASH:
+                    if cash_received is None:
+                        raise serializers.ValidationError({"cash_received": "Укажите сумму, принятую наличными."})
+                    if cash_received < 0:
+                        raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
+                else:
+                    if cash_received is None:
+                        attrs["cash_received"] = Decimal("0.00")
+                    elif cash_received < 0:
+                        raise serializers.ValidationError({"cash_received": "Не может быть отрицательной."})
 
         # --- касса/смена ---
         if getattr(cart, "shift_id", None):
@@ -565,7 +708,12 @@ class CheckoutSerializer(serializers.Serializer):
             attrs["shift_id"] = None
             return attrs
 
-        cb = self._resolve_cashbox(cart, attrs.get("cashbox_id"))
+        cb = self._resolve_cashbox(
+            cart,
+            attrs.get("cashbox_id"),
+            branch_id=attrs.get("branch_id"),
+            cashbox_role=attrs.get("cashbox_role"),
+        )
         sh = self._resolve_shift(cart, cb, user, attrs.get("shift_id"))
 
         attrs["cashbox_id"] = cb.id
@@ -580,7 +728,7 @@ class PayDebtSerializer(serializers.Serializer):
     """
 
     payment_method = serializers.ChoiceField(
-        choices=[c for c in Sale.PaymentMethod.choices if c[0] != Sale.PaymentMethod.DEBT],
+        choices=[c for c in Sale.PaymentMethod.choices if c[0] not in (Sale.PaymentMethod.DEBT, Sale.PaymentMethod.OFFSET)],
         required=True,
     )
     cash_received = MoneyField(required=False, allow_null=True)
@@ -643,23 +791,116 @@ class CartItemDeletionLogSerializer(serializers.ModelSerializer):
         return getattr(u, "email", None) or str(getattr(u, "pk", ""))
 
 
+def _sale_payment_split(sale):
+    """(cash_amount, card_amount) по строкам оплаты или полям чека; None, если разбивка неизвестна."""
+    c = getattr(sale, "cash_amount", None)
+    k = getattr(sale, "card_amount", None)
+    if c is not None or k is not None:
+        return str(money(c or Decimal("0.00"))), str(money(k or Decimal("0.00")))
+    if sale.status == Sale.Status.DEBT or sale.payment_method == Sale.PaymentMethod.DEBT:
+        c_amt = sale.cash_received or Decimal("0.00")
+        return str(money(c_amt)), "0.00"
+    lines = sale.payment_lines()
+    if not lines or any(line.method == Sale.PaymentMethod.MIXED for line in lines):
+        if sale.payment_method == Sale.PaymentMethod.CASH:
+            return str(money(sale.total or Decimal("0.00"))), "0.00"
+        return None, None
+    cash = sum((line.amount for line in lines if line.method == Sale.PaymentMethod.CASH), Decimal("0.00"))
+    card = sum((line.amount for line in lines if line.method != Sale.PaymentMethod.CASH and line.method != Sale.PaymentMethod.DEBT), Decimal("0.00"))
+    return str(money(cash)), str(money(card))
+
+
+def _linked_debt_deal(sale):
+    """Сделка-долг, созданная из этой продажи (09). Берёт prefetch deals, если он есть."""
+    for deal in sale.deals.all():
+        if deal.kind == ClientDeal.Kind.DEBT:
+            return deal
+    return None
+
+
+def _sale_debt_amount(sale):
+    """Сколько ещё должны по продаже: по остатку сделки или debt_remaining, если есть; погашенная — 0."""
+    is_debt = sale.status == Sale.Status.DEBT or sale.payment_method == Sale.PaymentMethod.DEBT
+    if not is_debt or sale.status == Sale.Status.PAID:
+        return money(Decimal("0.00"))
+    if getattr(sale, "debt_remaining", None) is not None:
+        return money(sale.debt_remaining)
+    deal = _linked_debt_deal(sale)
+    if deal is not None:
+        remaining = deal.remaining_debt
+    else:
+        remaining = (sale.total or Decimal("0.00")) - (sale.cash_received or Decimal("0.00"))
+    return money(remaining if remaining > Decimal("0.00") else Decimal("0.00"))
+
+
+def _sale_returns_info(sale):
+    """ТЗ Н-07: (сумма возвратов, {sale_item_id: возвращённое кол-во}) по SaleReturn чека.
+    Берём prefetch `returns`, если он есть; кэшируем на объекте продажи."""
+    cached = getattr(sale, "_returns_info_cache", None)
+    if cached is not None:
+        return cached
+    total = Decimal("0.00")
+    per_line = {}
+    for r in sale.returns.all():
+        total += Decimal(str(r.returned_amount or 0))
+        for row in (r.returned_items or []):
+            sid = row.get("sale_item") if isinstance(row, dict) else None
+            if not sid:
+                continue
+            try:
+                per_line[str(sid)] = per_line.get(str(sid), Decimal("0")) + Decimal(str(row.get("qty") or 0))
+            except Exception:
+                continue
+    cached = (money(total), per_line)
+    sale._returns_info_cache = cached
+    return cached
+
+
+def _sale_refunded_total(sale):
+    return str(_sale_returns_info(sale)[0])
+
+
+def _sale_refundable_total(sale):
+    """Сколько ещё можно вернуть деньгами: текущий итог чека (после частичных возвратов
+    `total` уже уменьшен на возвращённое); у отменённого/полностью возвращённого — 0."""
+    if sale.status == Sale.Status.CANCELED:
+        return "0.00"
+    return str(money(max(Decimal(str(sale.total or 0)), Decimal("0.00"))))
+
+
 class SaleListSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField()
     consultant_display = serializers.SerializerMethodField(read_only=True)
     client_name = serializers.CharField(source="client.full_name", read_only=True)
     change = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     first_item_name = serializers.SerializerMethodField(read_only=True)
+    items_preview = serializers.SerializerMethodField(read_only=True)
+    items_count = serializers.SerializerMethodField(read_only=True)
+    matched_item_name = serializers.CharField(read_only=True, allow_null=True)
 
     shift = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox = serializers.PrimaryKeyRelatedField(read_only=True)
     branch = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox_name = serializers.SerializerMethodField(read_only=True)
     debt_amount = serializers.SerializerMethodField(read_only=True)
+    deal_id = serializers.SerializerMethodField(read_only=True)
+    number = serializers.IntegerField(source="doc_number", read_only=True)
+    cash_amount = serializers.SerializerMethodField(read_only=True)
+    card_amount = serializers.SerializerMethodField(read_only=True)
+    paid_now = serializers.SerializerMethodField(read_only=True)
+    debt_initial = serializers.SerializerMethodField(read_only=True)
+    debt_remaining = serializers.SerializerMethodField(read_only=True)
+    refunded_total = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-07
+    refundable_total = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-07
+    debt_paid = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-14
+    prepayment = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-14
+    due_date = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-14
 
     class Meta:
         model = Sale
         fields = (
             "id",
+            "number",
             "branch",
             "status",
             "subtotal",
@@ -683,8 +924,63 @@ class SaleListSerializer(serializers.ModelSerializer):
             "cashbox",
             "cashbox_name",
             "first_item_name",
+            "items_preview",
+            "items_count",
+            "matched_item_name",
             "debt_amount",
+            "deal_id",
+            "cash_amount",
+            "card_amount",
+            "paid_now",
+            "debt_initial",
+            "debt_remaining",
+            "refunded_total",
+            "refundable_total",
+            "debt_paid",
+            "prepayment",
+            "due_date",
         )
+
+    def get_debt_paid(self, obj):
+        """ТЗ Н-14: сколько долга уже погашено = debt_initial − debt_remaining."""
+        paid = Decimal(str(obj.debt_initial or 0)) - Decimal(str(obj.debt_remaining or 0))
+        return str(money(max(paid, Decimal("0.00"))))
+
+    def get_prepayment(self, obj):
+        """ТЗ Н-14: предоплата при оформлении (= paid_now)."""
+        return str(money(obj.paid_now or Decimal("0.00")))
+
+    def get_due_date(self, obj):
+        """ТЗ Н-14: срок ближайшего непогашенного взноса связанной долговой сделки."""
+        deal = _linked_debt_deal(obj)
+        if deal is None:
+            return None
+        dues = [
+            i.due_date for i in deal.installments.all()
+            if i.due_date and (i.paid_amount or 0) < (i.amount or 0)
+        ]
+        return min(dues).isoformat() if dues else None
+
+    def get_refunded_total(self, obj):
+        return _sale_refunded_total(obj)
+
+    def get_refundable_total(self, obj):
+        return _sale_refundable_total(obj)
+
+    def get_paid_now(self, obj):
+        return str(money(obj.paid_now or Decimal("0.00")))
+
+    def get_debt_initial(self, obj):
+        return str(money(obj.debt_initial or Decimal("0.00")))
+
+    def get_debt_remaining(self, obj):
+        return str(money(obj.debt_remaining or Decimal("0.00")))
+
+    def get_cash_amount(self, obj):
+        return _sale_payment_split(obj)[0]
+
+    def get_card_amount(self, obj):
+        return _sale_payment_split(obj)[1]
 
     def get_user_display(self, obj):
         u = obj.user
@@ -708,10 +1004,19 @@ class SaleListSerializer(serializers.ModelSerializer):
         )
 
     def get_first_item_name(self, obj):
-        item = obj.items.first()
-        if not item:
+        # items предзагружены (prefetch) — без запроса на каждую строку списка;
+        # порядок как у .first() (по pk), чтобы «первая позиция» была стабильной.
+        items = list(obj.items.all())
+        if not items:
             return None
+        item = min(items, key=lambda i: str(i.id))
         return (item.name_snapshot or "").strip() or getattr(getattr(item, "product", None), "name", None)
+
+    def get_items_preview(self, obj):
+        return self.get_first_item_name(obj)
+
+    def get_items_count(self, obj):
+        return len(obj.items.all())
 
     def get_cashbox_name(self, obj):
         cb = getattr(obj, "cashbox", None)
@@ -722,25 +1027,33 @@ class SaleListSerializer(serializers.ModelSerializer):
         return cb.name or "Касса компании"
 
     def get_debt_amount(self, obj):
-        is_debt = (
-            obj.status == Sale.Status.DEBT
-            or obj.payment_method == Sale.PaymentMethod.DEBT
-        )
-        if not is_debt:
-            return money(Decimal("0.00"))
-        remaining = (obj.total or Decimal("0.00")) - (obj.cash_received or Decimal("0.00"))
-        return money(remaining if remaining > Decimal("0.00") else Decimal("0.00"))
+        return _sale_debt_amount(obj)
+
+    def get_deal_id(self, obj):
+        deal = _linked_debt_deal(obj)
+        return str(deal.id) if deal else None
 
 
 class SaleItemReadSerializer(serializers.ModelSerializer):
+    variant_size = serializers.CharField(source="variant.size", read_only=True, default=None)
+    variant_color = serializers.CharField(source="variant.color", read_only=True, default=None)
     product_name = serializers.SerializerMethodField()
     kind = serializers.CharField(source="product.kind", read_only=True, default="product")
     line_total = serializers.SerializerMethodField()
+    manual_discount_ignored = serializers.SerializerMethodField()
     item_id = serializers.UUIDField(source="id", read_only=True)
     line_id = serializers.UUIDField(source="id", read_only=True)
     sale_item_id = serializers.UUIDField(source="id", read_only=True)
     price_manually_edited = serializers.BooleanField(read_only=True)
     price_override_reason = serializers.SerializerMethodField()
+    returnable_qty = serializers.SerializerMethodField()
+    quantity_refunded = serializers.SerializerMethodField()  # ТЗ Н-07
+
+    is_custom = serializers.BooleanField(read_only=True)
+    price = serializers.SerializerMethodField(read_only=True)
+    discount = serializers.SerializerMethodField(read_only=True)
+    amount = serializers.SerializerMethodField(read_only=True)
+    cost_price = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = SaleItem
@@ -750,26 +1063,77 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
             "line_id",
             "sale_item_id",
             "product",
+            "is_custom",
+            "price",
+            "discount",
+            "amount",
+            "cost_price",
+            "variant",
+            "variant_size",
+            "variant_color",
+            "performer",
+            "performer_commission_amount",
             "kind",
             "product_name",
             "name_snapshot",
             "barcode_snapshot",
             "unit_price",
             "line_discount",
+            "manual_discount",
+            "discount_source",
+            "promotion_id",
+            "manual_discount_ignored",
             "quantity",
             "line_total",
             "price_manually_edited",
             "price_override_reason",
+            "returnable_qty",
+            "quantity_refunded",
         )
         read_only_fields = fields
 
+    def get_quantity_refunded(self, obj):
+        """ТЗ Н-07: сколько по строке уже возвращено (по SaleReturn.returned_items)."""
+        sale = getattr(obj, "sale", None)
+        if sale is None:
+            return "0.000"
+        return str(qty3(_sale_returns_info(sale)[1].get(str(obj.id), Decimal("0"))))
+
+    def get_price(self, obj):
+        return str(money(obj.unit_price or Decimal("0.00")))
+
+    def get_discount(self, obj):
+        return str(money(obj.line_discount or Decimal("0.00")))
+
+    def get_amount(self, obj):
+        return str(obj.line_total)
+
+    def get_cost_price(self, obj):
+        return str(money(obj.purchase_price_snapshot or Decimal("0.00")))
+
     def get_product_name(self, obj):
         return get_attr(get_attr(obj, "product", None), "name", None) or obj.name_snapshot
+
+    def get_manual_discount_ignored(self, obj):
+        """Ручная скидка кассира не применена, потому что сработала акция (BE2-06)."""
+        return obj.discount_source == "promotion" and (obj.manual_discount or 0) > 0
 
     def get_line_total(self, obj):
         base = (obj.unit_price or Decimal("0")) * Decimal(obj.quantity or 0)
         disc = Decimal(str(getattr(obj, "line_discount", None) or 0))
         return money(base - disc)
+
+    def get_returnable_qty(self, obj):
+        """
+        Сколько ещё можно вернуть по этой строке.
+
+        Отдельного счётчика возвратов у строки нет: частичный возврат уменьшает
+        саму `quantity` (а полностью возвращённая строка удаляется), поэтому
+        остаток к возврату — это и есть текущее количество. Поле отдаём явно,
+        чтобы фронт ограничивал «Макс. возврат» по стабильному имени, а не
+        догадывался по `quantity`.
+        """
+        return qty3(Decimal(str(obj.quantity or 0)))
 
     def get_price_override_reason(self, obj):
         if getattr(obj, "price_manually_edited", False):
@@ -799,11 +1163,21 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     cashbox = serializers.PrimaryKeyRelatedField(read_only=True)
     branch = serializers.PrimaryKeyRelatedField(read_only=True)
     cashbox_name = serializers.SerializerMethodField(read_only=True)
+    number = serializers.IntegerField(source="doc_number", read_only=True)
+    cash_amount = serializers.SerializerMethodField(read_only=True)
+    card_amount = serializers.SerializerMethodField(read_only=True)
+    paid_now = serializers.SerializerMethodField(read_only=True)
+    debt_initial = serializers.SerializerMethodField(read_only=True)
+    debt_remaining = serializers.SerializerMethodField(read_only=True)
+    debt_amount = serializers.SerializerMethodField(read_only=True)
+    refunded_total = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-07
+    refundable_total = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-07
 
     class Meta:
         model = Sale
         fields = (
             "id",
+            "number",
             "branch",
             "status",
             "subtotal",
@@ -831,8 +1205,42 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "cashbox",
             "cashbox_name",
             "ekassa_fiscal",
+            "cash_amount",
+            "card_amount",
+            "paid_now",
+            "debt_initial",
+            "debt_remaining",
+            "debt_amount",
+            "refunded_total",
+            "refundable_total",
         )
         read_only_fields = fields
+
+    def get_refunded_total(self, obj):
+        return _sale_refunded_total(obj)
+
+    def get_refundable_total(self, obj):
+        return _sale_refundable_total(obj)
+
+    def get_paid_now(self, obj):
+        return str(money(obj.paid_now or Decimal("0.00")))
+
+    def get_debt_initial(self, obj):
+        return str(money(obj.debt_initial or Decimal("0.00")))
+
+    def get_debt_remaining(self, obj):
+        if getattr(obj, "debt_remaining", None) is not None:
+            return str(money(obj.debt_remaining))
+        return self.get_remaining_debt(obj) or "0.00"
+
+    def get_debt_amount(self, obj):
+        return str(_sale_debt_amount(obj))
+
+    def get_cash_amount(self, obj):
+        return _sale_payment_split(obj)[0]
+
+    def get_card_amount(self, obj):
+        return _sale_payment_split(obj)[1]
 
     def get_deal_id(self, obj):
         deal = obj.deals.first() if hasattr(obj, "deals") else None
@@ -942,11 +1350,13 @@ class AgentCheckoutSerializer(serializers.Serializer):
     consultant_commission_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
 
     payment_method = serializers.ChoiceField(
-        choices=Sale.PaymentMethod.choices,
+        choices=[c for c in Sale.PaymentMethod.choices if c[0] != Sale.PaymentMethod.OFFSET],
         default=Sale.PaymentMethod.CASH,
         required=False,
     )
     cash_received = MoneyField(required=False, allow_null=True)
+    prepayment = MoneyField(required=False, allow_null=True)
+    prepayment_amount = MoneyField(required=False, allow_null=True)
 
     # если хочешь сохранять кассу в продаже — оставь
     cashbox_id = OptionalUUIDField(required=False, allow_null=True)

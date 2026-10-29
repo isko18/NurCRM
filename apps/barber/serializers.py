@@ -87,16 +87,17 @@ class CompanyBranchReadOnlyMixin:
                     return val
             except Exception:
                 pass
-        if primary and getattr(primary, "company_id", None) == comp_id:
-            return primary
+        # 2) из instance (если редактируем существующий объект в филиале)
+        if self.instance and getattr(self.instance, "branch", None):
+            return self.instance.branch
 
-        # 2) из middleware (на будущее)
+        # 3) из middleware (на будущее)
         if hasattr(request, "branch"):
             b = getattr(request, "branch")
             if b and getattr(b, "company_id", None) == comp_id:
                 return b
 
-        # 3) глобально
+        # 4) глобально
         return None
 
     def create(self, validated_data):
@@ -196,6 +197,16 @@ class ServiceBarberBriefSerializer(serializers.Serializer):
         return full or getattr(obj, "email", "")
 
 
+def normalize_service_name(value: str) -> str:
+    """
+    Нормализация названия услуги согласно спецификации (service-name-per-category.md §3.2):
+    - обрезка пробелов по краям;
+    - сжатие повторяющихся пробелов;
+    - сравнение без учёта регистра (casefold).
+    """
+    return " ".join(str(value or "").split()).casefold()
+
+
 class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -238,7 +249,10 @@ class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         return fields
 
     def validate_name(self, value):
-        return (value or "").strip()
+        cleaned = " ".join(str(value or "").split())
+        if not cleaned:
+            raise serializers.ValidationError("Название не может быть пустым.")
+        return cleaned
 
     def _validate_barbers(self, barbers, company_id, target_branch):
         if not barbers:
@@ -257,36 +271,57 @@ class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 
     def validate(self, attrs):
         request = self.context.get("request")
-        company = getattr(getattr(request, "user", None), "company", None) if request else None
+        user = getattr(request, "user", None) if request else None
+        company = getattr(user, "company", None) or getattr(user, "owned_company", None)
         company_id = getattr(company, "id", None)
         if not company_id:
             return attrs
 
         target_branch = self._auto_branch()  # тот же источник, что в create()
-        name = (attrs.get("name") or getattr(self.instance, "name", "")).strip()
 
-        # ---- проверка уникальности имени внутри компании/филиала ----
-        qs = Service.objects.filter(company_id=company_id, name__iexact=name)
-        if target_branch is None:
-            qs = qs.filter(branch__isnull=True)   # среди глобальных
+        # Получаем очищенное и нормализованное имя
+        raw_name = attrs.get("name") if "name" in attrs else getattr(self.instance, "name", "")
+        clean_name = " ".join(str(raw_name or "").split())
+        if not clean_name:
+            raise serializers.ValidationError({"name": "Название не может быть пустым."})
+        norm_name = normalize_service_name(clean_name)
+
+        # Категория
+        if "category" in attrs:
+            category = attrs.get("category")
+        elif self.instance:
+            category = getattr(self.instance, "category", None)
         else:
-            qs = qs.filter(branch=target_branch)  # внутри филиала
-
-        if self.instance:
-            qs = qs.exclude(pk=self.instance.pk)
-
-        if qs.exists():
-            raise serializers.ValidationError({
-                "name": "Услуга с таким названием уже существует (на этом уровне: глобально/филиал)."
-            })
+            category = None
+        category_id = getattr(category, "id", None) if category else None
 
         # ---- проверка категории, если указана ----
-        category = attrs.get("category") or getattr(self.instance, "category", None)
         if category:
             if category.company_id != company_id:
                 raise serializers.ValidationError({"category": "Категория принадлежит другой компании."})
             if target_branch is not None and category.branch_id not in (None, target_branch.id):
                 raise serializers.ValidationError({"category": "Категория принадлежит другому филиалу."})
+
+        # ---- проверка уникальности имени внутри (company, branch, category) ----
+        qs = Service.objects.filter(company_id=company_id)
+        if target_branch is None:
+            qs = qs.filter(branch__isnull=True)   # среди глобальных
+        else:
+            qs = qs.filter(branch=target_branch)  # внутри филиала
+
+        if category_id is None:
+            qs = qs.filter(category__isnull=True)  # «Общее» (без категории)
+        else:
+            qs = qs.filter(category_id=category_id)
+
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+
+        for row in qs.only("name"):
+            if normalize_service_name(row.name) == norm_name:
+                raise serializers.ValidationError({
+                    "name": "Услуга с таким названием уже есть в этой категории."
+                })
 
         barbers = attrs.get("barbers")
         if barbers is None and self.instance is not None:
@@ -313,6 +348,20 @@ class ServiceSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
 # ===========================
 # Client
 # ===========================
+def normalize_barber_phone(phone):
+    if not phone:
+        return None
+    phone = phone.strip()
+    digits = "".join(c for c in phone if c.isdigit())
+    if not digits:
+        return phone
+    if len(digits) == 10 and digits.startswith("0"):
+        return "996" + digits[1:]
+    elif len(digits) == 9 and not digits.startswith("996"):
+        return "996" + digits
+    return digits
+
+
 class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -328,24 +377,29 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         ref_name = "BarberClient"
 
     def validate(self, attrs):
-        """
-        Клиент создаётся глобально или в текущем филиале пользователя.
-        Поле branch read-only, поэтому клиент не может его подменить.
-        Проверяем уникальность телефона в рамках компании (глобально или по филиалу).
-        """
-        phone = (attrs.get("phone") or "").strip() if attrs.get("phone") else None
+        raw_phone = attrs.get("phone")
+        if raw_phone:
+            norm_phone = normalize_barber_phone(raw_phone)
+            attrs["phone"] = norm_phone or raw_phone
+            phone = attrs["phone"]
+        else:
+            phone = None
+
         if not phone:
             return attrs
 
         company = self._user_company()
-        # Use branch from view context (ClientListCreateView) so validation matches save()
         branch = self.context.get("active_branch")
         if branch is None:
             branch = self._auto_branch()
         if not company:
             return attrs
 
-        qs = Client.objects.filter(company=company, phone=phone)
+        from django.db.models import Q
+        last9 = phone[-9:] if len(phone) >= 9 else phone
+        qs = Client.objects.filter(company=company).filter(
+            Q(phone=phone) | Q(phone__endswith=last9)
+        )
         if branch is not None:
             qs = qs.filter(branch=branch)
         else:
@@ -359,9 +413,6 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         return attrs
 
 
-# ===========================
-# ClientDocument
-# ===========================
 class ClientDocumentSerializer(serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
     branch = serializers.ReadOnlyField(source="branch.id")
@@ -422,35 +473,54 @@ class AppointmentPublicMasterSerializer(serializers.Serializer):
 
 class AppointmentServicesListField(serializers.Field):
     """
-    Поле services: массив ID услуг. Повторяющиеся ID — отдельные позиции.
+    Поле services: массив ID услуг (или объектов с qty).
+    Повторяющиеся ID — отдельные позиции (количество).
     Чтение: список ID в порядке позиций (с дубликатами).
-    Запись: список ID — каждая позиция сохраняется отдельно.
+    Запись: список ID (например: [uuid1, uuid1, uuid2]) или [{service_id: uuid1, qty: 2}, uuid2].
     """
 
     def to_representation(self, value):
         # value — manager (appointment_services) или prefetched list
         if value is None:
             return []
-        if hasattr(value, "order_by"):
-            qs = value.order_by("position")
-            if hasattr(qs, "values_list"):
-                return list(qs.values_list("service_id", flat=True))
+        mgr_inst = getattr(value, "instance", None)
+        if mgr_inst and hasattr(mgr_inst, "_prefetched_objects_cache") and "appointment_services" in mgr_inst._prefetched_objects_cache:
+            return [item.service_id for item in mgr_inst._prefetched_objects_cache["appointment_services"]]
         if hasattr(value, "__iter__") and not hasattr(value, "values_list"):
             return [getattr(item, "service_id", None) for item in value]
+        if hasattr(value, "all"):
+            return [getattr(item, "service_id", None) for item in value.all()]
         return []
 
     def to_internal_value(self, data):
-        """Возвращаем список ID (не объекты Service), чтобы в модель не попадали Service при create/update."""
+        """Возвращаем список ID (с повторами по количеству)."""
         if not isinstance(data, list):
             raise serializers.ValidationError("Ожидается массив ID услуг.")
-        qs = Service.objects.filter(pk__in=data)
+        
+        flat_ids = []
+        for item in data:
+            if isinstance(item, dict):
+                sid = item.get("service_id") or item.get("id") or item.get("pk")
+                qty = item.get("qty") or item.get("quantity") or 1
+                try:
+                    qty = int(qty)
+                except (ValueError, TypeError):
+                    qty = 1
+                if qty < 1:
+                    qty = 1
+                if sid:
+                    for _ in range(qty):
+                        flat_ids.append(str(sid))
+            elif item is not None:
+                flat_ids.append(str(item))
+
+        qs = Service.objects.filter(pk__in=flat_ids)
         by_pk = {str(s.pk): s.pk for s in qs}
         ids = []
-        for pk in data:
-            spk = str(pk) if pk is not None else None
-            if spk not in by_pk:
+        for pk in flat_ids:
+            if pk not in by_pk:
                 raise serializers.ValidationError(f"Услуга с id {pk} не найдена или недоступна.")
-            ids.append(by_pk[spk])
+            ids.append(by_pk[pk])
         return ids
 
 
@@ -477,7 +547,7 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             "barber", "barber_name", "barber_public",
             "services", "services_names", "services_public",
             "start_at", "end_at",
-            "price", "discount",        # 👈 новые поля
+            "price", "discount",
             "status", "comment",
             "created_at",
         ]
@@ -491,12 +561,14 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         return obj.barber.email
 
     def _get_appointment_services_ordered(self, obj):
-        """Возвращает список AppointmentService по порядку position (всегда из БД при необходимости)."""
+        """Возвращает список AppointmentService по порядку position."""
+        if hasattr(obj, "_prefetched_objects_cache") and "appointment_services" in obj._prefetched_objects_cache:
+            return list(obj._prefetched_objects_cache["appointment_services"])
         rel = getattr(obj, "appointment_services", None)
         if rel is None:
             return []
-        if hasattr(rel, "order_by"):
-            return list(rel.order_by("position").select_related("service", "service__category"))
+        if hasattr(rel, "all"):
+            return list(rel.all())
         return list(rel) if hasattr(rel, "__iter__") else []
 
     def get_services_names(self, obj):
@@ -512,6 +584,17 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         service_ids = validated_data.pop("appointment_services", None)
         if service_ids is None:
             service_ids = validated_data.pop("services", [])
+        
+        # Если price не передан с фронта, считаем sum(service.price * qty) с учетом discount
+        if ("price" not in validated_data or validated_data.get("price") is None) and service_ids:
+            by_pk = {str(s.pk): s for s in Service.objects.filter(pk__in=service_ids)}
+            base_sum = sum((by_pk[str(sid)].price or Decimal("0.00")) for sid in service_ids if str(sid) in by_pk)
+            discount = validated_data.get("discount") or Decimal("0.00")
+            if discount > 0:
+                validated_data["price"] = (base_sum * (Decimal("1") - Decimal(str(discount)) / Decimal("100"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            else:
+                validated_data["price"] = base_sum.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
         instance = super().create(validated_data)
         if service_ids:
             by_pk = {str(s.pk): s for s in Service.objects.filter(pk__in=service_ids)}
@@ -526,6 +609,18 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         service_ids = validated_data.pop("appointment_services", None)
         if service_ids is None:
             service_ids = validated_data.pop("services", None)
+        
+        # Если price не передан в PATCH, но переданы новые services, пересчитываем price
+        if "price" not in validated_data and service_ids is not None and len(service_ids) > 0:
+            if instance.price is None or instance.price == Decimal("0.00"):
+                by_pk = {str(s.pk): s for s in Service.objects.filter(pk__in=service_ids)}
+                base_sum = sum((by_pk[str(sid)].price or Decimal("0.00")) for sid in service_ids if str(sid) in by_pk)
+                discount = validated_data.get("discount") or instance.discount or Decimal("0.00")
+                if discount > 0:
+                    validated_data["price"] = (base_sum * (Decimal("1") - Decimal(str(discount)) / Decimal("100"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                else:
+                    validated_data["price"] = base_sum.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
         instance = super().update(instance, validated_data)
         if service_ids is not None:
             AppointmentService.objects.filter(appointment=instance).delete()
@@ -622,11 +717,24 @@ class AppointmentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
         price = attrs.get("price", None)
         discount = attrs.get("discount", None)
 
-        # если цена не передана — суммируем цены услуг
-        if price is None and services:
-            total_price = sum((s.price or 0) for s in services)
-            attrs["price"] = total_price
-            price = total_price
+        # Если цена не передана в запросе
+        if price is None:
+            if not self.instance:
+                if services:
+                    base_price = sum((s.price or Decimal("0.00")) for s in services)
+                    disc = Decimal(str(discount or "0.00")) if discount is not None else Decimal("0.00")
+                    if disc > 0:
+                        attrs["price"] = (base_price * (Decimal("1") - disc / Decimal("100"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    else:
+                        attrs["price"] = base_price
+            else:
+                if "appointment_services" in attrs or "services" in attrs or "discount" in attrs:
+                    disc = Decimal(str(discount if discount is not None else getattr(self.instance, "discount", Decimal("0.00")) or "0.00"))
+                    base_price = sum((s.price or Decimal("0.00")) for s in services)
+                    if disc > 0:
+                        attrs["price"] = (base_price * (Decimal("1") - disc / Decimal("100"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    else:
+                        attrs["price"] = base_price
 
         # скидка: 0–100
         if discount is not None:
@@ -763,10 +871,10 @@ class DocumentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer
 
 class PayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     """
-    Создаёт выплату и сразу считает:
-      - appointments_count  — кол-во записей за период
-      - total_revenue       — выручка за период
-      - payout_amount       — сумма выплаты
+    Создаёт и обновляет выплату, автоматически рассчитывая:
+      - appointments_count  — кол-во завершённых записей за период
+      - total_revenue       — выручка за период (completed)
+      - payout_amount       — сумма выплаты = round(выручка * percent / 100) + (завершённые * per_record) + fixed
     """
 
     company = serializers.ReadOnlyField(source="company.id")
@@ -784,6 +892,9 @@ class PayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
             "period",
             "mode",
             "rate",
+            "percent",
+            "per_record",
+            "fixed",
             "appointments_count",
             "total_revenue",
             "payout_amount",
@@ -831,13 +942,23 @@ class PayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
         company = self._user_company()
         barber = attrs.get("barber") or getattr(self.instance, "barber", None)
         mode = attrs.get("mode") or getattr(self.instance, "mode", None)
-        rate = attrs.get("rate") or getattr(self.instance, "rate", None)
+        rate = attrs.get("rate") if "rate" in attrs else getattr(self.instance, "rate", None)
+        percent = attrs.get("percent") if "percent" in attrs else getattr(self.instance, "percent", None)
+        per_record = attrs.get("per_record") if "per_record" in attrs else getattr(self.instance, "per_record", None)
+        fixed = attrs.get("fixed") if "fixed" in attrs else getattr(self.instance, "fixed", None)
 
         # барбер должен быть из той же компании
         if company and barber and getattr(barber, "company_id", None) != getattr(company, "id", None):
             raise serializers.ValidationError({"barber": "Сотрудник принадлежит другой компании."})
 
-        # проверка ставки для процента
+        if percent is not None and (percent < 0 or percent > 100):
+            raise serializers.ValidationError({"percent": "Процент от выручки должен быть от 0 до 100."})
+        if per_record is not None and per_record < 0:
+            raise serializers.ValidationError({"per_record": "Фикс за запись не может быть отрицательным."})
+        if fixed is not None and fixed < 0:
+            raise serializers.ValidationError({"fixed": "Оклад не может быть отрицательным."})
+
+        # проверка ставки для процента (legacy)
         if mode == Payout.Mode.PERCENT and rate is not None:
             if rate < 0 or rate > 100:
                 raise serializers.ValidationError({"rate": "Для режима 'percent' ставка должна быть от 0 до 100."})
@@ -856,19 +977,7 @@ class PayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
             end = date(year, month + 1, 1)
         return start, end
 
-    # ----- create с расчётом выплаты -----
-
-    def create(self, validated_data):
-        company = self._user_company()
-        if not company:
-            raise serializers.ValidationError("У пользователя не задана компания.")
-
-        branch = self._auto_branch()
-        barber = validated_data["barber"]
-        period = validated_data["period"]
-        mode = validated_data["mode"]
-        rate = Decimal(str(validated_data["rate"]))
-
+    def _calculate_payout_fields(self, company, branch, barber, period, data):
         start_date, end_date = self._period_bounds(period)
 
         qs = Appointment.objects.filter(
@@ -887,27 +996,109 @@ class PayoutSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
 
         total_revenue = qs.aggregate(total=Sum("price"))["total"] or Decimal("0.00")
 
-        # расчёт выплаты
-        if mode == Payout.Mode.RECORD:
-            payout_amount = rate * Decimal(appointments_count)
-        elif mode == Payout.Mode.FIXED:
-            payout_amount = rate
-        elif mode == Payout.Mode.PERCENT:
-            payout_amount = (total_revenue * rate) / Decimal("100")
+        # Извлекаем значения ставок
+        mode = data.get("mode") or Payout.Mode.PERCENT
+        rate = Decimal(str(data.get("rate") or 0))
+
+        percent_val = data.get("percent")
+        per_record_val = data.get("per_record")
+        fixed_val = data.get("fixed")
+
+        has_new_fields = percent_val is not None or per_record_val is not None or fixed_val is not None
+
+        if has_new_fields:
+            percent_d = Decimal(str(percent_val or 0))
+            per_record_d = Decimal(str(per_record_val or 0))
+            fixed_d = Decimal(str(fixed_val or 0))
+
+            percent_amount = (total_revenue * percent_d / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            record_amount = (Decimal(appointments_count) * per_record_d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            fixed_amount = fixed_d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+            payout_amount = percent_amount + record_amount + fixed_amount
+
+            if percent_d > 0 and per_record_d == 0 and fixed_d == 0:
+                mode = Payout.Mode.PERCENT
+                rate = percent_d
+            elif per_record_d > 0 and percent_d == 0 and fixed_d == 0:
+                mode = Payout.Mode.RECORD
+                rate = per_record_d
+            elif fixed_d > 0 and percent_d == 0 and per_record_d == 0:
+                mode = Payout.Mode.FIXED
+                rate = fixed_d
+            else:
+                mode = Payout.Mode.PERCENT
+                rate = percent_d
         else:
-            payout_amount = Decimal("0.00")
+            if mode == Payout.Mode.RECORD:
+                per_record_d = rate
+                percent_d = Decimal("0.00")
+                fixed_d = Decimal("0.00")
+                payout_amount = (rate * Decimal(appointments_count)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            elif mode == Payout.Mode.FIXED:
+                fixed_d = rate
+                percent_d = Decimal("0.00")
+                per_record_d = Decimal("0.00")
+                payout_amount = rate.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            elif mode == Payout.Mode.PERCENT:
+                percent_d = rate
+                per_record_d = Decimal("0.00")
+                fixed_d = Decimal("0.00")
+                payout_amount = ((total_revenue * rate) / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            else:
+                percent_d = Decimal("0.00")
+                per_record_d = Decimal("0.00")
+                fixed_d = Decimal("0.00")
+                payout_amount = Decimal("0.00")
 
-        payout_amount = payout_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return {
+            "mode": mode,
+            "rate": rate,
+            "percent": percent_d,
+            "per_record": per_record_d,
+            "fixed": fixed_d,
+            "appointments_count": appointments_count,
+            "total_revenue": total_revenue,
+            "payout_amount": payout_amount,
+        }
 
+    # ----- create с расчётом выплаты -----
+
+    def create(self, validated_data):
+        company = self._user_company()
+        if not company:
+            raise serializers.ValidationError("У пользователя не задана компания.")
+
+        branch = self._auto_branch()
+        barber = validated_data["barber"]
+        period = validated_data["period"]
+
+        calculated = self._calculate_payout_fields(company, branch, barber, period, validated_data)
 
         validated_data["company"] = company
         validated_data["branch"] = branch
-        validated_data["appointments_count"] = appointments_count
-        validated_data["total_revenue"] = total_revenue
-        validated_data["payout_amount"] = payout_amount
+        validated_data.update(calculated)
 
-        # обходим create из миксина и идём сразу в ModelSerializer
         return super(CompanyBranchReadOnlyMixin, self).create(validated_data)
+
+    def update(self, instance, validated_data):
+        company = instance.company
+        branch = instance.branch
+        barber = validated_data.get("barber", instance.barber)
+        period = validated_data.get("period", instance.period)
+
+        merged_data = {
+            "mode": validated_data.get("mode", instance.mode),
+            "rate": validated_data.get("rate", instance.rate),
+            "percent": validated_data.get("percent", instance.percent),
+            "per_record": validated_data.get("per_record", instance.per_record),
+            "fixed": validated_data.get("fixed", instance.fixed),
+        }
+
+        calculated = self._calculate_payout_fields(company, branch, barber, period, merged_data)
+        validated_data.update(calculated)
+
+        return super(CompanyBranchReadOnlyMixin, self).update(instance, validated_data)
 
 
     

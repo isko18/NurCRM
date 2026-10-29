@@ -13,6 +13,14 @@ from apps.main.models import Notification, Task
 
 logger = logging.getLogger("crm.webhooks")
 
+from apps.main.telegram_bot.tasks import (
+    process_telegram_update,
+    send_telegram_shift_summary,
+    send_telegram_debt_reminders,
+    send_telegram_notification,
+)
+from apps.main.notifications_market import notify_debt_overdue
+
 
 @shared_task
 def create_task_notification(task_id):
@@ -50,6 +58,27 @@ def notify_assigned_user_async(sender, instance, created, **kwargs):
         transaction.on_commit(lambda: create_task_notification.delay(str(instance.id)))
 
 
+@shared_task(name="apps.main.tasks.deliver_product_webhook")
+def deliver_product_webhook(payload, retries: int = 3, timeout: int = 5, backoff: float = 1.5):
+    """
+    Доставка product-вебхука вне цикла запроса.
+
+    Раньше HTTP шёл прямо в обработчике: при недоступном приёмнике одна
+    отправка стоила retries*timeout + backoff (~17.5 с), а на чекауте их
+    было по числу позиций в чеке — касса вставала на минуты.
+    """
+    from apps.main.services.webhooks import _send_payload
+
+    try:
+        _send_payload(payload, retries=retries, timeout=timeout, backoff=backoff)
+    except Exception:
+        logger.error(
+            "deliver_product_webhook упал. event=%s",
+            (payload or {}).get("event"),
+            exc_info=True,
+        )
+
+
 @shared_task(name="apps.main.tasks.catalog_webhook_sync")
 def catalog_webhook_sync():
     """
@@ -80,7 +109,11 @@ def catalog_webhook_sync():
     started = time.time()
 
     for product in qs.iterator(chunk_size=200):
-        send_product_webhook(product, "product.updated", retries=3, timeout=15, backoff=1.5)
+        # sync=True: мы уже внутри Celery, повторно ставить в очередь каждый
+        # товар незачем.
+        send_product_webhook(
+            product, "product.updated", retries=3, timeout=15, backoff=1.5, sync=True
+        )
         total += 1
 
         # Use prefetch cache — do NOT call .exists() here (bypasses cache → N+1)
@@ -108,3 +141,62 @@ def catalog_webhook_sync():
             )
 
     return {"total": total, "no_images_count": len(no_image_codes)}
+
+
+@shared_task(name="apps.main.tasks.product_expiry_digest")
+def product_expiry_digest():
+    """
+    Daily digest for products that are expired or expiring soon (within 14 days).
+    Sends aggregated notification to company owner / WS groups.
+    """
+    from apps.main.services_expiry import send_product_expiry_digest_for_all_companies
+
+    count = send_product_expiry_digest_for_all_companies()
+    logger.info("product_expiry_digest finished: created %d notifications", count)
+    return {"created_notifications_count": count}
+
+
+@shared_task(name="apps.main.tasks.send_tariff_notifications")
+def send_tariff_notifications():
+    """
+    Ежедневная проверка окончания подписок: tariff.expiring за 7/3/1 день
+    владельцу компании (realtime-notifications-backend.md §6.5).
+    """
+    from apps.main.realtime import check_and_create_tariff_notifications
+
+    created = check_and_create_tariff_notifications()
+    logger.info("send_tariff_notifications finished: created %d notifications", len(created))
+    return {"created_notifications_count": len(created)}
+
+
+@shared_task(name="apps.main.tasks.check_overdue_debts")
+def check_overdue_debts():
+    """
+    Периодический / ночной cron для проверки просроченных взносов.
+    Ищет взносы, где paid_on IS NULL, due_date < today, paid_amount < amount.
+    Если promised_date >= today, уведомление подавляется (согласно §3/Q3).
+    Отправляет событие market.debt.overdue.
+    """
+    from django.db.models import F
+    from django.utils import timezone
+    from apps.main.models import DealInstallment, ClientDeal
+
+    today = timezone.localdate()
+    qs = (
+        DealInstallment.objects
+        .filter(
+            deal__kind=ClientDeal.Kind.DEBT,
+            paid_on__isnull=True,
+            due_date__lt=today,
+            paid_amount__lt=F("amount"),
+        )
+        .select_related("deal", "deal__company", "deal__branch", "deal__client")
+    )
+    sent_count = 0
+    for inst in qs:
+        # Если клиент обещал оплатить к дате >= today, уведомление о просрочке пока не шлём
+        if inst.promised_date and inst.promised_date >= today:
+            continue
+        notify_debt_overdue(inst)
+        sent_count += 1
+    return {"checked_overdue_installments": sent_count}

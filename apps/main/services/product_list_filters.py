@@ -21,7 +21,11 @@ VALID_PRESETS = {
     "not_sold_90d",
     "negative_stock",
     "stock_below_min",
+    "low_stock",
 }
+
+# Порог «мало» для товаров без своего minimum_quantity (preset=low_stock).
+LOW_STOCK_DEFAULT_THRESHOLD = Decimal("5")
 
 # Обратная совместимость с кириллическими slug (старый фронт)
 _PRESET_ALIASES = {
@@ -77,8 +81,9 @@ def _parse_bool(raw) -> bool | None:
 
 def _parse_kind_list(query_params) -> list[str]:
     raw: list[str] = []
-    raw.extend(query_params.getlist("kind"))
-    raw.extend(query_params.getlist("kind[]"))
+    if hasattr(query_params, "getlist"):
+        raw.extend(query_params.getlist("kind"))
+        raw.extend(query_params.getlist("kind[]"))
     single = (query_params.get("kind") or "").strip()
     if single:
         if "," in single:
@@ -119,7 +124,7 @@ def _price_field(price_type: str) -> str | None:
     return mapping.get((price_type or "").strip().lower())
 
 
-def _apply_preset(qs, preset: str):
+def _apply_preset(qs, preset: str, low_stock_threshold=None):
     today = timezone.localdate()
 
     if preset == "discounted":
@@ -131,6 +136,7 @@ def _apply_preset(qs, preset: str):
         "out_of_stock",
         "negative_stock",
         "stock_below_min",
+        "low_stock",
     ):
         qs = qs.exclude(kind=Product.Kind.SERVICE)
 
@@ -151,6 +157,16 @@ def _apply_preset(qs, preset: str):
         return qs.filter(quantity__lt=0)
     if preset == "not_sold_90d":
         return _apply_not_sold_within(qs, 90)
+    if preset == "low_stock":
+        # «Заканчивается»: остаток ≤ своего минимума, а если минимум не задан — ≤ порога (по умолчанию 5).
+        threshold = _parse_decimal(low_stock_threshold)
+        if threshold is None or threshold < 0:
+            threshold = LOW_STOCK_DEFAULT_THRESHOLD
+        has_min = Q(minimum_quantity__isnull=False, minimum_quantity__gt=0)
+        return qs.filter(
+            (has_min & Q(quantity__lte=F("minimum_quantity")))
+            | (~has_min & (Q(quantity__isnull=True) | Q(quantity__lte=threshold)))
+        )
     if preset == "stock_below_min":
         return qs.filter(
             minimum_quantity__isnull=False,
@@ -198,9 +214,26 @@ def apply_product_list_filters(qs, query_params):
     if is_adult is not None:
         qs = qs.filter(is_adult=is_adult)
 
+    # Касса/бот: ?is_service=false&quantity_lte=5
+    is_service = _parse_bool(query_params.get("is_service"))
+    if is_service is True:
+        qs = qs.filter(kind="service")
+    elif is_service is False:
+        qs = qs.exclude(kind="service")
+
+    for param, lookup in (("quantity_lte", "quantity__lte"), ("quantity_gte", "quantity__gte")):
+        raw = query_params.get(param)
+        if raw not in (None, ""):
+            value = _parse_decimal(raw)
+            if value is None:
+                from rest_framework.exceptions import ValidationError
+
+                raise ValidationError({param: "Число."})
+            qs = qs.filter(**{lookup: value})
+
     preset = _normalize_preset(query_params.get("preset"))
     if preset:
-        qs = _apply_preset(qs, preset)
+        qs = _apply_preset(qs, preset, query_params.get("low_stock_threshold"))
 
     price_type = (query_params.get("price_type") or "").strip().lower()
     price_condition = (query_params.get("price_condition") or "eq").strip().lower()
@@ -220,7 +253,19 @@ def apply_product_list_filters(qs, query_params):
     shelf_cond = (query_params.get("shelf_life_condition") or "").strip().lower()
     shelf_days = _parse_int(query_params.get("shelf_life_value"))
     today = timezone.localdate()
-    if shelf_cond == "expires_within" and shelf_days is not None and shelf_days >= 0:
+    expiring_only = _parse_bool(query_params.get("expiring_only"))
+    expired_only = _parse_bool(query_params.get("expired_only"))
+
+    if expired_only:
+        qs = qs.filter(expiration_date__isnull=False, expiration_date__lt=today)
+    elif expiring_only:
+        qs = qs.filter(
+            expiration_date__isnull=False,
+            expiration_date__lte=today + timedelta(days=14),
+        )
+        if _parse_bool(query_params.get("exclude_expired")):
+            qs = qs.filter(expiration_date__gte=today)
+    elif shelf_cond == "expires_within" and shelf_days is not None and shelf_days >= 0:
         end = today + timedelta(days=shelf_days)
         qs = qs.filter(
             expiration_date__isnull=False,

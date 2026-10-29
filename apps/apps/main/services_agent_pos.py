@@ -1,0 +1,379 @@
+# apps/main/services_agent_pos.py
+from decimal import Decimal, InvalidOperation
+from django.db import transaction, IntegrityError, models
+from django.db.models import Sum
+from django.utils import timezone
+from django.core.exceptions import ValidationError
+
+from apps.main.models import (
+    Sale, SaleItem, ManufactureSubreal, AgentSaleAllocation, ReturnFromAgent, Product
+)
+from apps.construction.models import Cashbox
+
+
+class AgentNotEnoughStock(Exception):
+    pass
+
+
+class AgentCashboxError(Exception):
+    pass
+
+
+def model_has_field(model, field_name: str) -> bool:
+    try:
+        return any(f.name == field_name for f in model._meta.get_fields())
+    except Exception:
+        return False
+
+
+def _latest_ordering(model) -> str:
+    return "-created_at" if model_has_field(model, "created_at") else "-id"
+
+
+def _resolve_cashbox(company, branch=None, *, cashbox_id=None):
+    """
+    Касса нужна только если ты хочешь сохранить cashbox в Sale/чеке/отчёте.
+    Смены не трогаем вообще.
+    """
+    if cashbox_id:
+        cb = Cashbox.objects.filter(id=cashbox_id).select_related("branch").first()
+        if not cb:
+            raise AgentCashboxError("Касса не найдена.")
+        if cb.company_id != company.id:
+            raise AgentCashboxError("Касса другой компании.")
+        if (cb.branch_id or None) != (getattr(branch, "id", None) or None):
+            raise AgentCashboxError("Касса другого филиала.")
+        return cb
+
+    order = _latest_ordering(Cashbox)
+
+    if branch is not None:
+        cb = (
+            Cashbox.objects
+            .filter(company=company, branch=branch)
+            .order_by(order)
+            .first()
+        )
+        if cb:
+            return cb
+
+    cb = (
+        Cashbox.objects
+        .filter(company=company, branch__isnull=True)
+        .order_by(order)
+        .first()
+    )
+    if cb:
+        return cb
+
+    raise AgentCashboxError("Нет кассы для этого филиала/компании. Создай Cashbox.")
+
+
+def _to_int_qty(q) -> int:
+    """
+    У агента остатки (передачи/аллокейшены) обычно целые.
+    Разрешаем только значения типа 1 / 2 / 3 или Decimal('2.000').
+    Если придёт 0.5 или 1.250 — выдаём понятную ошибку.
+    """
+    if q is None:
+        return 0
+    try:
+        d = Decimal(str(q))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValidationError({"quantity": "Некорректное количество."})
+
+    if d <= 0:
+        raise ValidationError({"quantity": "Количество должно быть > 0."})
+
+    # проверка на целое
+    if d != d.to_integral_value():
+        raise ValidationError({"quantity": "Для агентских продаж количество должно быть целым (штучный товар)."})
+    return int(d)
+
+
+@transaction.atomic
+def checkout_agent_cart(
+    cart,
+    *,
+    department=None,
+    agent=None,
+    use_main_stock=False,
+    allow_negative_stock: bool = False,
+    cashbox_id=None,
+    client=None,
+    consultant=None,
+    consultant_commission_enabled: bool = False,
+    consultant_commission_percent=None,
+):
+    """
+    Чекаут корзины от лица АГЕНТА.
+    ✅ БЕЗ СМЕН: CashShift не используем, shift в Sale НЕ ставим.
+    Можно (опционально) сохранить cashbox в Sale, если поле есть.
+
+    Важно: Product.quantity НЕ трогаем.
+    """
+    company = cart.company
+    operator = cart.user               # кто оформляет (оператор/кассир)
+    acting_agent = agent or cart.user  # за кого списываем передачи
+    branch = getattr(cart, "branch", None)
+
+    # касса опционально (для отчёта/чека)
+    cashbox = None
+    if model_has_field(Sale, "cashbox"):
+        cashbox = _resolve_cashbox(company, branch, cashbox_id=cashbox_id)
+
+    # Поштучная продажа из пачки (sale_package) поддерживается только в checkout_cart (касса со сменой).
+    for it in cart.items.all():
+        if getattr(it, "sale_package_id", None):
+            raise ValidationError(
+                "Поштучная продажа из упаковки (поле sale_package) оформляется только через обычную кассу "
+                "и checkout_cart. Уберите такие позиции из корзины или оформите продажу через смену."
+            )
+
+    # --- 1) агрегируем потребности корзины ---
+    needs = {}
+    for it in cart.items.select_related("product"):
+        qty_int = _to_int_qty(getattr(it, "quantity", None))
+        qty_dec = Decimal(str(it.quantity or 1))
+        line_disc = Decimal(str(getattr(it, "line_discount", None) or 0))
+        effective_unit = (it.unit_price or Decimal("0")) - (line_disc / qty_dec) if qty_dec else (it.unit_price or Decimal("0"))
+
+        if it.product is None:
+            key = f"custom:{it.custom_name}:{effective_unit}"
+            row = needs.setdefault(key, {"custom_name": it.custom_name, "unit_price": effective_unit, "qty": 0})
+            row["qty"] += qty_int
+            continue
+
+        pid = str(it.product_id)
+        row = needs.setdefault(pid, {"product": it.product, "unit_price": effective_unit, "qty": 0})
+        row["qty"] += qty_int
+
+    # --- 2) готовим источник остатков ---
+    product_ids = [v["product"].id for k, v in needs.items() if not k.startswith("custom:")]
+
+    products_by_id = {}
+    if use_main_stock and product_ids:
+        locked_products = Product.objects.select_for_update().filter(id__in=product_ids, company=company)
+        products_by_id = {p.id: p for p in locked_products}
+        subreals = []
+        sold_by_subreal = {}
+        reserved_by_subreal = {}
+    elif product_ids:
+        subreals = (
+            ManufactureSubreal.objects
+            .select_for_update()
+            .filter(agent_id=acting_agent.id, product_id__in=product_ids, company=company)
+            .select_related("product")
+            .order_by("product_id", "created_at", "id")
+        )
+
+        sold_map = (
+            AgentSaleAllocation.objects
+            .filter(
+                agent=acting_agent,
+                company=company,
+                product_id__in=product_ids,
+                sale__status__in=[Sale.Status.PAID, Sale.Status.DEBT],
+            )
+            .values("subreal_id")
+            .annotate(s=Sum("qty"))
+        )
+        sold_by_subreal = {r["subreal_id"]: int(r["s"] or 0) for r in sold_map}
+
+        # "Резерв" под возвраты: pending возвраты по этим subreal-ам уменьшают доступное у агента,
+        # чтобы нельзя было продать то, что уже оформлено на возврат.
+        reserved_map = (
+            ReturnFromAgent.objects
+            .filter(company=company, subreal_id__in=[s.id for s in subreals], status=ReturnFromAgent.Status.PENDING)
+            .values("subreal_id")
+            .annotate(s=Sum("qty"))
+        )
+        reserved_by_subreal = {r["subreal_id"]: int(r["s"] or 0) for r in reserved_map}
+    else:
+        subreals = []
+        sold_by_subreal = {}
+        reserved_by_subreal = {}
+
+    fifo = {}
+    for s in subreals:
+        free = max(
+            0,
+            int(s.qty_accepted or 0) - int(s.qty_returned or 0) - int(sold_by_subreal.get(s.id, 0))
+            - int(reserved_by_subreal.get(s.id, 0))
+        )
+        if free > 0:
+            fifo.setdefault(str(s.product_id), []).append([s, free])
+
+    # --- 3) проверяем достаточность остатков агента ---
+    for k, v in needs.items():
+        if k.startswith("custom:"):
+            continue
+        pid = str(v["product"].id)
+        need = int(v["qty"] or 0)
+        if use_main_stock:
+            if allow_negative_stock or getattr(v["product"], "kind", None) == Product.Kind.SERVICE:
+                continue
+            p = products_by_id.get(v["product"].id)
+            have = int(Decimal(str(getattr(p, "quantity", 0) or 0)))
+            if need > have:
+                raise AgentNotEnoughStock(
+                    f"Недостаточно на основном складе: «{v['product'].name}». Нужно {need}, доступно {have}."
+                )
+        else:
+            have = sum(q for _, q in fifo.get(pid, []))
+            if need > have:
+                raise AgentNotEnoughStock(
+                    f"Недостаточно у агента: «{v['product'].name}». Нужно {need}, доступно {have}."
+                )
+
+    # --- 4) создаём Sale (БЕЗ shift) ---
+    create_kwargs = dict(
+        company=company,
+        user=operator,
+        status=Sale.Status.NEW,  # дальше mark_paid()
+        subtotal=Decimal("0.00"),
+        # Итоги перезаписываются после строк из cart.recalc() (строковые + чековые скидки)
+        discount_total=Decimal("0.00"),
+        tax_total=Decimal("0.00"),
+        total=Decimal("0.00"),
+    )
+
+    if model_has_field(Sale, "branch"):
+        create_kwargs["branch"] = branch
+
+    # Клиент: явный аргумент (checkout) или поле корзины, если оно есть в модели
+    sale_client = client
+    if sale_client is None and model_has_field(Sale, "client"):
+        sale_client = getattr(cart, "client", None)
+    if model_has_field(Sale, "client") and sale_client is not None:
+        create_kwargs["client"] = sale_client
+
+    if model_has_field(Sale, "department") and department is not None:
+        create_kwargs["department"] = department
+
+    # ✅ сохраняем кассу (если нужно), но shift НЕ ставим никогда
+    if model_has_field(Sale, "cashbox") and cashbox is not None:
+        create_kwargs["cashbox"] = cashbox
+
+    comm_enabled = bool(consultant and consultant_commission_enabled)
+    comm_pct = (
+        Decimal(str(consultant_commission_percent))
+        if (consultant and consultant_commission_percent not in (None, "", "null"))
+        else None
+    )
+    comm_amount = Decimal("0.00")
+    if consultant and comm_enabled and comm_pct is not None and comm_pct > 0:
+        comm_amount = (cart.total * comm_pct / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    create_kwargs["consultant"] = consultant if consultant else None
+    create_kwargs["consultant_commission_enabled"] = comm_enabled
+    create_kwargs["consultant_commission_percent"] = comm_pct
+    create_kwargs["consultant_commission_amount"] = comm_amount
+
+    # убираем None для полей, которые могут быть not-null
+    create_kwargs = {k: v for k, v in create_kwargs.items() if not (v is None and k in ("branch", "client", "department", "cashbox", "shift"))}
+
+    sale = Sale.objects.create(**create_kwargs)
+
+    # --- 5) переносим позиции и делаем FIFO-аллокации ---
+    for k, v in needs.items():
+        if k.startswith("custom:"):
+            qty = int(v["qty"])
+            price = v["unit_price"] or Decimal("0.00")
+            SaleItem.objects.create(
+                sale=sale,
+                product=None,
+                name_snapshot=v["custom_name"],
+                barcode_snapshot=None,
+                unit_price=price,
+                quantity=qty,
+                price_manually_edited=bool(v.get("price_manually_edited", False)),
+            )
+            continue
+
+        product = v["product"]
+        qty = int(v["qty"])
+        price = v["unit_price"] or getattr(product, "price", None) or Decimal("0.00")
+
+        sitem = SaleItem.objects.create(
+            sale=sale,
+            product=product,
+            name_snapshot=product.name,
+            barcode_snapshot=getattr(product, "barcode", None),
+            unit_price=price,
+            quantity=qty,
+            price_manually_edited=bool(v.get("price_manually_edited", False)),
+        )
+
+        if not use_main_stock:
+            left = qty
+            queue = fifo.get(str(product.id), [])
+            while left > 0 and queue:
+                subr, free = queue[0]
+                take = min(left, free)
+
+                try:
+                    alloc, created = AgentSaleAllocation.objects.get_or_create(
+                        company=company,
+                        agent=acting_agent,
+                        subreal=subr,
+                        sale=sale,
+                        sale_item=sitem,
+                        product=product,
+                        defaults={"qty": take},
+                    )
+                    if not created:
+                        AgentSaleAllocation.objects.filter(pk=alloc.pk).update(qty=models.F("qty") + take)
+                except IntegrityError:
+                    alloc = AgentSaleAllocation.objects.get(
+                        company=company,
+                        agent=acting_agent,
+                        subreal=subr,
+                        sale=sale,
+                        sale_item=sitem,
+                        product=product,
+                    )
+                    AgentSaleAllocation.objects.filter(pk=alloc.pk).update(qty=models.F("qty") + take)
+
+                free -= take
+                left -= take
+                if free == 0:
+                    queue.pop(0)
+                else:
+                    queue[0][1] = free
+
+    if use_main_stock and product_ids:
+        changed_products = []
+        for k, v in needs.items():
+            if k.startswith("custom:"):
+                continue
+            if getattr(v["product"], "kind", None) == Product.Kind.SERVICE:
+                continue
+            p = products_by_id.get(v["product"].id)
+            if p is None:
+                raise AgentNotEnoughStock(f"Товар «{v['product'].name}» не найден на складе.")
+            p.quantity = Decimal(str(getattr(p, "quantity", 0) or 0)) - Decimal(int(v["qty"] or 0))
+            if (not allow_negative_stock) and p.quantity < 0:
+                raise AgentNotEnoughStock(
+                    f"Недостаточно на основном складе: «{v['product'].name}»."
+                )
+            changed_products.append(p)
+        if changed_products:
+            Product.objects.bulk_update(changed_products, ["quantity"])
+
+    # --- 6) итоги + “оплата” ---
+    # Суммы чека как в корзине: строковые скидки + скидка на чек (% или сумма) уже в cart.discount_total
+    cart.recalc()
+    sale.subtotal = cart.subtotal
+    sale.discount_total = cart.discount_total
+    sale.tax_total = getattr(cart, "tax_total", None) or Decimal("0.00")
+    sale.total = cart.total if cart.total > 0 else Decimal("0.00")
+    sale.save(update_fields=["subtotal", "discount_total", "tax_total", "total"])
+
+    # Оплата — в POS-вьюхе через ``sale.mark_paid()`` (как обычная касса с ``checkout_cart``).
+
+    # --- 7) закрываем корзину ---
+    cart.status = cart.Status.CHECKED_OUT
+    cart.save(update_fields=["status"])
+
+    return sale

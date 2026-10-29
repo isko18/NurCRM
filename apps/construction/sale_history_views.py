@@ -1,4 +1,5 @@
 # apps/construction/views/shift_sales.py
+import uuid as uuid_lib
 from datetime import datetime, time
 from decimal import Decimal, InvalidOperation
 
@@ -7,6 +8,7 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, permissions
 from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.pagination import PageNumberPagination
 
 from apps.construction.models import CashShift
 from apps.main.models import Sale, SaleItem
@@ -76,12 +78,37 @@ ALLOWED_ORDERING = {
 }
 
 
+class ShiftSalesPagination(PageNumberPagination):
+    """
+    Глобальный PageNumberPagination не даёт клиенту менять размер страницы, из-за
+    чего фронт видел только первые 100 чеков смены и строил фильтр «Кассир» по
+    неполному списку (L1 в shift-sales-cashier-filter-backend.md).
+    """
+    page_size_query_param = "page_size"
+    max_page_size = 500
+
+
+def _parse_cashier_ids(raw: str):
+    """`?cashier=<uuid>` или несколько через запятую. Невалидный uuid → 400."""
+    ids = []
+    for chunk in str(raw).split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            ids.append(uuid_lib.UUID(chunk))
+        except (ValueError, AttributeError, TypeError):
+            raise ValidationError({"cashier": "Ожидается UUID сотрудника (можно несколько через запятую)."})
+    return ids
+
+
 # ─────────────────────────────────────────────────────────────
 # view
 # ─────────────────────────────────────────────────────────────
 class CashShiftSalesListView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = SaleHistorySerializer
+    pagination_class = ShiftSalesPagination
 
     def get_queryset(self):
         user = self.request.user
@@ -118,7 +145,8 @@ class CashShiftSalesListView(generics.ListAPIView):
             .only(
                 "id", "sale_id", "product_id",
                 "name_snapshot", "barcode_snapshot",
-                "unit_price", "quantity",
+                "unit_price", "quantity", "line_discount",
+                "product__name",
             )
             .order_by("id")
         )
@@ -140,7 +168,24 @@ class CashShiftSalesListView(generics.ListAPIView):
             val = PM_MAP.get(raw_pm.lower())
             if val is None:
                 raise ValidationError({"payment_method": "Допустимо: cash, transfer"})
-            qs = qs.filter(payment_method=val)
+            if val == Sale.PaymentMethod.TRANSFER:
+                # ТЗ 12.11: безнал разных банков тоже считается переводом.
+                qs = qs.filter(payment_method__in=[
+                    Sale.PaymentMethod.TRANSFER, Sale.PaymentMethod.MBANK, Sale.PaymentMethod.OPTIMA,
+                    Sale.PaymentMethod.OBANK, Sale.PaymentMethod.BAKAI,
+                ])
+            else:
+                qs = qs.filter(payment_method=val)
+
+        # ---- cashier ----
+        # Фильтруем по продавцу конкретного чека (Sale.user — источник
+        # cashier_display), а НЕ по владельцу смены: в общей смене на одну кассу
+        # чеки пробивают несколько сотрудников.
+        raw_cashier = (p.get("cashier") or "").strip()
+        if raw_cashier:
+            cashier_ids = _parse_cashier_ids(raw_cashier)
+            if cashier_ids:
+                qs = qs.filter(user_id__in=cashier_ids)
 
         # ---- q search ----
         q = (p.get("q") or "").strip()

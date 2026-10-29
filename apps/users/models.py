@@ -51,6 +51,9 @@ class SubscriptionPlan(models.Model):
 class Roles(models.TextChoices):
     ADMIN = "admin", "Администратор"
     OWNER = "owner", "Владелец"
+    ROP = "rop", "РОП"
+    SUPERVISOR = "supervisor", "Руководитель региона"
+    SALESPERSON = "salesperson", "Сотрудник"
 
 
 class KyrgyzstanRegion(models.TextChoices):
@@ -198,6 +201,22 @@ class Company(models.Model):
         blank=True
     )
 
+    class MarketSphere(models.TextChoices):
+        GROCERY = "grocery", "Продукты"
+        CLOTHING = "clothing", "Одежда"
+        SERVICES = "services", "Услуги"
+
+    market_sphere = models.CharField(
+        "Вид магазина",
+        max_length=16,
+        choices=MarketSphere.choices,
+        null=True,
+        blank=True,
+        help_text="Под него перестраиваются кассы: каталог, карточка товара, запись, прокат.",
+    )
+    # BE2-02: магазин может совмещать виды (одежда + услуги); market_sphere — основной, первый в списке.
+    market_spheres = models.JSONField("Виды магазина", default=list, blank=True)
+
 
     scale_api_token = models.CharField(
         max_length=64,
@@ -251,12 +270,35 @@ class Company(models.Model):
     debt_schedule_version = models.CharField(
         "Версия графика отсрочки",
         max_length=8,
-        default="v1",
+        default="v2",
         choices=[("v1", "v1"), ("v2", "v2")],
         blank=True,
         null=True,
         help_text="Версия графика рассрочки на кассе ('v1' или 'v2')",
     )
+    cashflow_requests_enabled = models.BooleanField(
+        default=False,
+        verbose_name="Запросы на подтверждение движений кассы",
+        help_text="True — ручные записи не-владельца, компенсация возврата и правка/отмена одобренного движения создают pending-заявку. False — проводятся немедленно.",
+    )
+
+    appointment_work_start = models.CharField(
+        "Начало рабочего дня для записей",
+        max_length=5,
+        default="09:00",
+        blank=True,
+        null=True,
+        help_text="Время начала рабочего дня для календаря записей (формат HH:MM)",
+    )
+    appointment_work_end = models.CharField(
+        "Конец рабочего дня для записей",
+        max_length=5,
+        default="21:00",
+        blank=True,
+        null=True,
+        help_text="Время окончания рабочего дня для календаря записей (формат HH:MM)",
+    )
+
 
     def ensure_scale_api_token(self):
         if not self.scale_api_token:
@@ -537,6 +579,31 @@ class User(AbstractBaseUser, PermissionsMixin):
         verbose_name="Кастомная роль",
     )
 
+    consulting_region_codes = models.JSONField(
+        default=list,
+        blank=True,
+        verbose_name="Коды регионов (консалтинг)",
+    )
+
+    def get_consulting_region_codes(self) -> list[str]:
+        val = self.consulting_region_codes
+        if isinstance(val, list):
+            return [str(x).strip().lower() for x in val if str(x).strip()]
+        return []
+
+    @property
+    def is_consulting_supervisor(self) -> bool:
+        return str(getattr(self, "role", "") or "").lower() == "supervisor"
+
+    @property
+    def is_consulting_salesperson(self) -> bool:
+        return str(getattr(self, "role", "") or "").lower() == "salesperson"
+
+    @property
+    def is_consulting_manager(self) -> bool:
+        r = str(getattr(self, "role", "") or "").lower()
+        return r in ("owner", "admin", "rop") or bool(getattr(self, "is_superuser", False)) or bool(getattr(self, "owned_company_id", None))
+
     # ===== Права доступа =====
     can_view_dashboard = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к обзору")
     can_view_cashbox = models.BooleanField(default=False, blank=True, null=True, verbose_name="Доступ к кассе")
@@ -556,6 +623,9 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_funnel = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: страница воронки")
     can_manage_funnel_leads = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: управление лидами своей роли")
     can_manage_funnel_stages = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: управление стадиями своей роли")
+    can_create_funnel = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: создание собственных воронок")
+    can_manage_lead_ad_spend = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: управление рекламным бюджетом лидов")
+    can_view_leads_inbox = models.BooleanField(default=False, blank=True, null=True, verbose_name="Консалтинг: доступ к входящим лидам")
 
     # Building permissions (CRM) — ключи для profile, меню Building и роутинга
     can_view_building_analytics = models.BooleanField(default=False, blank=True, null=True, verbose_name="Building: Аналитика")
@@ -620,6 +690,9 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_request = models.BooleanField(default=False, verbose_name="Доступ к запросам")
     can_view_shifts = models.BooleanField(default=False, verbose_name="Доступ к смене")
     can_view_cashier = models.BooleanField(default=False, verbose_name="Доступ к интерфейсу кассы")
+    # ТЗ Н-16: «Работа на кассе» отдельно от «Финансы: кассы компании» (can_view_cashbox).
+    # По умолчанию True (db_default) — после миграции никто не теряет доступ к кассе.
+    can_use_pos = models.BooleanField(default=True, db_default=True, verbose_name="Работа на кассе (POS)")
     can_view_document = models.BooleanField(default=False, verbose_name="Доступ к документам")
     can_view_market_scales = models.BooleanField(default=False, verbose_name="Доступ к весам")
     can_view_market_label = models.BooleanField(default=False, verbose_name="Доступ к печати этикеток")
@@ -629,7 +702,25 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_market_procurement = models.BooleanField(default=False, verbose_name="Маркет: доступ к закупкам")
     can_view_market_supplier = models.BooleanField(default=False, verbose_name="Маркет: доступ к поставщикам")
     can_view_market_employee_return = models.BooleanField(default=False, verbose_name="Маркет: доступ к возврату сотрудника")
-    
+
+    # Склад: права на опасные операции (QA 06.10, §2). NULL — по умолчанию для роли
+    # (см. apps.warehouse.op_permissions.ROLE_DEFAULTS), True/False — явно выданное право.
+    can_post_negative_stock = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: проводить в минус")
+    can_unpost_documents = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: отменять проведение")
+    can_change_document_date = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: менять дату документа")
+    can_post_closed_period = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: изменения в закрытом периоде")
+    can_cash_negative = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: расход кассы в минус")
+
+    # Режим «только смотреть» (ТЗ «Бухгалтер», п. 1). NULL — как раньше (видит → может менять), False — только просмотр.
+    can_edit_cashbox = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: кассы")
+    can_edit_products = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: товары")
+    can_edit_procurement = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: закупки")
+    can_edit_documents = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: документы склада")
+    can_edit_clients = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: клиенты и долги")
+    can_edit_salary = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: зарплата")
+    can_edit_employees = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: сотрудники")
+    can_edit_settings = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: настройки")
+
     branches = models.ManyToManyField(
         "Branch",
         through="BranchMembership",
@@ -871,3 +962,261 @@ class ScaleDevice(models.Model):
         if self.branch:
             return f"{self.company.name} / {self.branch.name} / {self.name}"
         return f"{self.company.name} / {self.name}"
+
+
+class CompanyAddon(models.Model):
+    """Платная функция компании (голос, лояльность и т.п.). Включается администратором платформы."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="addons")
+    code = models.SlugField(max_length=64)
+    active = models.BooleanField(default=True)
+    until = models.DateField(null=True, blank=True, help_text="Пусто — бессрочно")
+    note = models.CharField(max_length=255, blank=True, default="")
+    # ТЗ Н-32: откуда функция — key (ключ), trial (пробный доступ), support (включила поддержка)
+    source = models.CharField(max_length=16, default="support", db_default="support")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Платная функция компании"
+        verbose_name_plural = "Платные функции компаний"
+        constraints = [
+            models.UniqueConstraint(fields=["company", "code"], name="uniq_company_addon_code"),
+        ]
+
+    def is_effective(self, today=None) -> bool:
+        from django.utils import timezone
+
+        today = today or timezone.localdate()
+        return self.active and (self.until is None or self.until >= today)
+
+    def __str__(self):
+        return f"{self.company_id}: {self.code}"
+
+
+class UserUiPreferences(models.Model):
+    """
+    Персональные настройки интерфейса пользователя (сайдбар, тема, кнопка кассы).
+    Одна запись на пользователя (singleton per-user).
+    """
+    class ThemeMode(models.TextChoices):
+        LIGHT = "light", "light"
+        DARK = "dark", "dark"
+
+    class ThemeDarkPalette(models.TextChoices):
+        SOFT = "soft", "soft"
+        CLASSIC = "classic", "classic"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(
+        "users.User",
+        on_delete=models.CASCADE,
+        related_name="ui_preferences",
+        verbose_name="Пользователь",
+        db_index=True,
+    )
+    sidebar_auto_close = models.BooleanField(
+        default=False,
+        verbose_name="Автозакрытие сайдбара",
+    )
+    cashier_desktop_download = models.BooleanField(
+        default=True,
+        verbose_name="Кнопка кассы скачивает desktop",
+    )
+    theme_mode = models.CharField(
+        max_length=16,
+        choices=ThemeMode.choices,
+        default=ThemeMode.LIGHT,
+        verbose_name="Тема интерфейса",
+    )
+    theme_dark_palette = models.CharField(
+        max_length=16,
+        choices=ThemeDarkPalette.choices,
+        default=ThemeDarkPalette.SOFT,
+        verbose_name="Стиль тёмной темы",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Обновлено")
+
+    class Meta:
+        verbose_name = "Пользовательские настройки интерфейса"
+        verbose_name_plural = "Пользовательские настройки интерфейса"
+
+    def __str__(self):
+        return f"UiPreferences ({self.user_id})"
+
+
+# ---------------------------------------------------------------------------
+# ТЗ ч.13, 1: настройки программ (касса, программа владельца) на сервере
+# ---------------------------------------------------------------------------
+
+class UserAppSettings(models.Model):
+    """Личные настройки пользователя для программы app (nurmarket-kassa, nurmarket-owner, …)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey("users.User", on_delete=models.CASCADE, related_name="app_settings")
+    app = models.CharField("Программа", max_length=64)
+    settings = models.JSONField("Настройки", default=dict, blank=True)
+    secrets = models.JSONField("Секреты (зашифрованы)", default=dict, blank=True)
+    version = models.PositiveIntegerField("Версия", default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Настройки программы пользователя"
+        verbose_name_plural = "Настройки программ пользователей"
+        constraints = [
+            models.UniqueConstraint(fields=["user", "app"], name="uniq_user_app_settings"),
+        ]
+
+    def __str__(self):
+        return f"{self.app} ({self.user_id})"
+
+
+class CompanyAppSettings(models.Model):
+    """Общие настройки программы app для компании (branch пусто) или филиала."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="app_settings")
+    branch = models.ForeignKey(
+        "users.Branch", on_delete=models.CASCADE, null=True, blank=True, related_name="app_settings"
+    )
+    app = models.CharField("Программа", max_length=64)
+    settings = models.JSONField("Настройки", default=dict, blank=True)
+    secrets = models.JSONField("Секреты (зашифрованы)", default=dict, blank=True)
+    version = models.PositiveIntegerField("Версия", default=0)
+    updated_by = models.ForeignKey(
+        "users.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Настройки программы компании"
+        verbose_name_plural = "Настройки программ компаний"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "app"], condition=Q(branch__isnull=True), name="uniq_company_app_settings"
+            ),
+            models.UniqueConstraint(
+                fields=["company", "branch", "app"], condition=Q(branch__isnull=False),
+                name="uniq_company_branch_app_settings",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.app} ({self.company_id}{'/' + str(self.branch_id) if self.branch_id else ''})"
+
+
+# ---------------------------------------------------------------------------
+# ТЗ ч.13, 2: купленные функции — ключи активации
+# ---------------------------------------------------------------------------
+
+def _new_activation_key():
+    import secrets as _s
+    raw = _s.token_hex(8).upper()
+    return "-".join(raw[i:i + 4] for i in range(0, 16, 4))
+
+
+class FeatureActivationKey(models.Model):
+    """
+    Ключ, который владелец вводит на кассе: включает функцию (code) компании на days дней
+    (пусто — бессрочно). Ключ одноразовый — запоминается, какая компания его использовала.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    key = models.CharField("Ключ", max_length=64, unique=True, default=_new_activation_key)
+    code = models.SlugField("Код функции", max_length=64,
+                            help_text="ai, clients, sales_analytics, restock, salary, debts, service, …")
+    days = models.PositiveIntegerField("Дней", null=True, blank=True, help_text="Пусто — бессрочно")
+    note = models.CharField(max_length=255, blank=True, default="")
+    used_by_company = models.ForeignKey(
+        Company, on_delete=models.SET_NULL, null=True, blank=True, related_name="used_activation_keys"
+    )
+    used_by_user = models.ForeignKey(
+        "users.User", on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Ключ активации функции"
+        verbose_name_plural = "Ключи активации функций"
+
+    def __str__(self):
+        return f"{self.key} → {self.code}"
+
+
+class FeatureTrial(models.Model):
+    """ТЗ Н-32: пробный доступ к функции — один раз на функцию для компании."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="feature_trials")
+    code = models.SlugField(max_length=64)
+    expires_at = models.DateField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Пробный доступ к функции"
+        verbose_name_plural = "Пробные доступы к функциям"
+        constraints = [models.UniqueConstraint(fields=["company", "code"], name="uniq_feature_trial_company_code")]
+
+
+class FeatureKeyAttempt(models.Model):
+    """ТЗ Н-32: неверная попытка ввода ключа функции (защита от подбора, 10 в час)."""
+
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="+")
+    ip = models.GenericIPAddressField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        verbose_name = "Неверная попытка ключа"
+        verbose_name_plural = "Неверные попытки ключей"
+
+
+class AdminPin(models.Model):
+    """PIN подтверждения опасных действий (ТЗ п.10): хэш, счётчик неверных попыток, блокировка."""
+
+    user = models.OneToOneField("users.User", on_delete=models.CASCADE, related_name="admin_pin")
+    pin_hash = models.CharField(max_length=256)
+    failed_attempts = models.PositiveSmallIntegerField(default=0, db_default=0)
+    locked_until = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "PIN администратора"
+        verbose_name_plural = "PIN администраторов"
+
+
+class CompanyPinSetting(models.Model):
+    """Настройка компании «Подтверждать PIN» для опасных действий."""
+
+    company = models.OneToOneField("users.Company", on_delete=models.CASCADE, related_name="pin_setting")
+    require_pin = models.BooleanField(default=False, db_default=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Настройка PIN компании"
+        verbose_name_plural = "Настройки PIN компаний"
+
+
+class EmployeeAccessCode(models.Model):
+    """ТЗ Н-16: код доступа сотрудника к действию (например, скидка/удаление чека) — хранится хэшем."""
+
+    company = models.ForeignKey("users.Company", on_delete=models.CASCADE, related_name="employee_access_codes")
+    employee = models.ForeignKey("users.User", on_delete=models.CASCADE, related_name="access_codes")
+    action = models.CharField(max_length=64)
+    code_hash = models.CharField(max_length=256)
+    updated_by = models.ForeignKey(
+        "users.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Код доступа сотрудника"
+        verbose_name_plural = "Коды доступа сотрудников"
+        constraints = [
+            models.UniqueConstraint(fields=["employee", "action"], name="uniq_employee_access_code_action"),
+        ]
+        indexes = [models.Index(fields=["company", "action"], name="ix_empcode_company_action")]

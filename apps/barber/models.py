@@ -148,19 +148,30 @@ class Service(models.Model):
     class Meta:
         verbose_name = 'Услуга'
         verbose_name_plural = 'Услуги'
-        # заменяем unique_together на условные ограничения:
         constraints = [
-            # уникальность названия в рамках филиала
+            # уникальность названия в рамках филиала и категории
+            models.UniqueConstraint(
+                fields=('branch', 'category', 'name'),
+                name='uniq_service_name_per_branch_and_cat',
+                condition=Q(branch__isnull=False, category__isnull=False),
+            ),
+            # уникальность названия глобально по компании и категории
+            models.UniqueConstraint(
+                fields=('company', 'category', 'name'),
+                name='uniq_service_name_global_per_cat',
+                condition=Q(branch__isnull=True, category__isnull=False),
+            ),
+            # уникальность названия без категории («Общее») в рамках филиала
             models.UniqueConstraint(
                 fields=('branch', 'name'),
-                name='uniq_service_name_per_branch',
-                condition=Q(branch__isnull=False),
+                name='uniq_service_name_per_branch_no_cat',
+                condition=Q(branch__isnull=False, category__isnull=True),
             ),
-            # и отдельно — для глобальных услуг в рамках компании
+            # уникальность названия без категории («Общее») глобально по компании
             models.UniqueConstraint(
                 fields=('company', 'name'),
-                name='uniq_service_name_global_per_company',
-                condition=Q(branch__isnull=True),
+                name='uniq_service_name_global_no_cat',
+                condition=Q(branch__isnull=True, category__isnull=True),
             ),
         ]
         indexes = [
@@ -174,6 +185,10 @@ class Service(models.Model):
     def clean(self):
         if self.branch_id and self.branch.company_id != self.company_id:
             raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+        if self.category_id and self.category.company_id != self.company_id:
+            raise ValidationError({'category': 'Категория принадлежит другой компании.'})
+        if self.category_id and self.branch_id and self.category.branch_id not in (None, self.branch_id):
+            raise ValidationError({'category': 'Категория принадлежит другому филиалу.'})
 
 
 # ===========================
@@ -304,6 +319,7 @@ class Appointment(models.Model):
         COMPLETED = "completed", "Завершено"
         CANCELED = "canceled", "Отменено"
         NO_SHOW = "no_show", "Не пришёл"
+        DELETED = "deleted", "Удалено"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -603,17 +619,48 @@ class Payout(models.Model):
     mode = models.CharField(
         max_length=16,
         choices=Mode.choices,
+        default=Mode.PERCENT,
+        blank=True,
         verbose_name="Режим",
     )
 
-    # ставка:
+    # ставка (legacy):
     #   - mode=record  → сумма за одну запись
     #   - mode=fixed   → фиксированная сумма
     #   - mode=percent → процент от выручки (0–100)
     rate = models.DecimalField(
         max_digits=10,
         decimal_places=2,
+        default=Decimal("0.00"),
+        blank=True,
         verbose_name="Ставка",
+    )
+
+    percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="% от выручки",
+        null=True,
+        blank=True,
+    )
+
+    per_record = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="Фикс за запись",
+        null=True,
+        blank=True,
+    )
+
+    fixed = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        verbose_name="Оклад за месяц",
+        null=True,
+        blank=True,
     )
 
     # результат расчёта на момент создания выплаты

@@ -101,9 +101,21 @@ class BarberSalaryService:
         if diff != 0:
             accruals_data[max_share_idx]["service_amount"] += diff
 
+        # Группируем начисления по услуге для сохранения уникальности (appointment, service)
+        grouped_accruals = {}
+        for item in accruals_data:
+            svc_id = item["service"].id
+            if svc_id not in grouped_accruals:
+                grouped_accruals[svc_id] = {
+                    "service": item["service"],
+                    "percent": item["percent"],
+                    "service_amount": Decimal("0.00"),
+                }
+            grouped_accruals[svc_id]["service_amount"] += item["service_amount"]
+
         # Создаем начисления в БД
         with transaction.atomic():
-            for item in accruals_data:
+            for item in grouped_accruals.values():
                 service = item["service"]
                 percent = item["percent"]
                 service_amount = item["service_amount"]

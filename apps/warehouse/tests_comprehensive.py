@@ -1128,8 +1128,9 @@ class WarehouseComprehensiveTests(TestCase):
         # Удаляем баланс (симулируем edge case)
         models.StockBalance.objects.filter(warehouse=self.wh1, product=self.prod1).delete()
         
-        # Отменяем - баланс должен быть создан и отменен move должен быть применен
-        services.unpost_document(doc)
+        # Отменяем - баланс должен быть создан и отменен move должен быть применен.
+        # Откат в минус (QA B03) — только явным allow_negative.
+        services.unpost_document(doc, allow_negative=True)
         
         bal = models.StockBalance.objects.get(warehouse=self.wh1, product=self.prod1)
         # Документ добавил +30, отмена должна вычесть -30, поэтому баланс будет -30
@@ -1174,7 +1175,7 @@ class WarehouseComprehensiveTests(TestCase):
         with self.assertRaises(ValueError) as cm:
             services.post_document(doc)
         
-        self.assertIn("empty", str(cm.exception).lower())
+        self.assertEqual(getattr(cm.exception, "api_code", None), "document_empty")
     
     # ==================== ТЕСТЫ ВЕСОВЫХ ТОВАРОВ ====================
     

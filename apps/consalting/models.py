@@ -1,3 +1,4 @@
+from decimal import Decimal
 from django.db import models
 from django.core.exceptions import ValidationError
 from django.utils import timezone
@@ -120,6 +121,10 @@ class TariffConsalting(TimeStampedModel):
         choices=[('month', 'Месяц'), ('year', 'Год')],
         verbose_name='Период абонентки'
     )
+    provisions_crm_account = models.BooleanField("Создавать CRM-аккаунт", default=False)
+    crm_sector_id = models.IntegerField("Сектор CRM", null=True, blank=True)
+    crm_subscription_plan_id = models.IntegerField("Тарифный план CRM", null=True, blank=True)
+    initial_access_days = models.PositiveIntegerField("Дней начального доступа", default=30)
 
     class Meta:
         verbose_name = 'Тариф услуги'
@@ -155,6 +160,11 @@ class SaleConsalting(TimeStampedModel):
         PENDING_CONFIRMATION = "pending_confirmation", "Ждёт подтверждения"
         CANCELED = "canceled", "Отменена"
         REFUNDED = "refunded", "Частичный возврат"
+
+    class Kind(models.TextChoices):
+        SALE = "sale", "Обычная продажа"
+        SUBSCRIPTION = "subscription", "Подписка"
+        ADDON = "addon", "Доп. продажа"
 
     class CancelReason(models.TextChoices):
         CLIENT_REFUSED = "client_refused", "Клиент отказался"
@@ -239,6 +249,7 @@ class SaleConsalting(TimeStampedModel):
     subscription_started_at = models.DateTimeField(
         null=True, blank=True, verbose_name="Старт абонентки"
     )
+    paid_months = models.PositiveIntegerField(default=1, verbose_name="Оплачено месяцев вперёд")
     # Сделка-«подложка» для оплаты абонентки: ClientDeal(kind=DEBT) с помесячными
     # взносами (DealInstallment). Создаётся лениво при запросе расписания; через неё
     # работает существующий /api/main/clients/{cid}/deals/{did}/pay/.
@@ -249,6 +260,44 @@ class SaleConsalting(TimeStampedModel):
         related_name="consalting_subscription_sales",
         related_query_name="consalting_subscription_sale",
         verbose_name="Сделка абонентки",
+    )
+    deal = models.ForeignKey(
+        "main.ClientDeal",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="consalting_direct_sales",
+        verbose_name="Сделка",
+    )
+    kind = models.CharField(
+        max_length=16,
+        choices=Kind.choices,
+        default=Kind.SALE,
+        db_index=True,
+        verbose_name="Тип продажи",
+    )
+    source = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        db_index=True,
+        verbose_name="Источник",
+    )
+    payment_mode = models.CharField(
+        max_length=24,
+        blank=True,
+        default="cash",
+        verbose_name="Способ оплаты",
+    )
+    debt_months = models.PositiveIntegerField(
+        default=0,
+        verbose_name="Срок рассрочки (мес)",
+    )
+    idempotency_key = models.CharField(
+        max_length=64,
+        blank=True,
+        null=True,
+        db_index=True,
+        verbose_name="Ключ идемпотентности",
     )
     description = models.TextField(verbose_name="Заметка", blank=True)
 
@@ -278,25 +327,6 @@ class SaleConsalting(TimeStampedModel):
         return f"{service_name} — {self.company}"
 
 
-class SaleRefundConsalting(TimeStampedModel):
-    """Частичный возврат: продажа остаётся, часть суммы возвращается (§8.2)."""
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="consalting_sale_refunds")
-    sale = models.ForeignKey(SaleConsalting, on_delete=models.CASCADE, related_name="refunds")
-    amount = models.DecimalField(max_digits=12, decimal_places=2)
-    reason = models.CharField(max_length=32, choices=SaleConsalting.CancelReason.choices)
-    comment = models.TextField(blank=True)
-    refund_mode = models.CharField(max_length=16, default="cash")  # cash | transfer | none
-    created_by = models.ForeignKey(User, null=True, on_delete=models.SET_NULL)
-
-    class Meta:
-        verbose_name = "Частичный возврат продажи"
-        verbose_name_plural = "Частичные возвраты продаж"
-        ordering = ["-created_at"]
-
-    def __str__(self):
-        return f"Refund {self.sale_id}: {self.amount} ({self.reason})"
-
     # ----- расчёт итоговой суммы -----
     def base_price(self):
         """Цена тарифа, если выбран; иначе базовая цена услуги (с учетом ролевого переопределения)."""
@@ -319,7 +349,7 @@ class SaleRefundConsalting(TimeStampedModel):
         return Decimal("0.00")
 
     def items_total(self):
-        return sum((i.price or 0) for i in self.items.all())
+        return sum((i.price or Decimal("0.00")) * (getattr(i, 'quantity', 1) or 1) for i in self.items.all())
 
     def compute_total(self):
         """Итого = цена по роли + доп. товары − скидка + наценка."""
@@ -360,9 +390,29 @@ class SaleRefundConsalting(TimeStampedModel):
                 raise ValidationError({'client': 'Клиент другого филиала.'})
 
 
+class SaleRefundConsalting(TimeStampedModel):
+    """Частичный возврат: продажа остаётся, часть суммы возвращается (§8.2)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="consalting_sale_refunds")
+    sale = models.ForeignKey(SaleConsalting, on_delete=models.CASCADE, related_name="refunds")
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    reason = models.CharField(max_length=32, choices=SaleConsalting.CancelReason.choices)
+    comment = models.TextField(blank=True)
+    refund_mode = models.CharField(max_length=16, default="cash")  # cash | transfer | none
+    created_by = models.ForeignKey(User, null=True, on_delete=models.SET_NULL)
+
+    class Meta:
+        verbose_name = "Частичный возврат продажи"
+        verbose_name_plural = "Частичные возвраты продаж"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Refund {self.sale_id}: {self.amount} ({self.reason})"
+
+
 # ======== Доп. товар в продаже ========
 class SaleItemConsalting(TimeStampedModel):
-    """Произвольный доп. товар/позиция в продаже (название + цена)."""
+    """Произвольный доп. товар/позиция в продаже (название + цена + количество)."""
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     sale = models.ForeignKey(
         SaleConsalting,
@@ -373,6 +423,7 @@ class SaleItemConsalting(TimeStampedModel):
     )
     name = models.CharField(max_length=255, verbose_name='Название')
     price = models.DecimalField(max_digits=12, decimal_places=2, verbose_name='Цена')
+    quantity = models.PositiveIntegerField(default=1, verbose_name='Количество')
 
     class Meta:
         verbose_name = 'Доп. товар продажи'
@@ -474,6 +525,26 @@ class RequestsConsalting(TimeStampedModel):
     status = models.CharField(max_length=20, choices=Status.choices, verbose_name='Статус', default=Status.NEW)
     name = models.CharField(max_length=255, verbose_name="Заявка")
     description = models.TextField(verbose_name="Описание", blank=True)
+    assigned_to = models.ForeignKey(
+        "users.User",
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="consalting_requests_assigned",
+        verbose_name="Ответственный сотрудник",
+    )
+
+    class Acceptance(models.TextChoices):
+        PENDING = 'pending', 'Ожидает'
+        ACCEPTED = 'accepted', 'Принята'
+        DECLINED = 'declined', 'Отклонена'
+
+    acceptance = models.CharField(
+        max_length=16,
+        choices=Acceptance.choices,
+        null=True, blank=True,
+        verbose_name='Статус принятия'
+    )
+    decline_reason = models.TextField(blank=True, default='', verbose_name='Причина отказа')
 
     class Meta:
         verbose_name = "Заявка на консультацию"
@@ -481,6 +552,7 @@ class RequestsConsalting(TimeStampedModel):
         ordering = ['-created_at']
         indexes = [
             models.Index(fields=['company', 'status']),
+            models.Index(fields=['company', 'assigned_to']),
             models.Index(fields=['company', 'branch', 'status']),
             models.Index(fields=['company', 'name']),
         ]
@@ -569,7 +641,9 @@ class FunnelConsalting(TimeStampedModel):
     class FunnelKind(models.TextChoices):
         MAIN = 'main', 'Основная'
         ROLE = 'role', 'Роль'
+        REGION = 'region', 'Региональная'
         CUSTOM = 'custom', 'Пользовательская'
+        EMPLOYEE = 'employee', 'Воронка сотрудника'
 
     class NextAssign(models.TextChoices):
         KEEP = "keep", "Оставить текущего ответственного"
@@ -601,6 +675,17 @@ class FunnelConsalting(TimeStampedModel):
     funnel_kind = models.CharField(
         max_length=16, choices=FunnelKind.choices, default=FunnelKind.CUSTOM,
         db_index=True, verbose_name='Тип воронки'
+    )
+    parent_funnel = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="child_funnels", verbose_name="Родительская воронка"
+    )
+    owner_user = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="owned_funnels", verbose_name="Владелец воронки"
+    )
+    region_code = models.CharField(
+        max_length=32, blank=True, default="", db_index=True, verbose_name="Код региона"
     )
     is_main = models.BooleanField(default=False, verbose_name='Основная')
     is_static = models.BooleanField(
@@ -672,6 +757,48 @@ class FunnelConsalting(TimeStampedModel):
 
     def __str__(self):
         return self.name or str(self.id)
+
+    def ensure_system_stages(self):
+        """Гарантирует 3 базовые системные стадии (intake, in_progress, completed) §3.3."""
+        stages = list(self.stages.all().order_by("order"))
+
+        intake_stage = next((s for s in stages if getattr(s, "system_key", "") == "intake" or s.order == 1 or s.stage_type == "new_lead"), None)
+        if not intake_stage:
+            intake_stage = FunnelStageConsalting.objects.create(
+                company=self.company,
+                funnel=self,
+                name="Новый лид",
+                stage_type="new_lead",
+                system_key="intake",
+                order=1,
+                color="#3498db"
+            )
+            stages.insert(0, intake_stage)
+
+        has_progress = any(getattr(s, "system_key", "") == "in_progress" or (s.order > 1 and s.stage_type not in ["won", "lost"]) for s in stages)
+        if not has_progress:
+            FunnelStageConsalting.objects.create(
+                company=self.company,
+                funnel=self,
+                name="В работе",
+                stage_type="in_work",
+                system_key="in_progress",
+                order=2,
+                color="#f39c12"
+            )
+
+        has_won = any(s.stage_type == "won" for s in stages)
+        if not has_won:
+            max_order = max([s.order for s in stages] + [2]) + 1
+            FunnelStageConsalting.objects.create(
+                company=self.company,
+                funnel=self,
+                name="Успешно завершено",
+                stage_type="won",
+                system_key="completed",
+                order=max_order,
+                color="#2ecc71"
+            )
 
     @property
     def is_protected(self) -> bool:
@@ -835,7 +962,25 @@ class FunnelStageConsalting(TimeStampedModel):
         ]
 
     def __str__(self):
-        return f"{self.service.name} — {self.name}"
+        funnel_name = self.funnel.name if getattr(self, "funnel", None) else ""
+        if funnel_name:
+            return f"{funnel_name} — {self.name}"
+        return self.name or f"Этап {self.id}"
+
+    def save(self, *args, **kwargs):
+        # синхронизируем устаревшие флаги с семантическим типом
+        self.is_final = self.stage_type in self.TERMINAL_TYPES
+        self.is_success = self.stage_type in self.SUCCESS_TYPES
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        if self.funnel_id:
+            if self.company_id and self.funnel.company_id != self.company_id:
+                raise ValidationError({'funnel': 'Воронка принадлежит другой компании.'})
+            if self.funnel.branch_id not in (None, self.branch_id):
+                raise ValidationError({'funnel': 'Воронка относится к другому филиалу.'})
+        if self.branch_id and self.company_id and self.branch.company_id != self.company_id:
+            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
 
 
 class ServiceRolePriceConsalting(TimeStampedModel):
@@ -863,6 +1008,13 @@ class ServiceRolePriceConsalting(TimeStampedModel):
     def __str__(self):
         return f"{self.service.name} ({self.custom_role}): {self.price}"
 
+    def clean(self):
+        if self.price is not None and self.price < 0:
+            raise ValidationError({'price': 'Цена не может быть отрицательной.'})
+        if self.service_id and self.custom_role_id:
+            if self.custom_role.company_id not in (None, self.service.company_id):
+                raise ValidationError({'custom_role': 'Роль принадлежит другой компании.'})
+
 
 class TariffRolePriceConsalting(TimeStampedModel):
     """Переопределение цены тарифа для конкретной роли."""
@@ -889,21 +1041,12 @@ class TariffRolePriceConsalting(TimeStampedModel):
     def __str__(self):
         return f"{self.tariff.name} ({self.custom_role}): {self.price}"
 
-
-    def save(self, *args, **kwargs):
-        # синхронизируем устаревшие флаги с семантическим типом
-        self.is_final = self.stage_type in self.TERMINAL_TYPES
-        self.is_success = self.stage_type in self.SUCCESS_TYPES
-        super().save(*args, **kwargs)
-
     def clean(self):
-        if self.funnel_id:
-            if self.company_id and self.funnel.company_id != self.company_id:
-                raise ValidationError({'funnel': 'Воронка принадлежит другой компании.'})
-            if self.funnel.branch_id not in (None, self.branch_id):
-                raise ValidationError({'funnel': 'Воронка относится к другому филиалу.'})
-        if self.branch_id and self.company_id and self.branch.company_id != self.company_id:
-            raise ValidationError({'branch': 'Филиал принадлежит другой компании.'})
+        if self.price is not None and self.price < 0:
+            raise ValidationError({'price': 'Цена не может быть отрицательной.'})
+        if self.tariff_id and self.custom_role_id:
+            if self.custom_role.company_id not in (None, self.tariff.company_id):
+                raise ValidationError({'custom_role': 'Роль принадлежит другой компании.'})
 
 
 # ======== Лид (карточка) ========
@@ -914,6 +1057,14 @@ class LeadConsalting(TimeStampedModel):
         IN_WORK = 'in_work', 'В работе'
         WON = 'won', 'Успешно закрыт'
         LOST = 'lost', 'Потерян'
+
+    class QueueStatus(models.TextChoices):
+        NEW = 'new', 'Новый'
+        ASSIGNED = 'assigned', 'Назначен'
+        IN_WORK = 'in_work', 'В работе'
+        DEFERRED = 'deferred', 'Отложен'
+        CONVERTED = 'converted', 'Конвертирован (Сделка)'
+        REJECTED = 'rejected', 'Отказ'
 
     class Grade(models.TextChoices):
         A = 'A', 'Горячий'
@@ -986,8 +1137,10 @@ class LeadConsalting(TimeStampedModel):
     full_name = models.CharField(max_length=255, blank=True, verbose_name='Контактное лицо')
     phone = models.CharField(max_length=32, blank=True, db_index=True, verbose_name='Телефон')
     email = models.EmailField(blank=True, verbose_name='Email')
+    address = models.CharField(max_length=255, blank=True, default='', verbose_name='Адрес')
 
     source = models.CharField(max_length=100, blank=True, verbose_name='Источник')
+    region_code = models.CharField(max_length=32, blank=True, default="", db_index=True, verbose_name="Код региона")
     estimated_value = models.DecimalField(
         max_digits=12, decimal_places=2, default=0, verbose_name='Оценочная стоимость'
     )
@@ -996,6 +1149,23 @@ class LeadConsalting(TimeStampedModel):
         max_length=20, choices=Status.choices, default=Status.NEW, verbose_name='Статус'
     )
     closed_at = models.DateTimeField(null=True, blank=True, verbose_name='Дата закрытия')
+
+    # ----- Очередь / Единая база лидов (13-unify-leads-single-model) -----
+    queue_status = models.CharField(
+        max_length=16, choices=QueueStatus.choices, default=QueueStatus.NEW, db_index=True, verbose_name='Статус очереди'
+    )
+    channel = models.CharField(max_length=32, blank=True, verbose_name='Канал поступления')
+    remind_at = models.DateTimeField(null=True, blank=True, db_index=True, verbose_name='Напомнить в')
+    defer_reason = models.CharField(max_length=32, blank=True, verbose_name='Причина откладывания')
+    defer_comment = models.TextField(blank=True, verbose_name='Комментарий к откладыванию')
+    defer_count = models.PositiveIntegerField(default=0, verbose_name='Количество откладываний')
+    deferred_at = models.DateTimeField(null=True, blank=True, verbose_name='Дата откладывания')
+    reminded_at = models.DateTimeField(null=True, blank=True, verbose_name='Дата напоминания')
+    reject_reason = models.CharField(max_length=32, blank=True, verbose_name='Причина отказа')
+    reject_comment = models.TextField(blank=True, verbose_name='Комментарий к отказу')
+    first_reply_at = models.DateTimeField(null=True, blank=True, verbose_name='Первый ответ менеджера')
+    converted_at = models.DateTimeField(null=True, blank=True, verbose_name='Дата конвертации')
+    inbound_external_id = models.CharField(max_length=128, blank=True, db_index=True, verbose_name='Внешний ID входящего лида')
 
     # ----- Скоринг -----
     score_grade = models.CharField(
@@ -1535,6 +1705,18 @@ class WhatsAppMessageConsalting(TimeStampedModel):
         default=Status.PENDING,
         verbose_name='Статус'
     )
+    PROVIDER_CHOICES = [
+        ('wazzup', 'Wazzup'),
+        ('greenapi', 'GreenAPI'),
+    ]
+    provider = models.CharField(
+        max_length=20,
+        choices=PROVIDER_CHOICES,
+        default='wazzup',
+        null=True,
+        blank=True,
+        verbose_name='Провайдер отправки'
+    )
 
     class Meta:
         verbose_name = 'WhatsApp сообщение консалтинга'
@@ -1547,6 +1729,33 @@ class WhatsAppMessageConsalting(TimeStampedModel):
 
     def __str__(self):
         return f"{self.direction} - {self.message_id} ({self.status})"
+
+
+class ChatReadStateConsalting(models.Model):
+    """Персональная позиция прочтения сотрудника в чате лида."""
+    lead = models.ForeignKey(
+        LeadConsalting,
+        on_delete=models.CASCADE,
+        related_name="chat_read_states",
+    )
+    employee = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="consalting_chat_read_states",
+    )
+    last_read_message_id = models.CharField(max_length=64, null=True, blank=True)
+    last_read_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Состояние прочтения чата"
+        verbose_name_plural = "Состояния прочтения чатов"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("lead", "employee"),
+                name="uniq_consalting_chat_read_state",
+            ),
+        ]
+        indexes = [models.Index(fields=("employee", "lead"))]
 
 
 # ======== Wazzup аккаунт консалтинга ========
@@ -1594,6 +1803,38 @@ class WazzupAccountConsalting(TimeStampedModel):
     )
     is_active = models.BooleanField(default=True, verbose_name='Активен')
     is_connected = models.BooleanField(default=False, verbose_name='Подключен')
+
+    # === Резервный канал GREEN-API (Fallback) ===
+    green_api_id_instance = models.CharField(
+        max_length=255,
+        default='',
+        blank=True,
+        verbose_name='GREEN-API idInstance',
+        help_text='idInstance из личного кабинета GREEN-API'
+    )
+    green_api_token_instance = models.CharField(
+        max_length=255,
+        default='',
+        blank=True,
+        verbose_name='GREEN-API apiTokenInstance',
+        help_text='apiTokenInstance из личного кабинета GREEN-API'
+    )
+    green_api_url = models.CharField(
+        max_length=255,
+        default='https://api.greenapi.com',
+        blank=True,
+        verbose_name='GREEN-API Host URL'
+    )
+    green_api_media_url = models.CharField(
+        max_length=255,
+        default='https://api.greenapi.com',
+        blank=True,
+        verbose_name='GREEN-API Media Host URL'
+    )
+    green_api_enabled = models.BooleanField(
+        default=True,
+        verbose_name='Включить GREEN-API как резервный канал'
+    )
 
     class Meta:
         verbose_name = 'Wazzup аккаунт консалтинга'
@@ -1942,6 +2183,7 @@ class InboundLeadConsalting(TimeStampedModel):
     full_name = models.CharField(max_length=255, blank=True, verbose_name="Имя клиента")
     phone = models.CharField(max_length=32, blank=True, db_index=True, verbose_name="Телефон")
     source = models.CharField(max_length=32, default="whatsapp", verbose_name="Источник")
+    region_code = models.CharField(max_length=32, blank=True, default="", db_index=True, verbose_name="Код региона")
     external_id = models.CharField(max_length=128, blank=True, verbose_name="ID сообщения провайдера")
     message = models.TextField(blank=True, verbose_name="Текст сообщения")
     owner = models.ForeignKey(
@@ -1970,6 +2212,11 @@ class InboundLeadConsalting(TimeStampedModel):
     first_reply_at = models.DateTimeField(null=True, blank=True, verbose_name="Время первого ответа")
     converted_at = models.DateTimeField(null=True, blank=True, verbose_name="Время конвертации")
     closed_at = models.DateTimeField(null=True, blank=True, verbose_name="Время закрытия")
+    assigned_to = models.ForeignKey(
+        'users.User', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='consalting_inbound_leads_assigned',
+        verbose_name='Сотрудник'
+    )
     sale = models.ForeignKey(
         "SaleConsalting", null=True, blank=True, on_delete=models.SET_NULL,
         related_name="inbound_leads", verbose_name="Продажа"
@@ -2049,7 +2296,9 @@ class SubscriptionConsalting(TimeStampedModel):
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     period = models.CharField(max_length=8, choices=Period.choices, default=Period.MONTH)
     start_date = models.DateField()
+    paid_through = models.DateField(null=True, blank=True, verbose_name="Оплачено по")
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
+    autorenew = models.BooleanField(default=True, verbose_name="Автопродление")
     canceled_at = models.DateTimeField(null=True, blank=True)
     created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
 
@@ -2077,8 +2326,12 @@ class SubscriptionPaymentConsalting(models.Model):
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.PLANNED)
     paid_at = models.DateTimeField(null=True, blank=True)
+    paid_via = models.CharField(max_length=32, blank=True, default="", verbose_name="Канал оплаты")
     cashbox_id = models.UUIDField(null=True, blank=True)
     payment_method = models.CharField(max_length=32, blank=True, default="")
+    cash_operation = models.ForeignKey(
+        "CashOperationConsalting", null=True, blank=True, on_delete=models.SET_NULL, related_name="subscription_payments"
+    )
 
     class Meta:
         verbose_name = "Платёж абонентской подписки"
@@ -2156,6 +2409,9 @@ class CashOperationConsalting(TimeStampedModel):
     sale = models.ForeignKey(
         "SaleConsalting", null=True, blank=True, on_delete=models.SET_NULL, related_name="cash_operations"
     )
+    subscription = models.ForeignKey(
+        "SubscriptionConsalting", null=True, blank=True, on_delete=models.SET_NULL, related_name="cash_operations"
+    )
     kind = models.CharField(max_length=16, choices=Kind.choices, default=Kind.SALE, db_index=True)
     direction = models.CharField(max_length=8, choices=Direction.choices, default=Direction.INCOME)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
@@ -2201,6 +2457,9 @@ class CashRequestConsalting(TimeStampedModel):
     sale = models.ForeignKey(
         "SaleConsalting", null=True, blank=True, on_delete=models.SET_NULL, related_name="cash_requests"
     )
+    subscription = models.ForeignKey(
+        "SubscriptionConsalting", null=True, blank=True, on_delete=models.SET_NULL, related_name="cash_requests"
+    )
     subscription_payment = models.ForeignKey(
         "SubscriptionPaymentConsalting", null=True, blank=True, on_delete=models.SET_NULL, related_name="cash_requests"
     )
@@ -2211,6 +2470,8 @@ class CashRequestConsalting(TimeStampedModel):
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     payment_method = models.CharField(max_length=16, blank=True, default="cash")
     comment = models.TextField(blank=True)
+    period_month = models.CharField(max_length=64, blank=True, default="")
+    prepaid_count = models.PositiveIntegerField(default=1)
 
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True)
     confirmed_by = models.ForeignKey(
@@ -2244,7 +2505,7 @@ class CashConfirmationSettingsConsalting(TimeStampedModel):
     company = models.OneToOneField(
         Company, on_delete=models.CASCADE, related_name="consalting_cash_confirmation"
     )
-    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.CASH_ONLY)
+    mode = models.CharField(max_length=16, choices=Mode.choices, default=Mode.OFF)
     skip_for_cashier = models.BooleanField(default=True)
     overdue_hours = models.PositiveIntegerField(default=24)
 
@@ -2254,6 +2515,163 @@ class CashConfirmationSettingsConsalting(TimeStampedModel):
 
     def __str__(self):
         return f"CashConfirmationSettings ({self.company}): mode={self.mode}"
+
+
+class TenantSubscriptionExtension(TimeStampedModel):
+    """Журнал продлений CRM-аккаунта клиента по абонентской плате (§10.4)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="tenant_subscription_extensions")
+    consalting_client = models.ForeignKey("main.Client", on_delete=models.CASCADE, related_name="tenant_extensions")
+    subscription_payment = models.ForeignKey("SubscriptionPaymentConsalting", null=True, blank=True, on_delete=models.SET_NULL, related_name="tenant_extensions")
+    old_end_date = models.DateField(null=True, blank=True)
+    new_end_date = models.DateField()
+    period = models.CharField(max_length=8)  # month | year
+    extended_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+
+    class Meta:
+        verbose_name = "Продление подписки tenant"
+        verbose_name_plural = "Продления подписок tenant"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.company} extended to {self.new_end_date} by {self.extended_by}"
+
+
+class RegionalFunnelRoutingConsalting(TimeStampedModel):
+    """Настройки компании: куда класть inbound (§4.1)."""
+    class FallbackStrategy(models.TextChoices):
+        ROUND_ROBIN = "round_robin", "Round-Robin между воронками правил"
+        DEFAULT_FUNNEL = "default_funnel", "Воронка по умолчанию"
+
+    class BalanceStrategy(models.TextChoices):
+        LEAST_LOADED = "least_loaded", "Наименее загруженный"
+        ROUND_ROBIN = "round_robin", "Round-Robin"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.OneToOneField(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="consalting_regional_routing",
+        verbose_name="Компания",
+    )
+    enabled = models.BooleanField(default=False, verbose_name="Включено")
+    fallback_strategy = models.CharField(
+        max_length=16,
+        choices=FallbackStrategy.choices,
+        default=FallbackStrategy.ROUND_ROBIN,
+        verbose_name="Стратегия fallback",
+    )
+    balance_strategy = models.CharField(
+        max_length=16,
+        choices=BalanceStrategy.choices,
+        default=BalanceStrategy.LEAST_LOADED,
+        verbose_name="Стратегия балансировки",
+    )
+    default_funnel = models.ForeignKey(
+        "FunnelConsalting",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        verbose_name="Воронка по умолчанию",
+    )
+    _rr_cursor = models.PositiveIntegerField(default=0, verbose_name="Курсор RR")
+
+    class Meta:
+        verbose_name = "Региональная маршрутизация воронок"
+        verbose_name_plural = "Региональная маршрутизация воронок"
+
+    def __str__(self):
+        return f"Regional routing for {self.company} (enabled={self.enabled})"
+
+
+class RegionalFunnelRuleConsalting(TimeStampedModel):
+    """Правило региональной маршрутизации (§4.1)."""
+    class AssignStrategy(models.TextChoices):
+        ROUND_ROBIN = "round_robin", "Round-Robin"
+        LEAST_LOADED = "least_loaded", "Наименее загруженный"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    routing = models.ForeignKey(
+        RegionalFunnelRoutingConsalting,
+        on_delete=models.CASCADE,
+        related_name="rules",
+        verbose_name="Маршрутизация",
+    )
+    funnel = models.ForeignKey(
+        "FunnelConsalting",
+        on_delete=models.CASCADE,
+        related_name="regional_rules",
+        verbose_name="Воронка",
+    )
+    region_code = models.CharField(max_length=32, verbose_name="Код региона")  # bishkek | osh | jalal_abad
+    label = models.CharField(max_length=64, blank=True, default="", verbose_name="Название региона")
+    phone_prefixes = models.JSONField(default=list, blank=True, verbose_name="Префиксы телефонов")
+    wazzup_account_ids = models.JSONField(default=list, blank=True, verbose_name="Аккаунты Wazzup")
+    source_channels = models.JSONField(default=list, blank=True, verbose_name="Каналы источника")
+    assign_role_ids = models.JSONField(default=list, blank=True, verbose_name="Роли для назначения")
+    assign_strategy = models.CharField(
+        max_length=16,
+        choices=AssignStrategy.choices,
+        default=AssignStrategy.ROUND_ROBIN,
+        verbose_name="Стратегия назначения",
+    )
+    is_active = models.BooleanField(default=True, verbose_name="Активно")
+    _rr_cursor = models.PositiveIntegerField(default=0, verbose_name="Курсор RR")
+    order = models.PositiveIntegerField(default=0, verbose_name="Порядок")
+
+    class Meta:
+        verbose_name = "Правило региональной маршрутизации"
+        verbose_name_plural = "Правила региональной маршрутизации"
+        ordering = ["order", "created_at"]
+        unique_together = ("routing", "region_code")
+
+    def __str__(self):
+        return f"Rule {self.region_code} -> {self.funnel.name}"
+
+
+class LeadAdSpend(TimeStampedModel):
+    """Строка рекламного отчёта: один день закупки трафика (§8.2)."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(
+        Company,
+        on_delete=models.CASCADE,
+        related_name="lead_ad_spends",
+        db_index=True,
+        verbose_name="Компания",
+    )
+    date = models.DateField(db_index=True, verbose_name="Дата")
+    impressions = models.PositiveIntegerField(default=0, verbose_name="Показы")
+    leads = models.PositiveIntegerField(default=0, verbose_name="Лиды")
+    spend = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"), verbose_name="Сумма затрат")
+    note = models.CharField(max_length=255, blank=True, default="", verbose_name="Примечание")
+
+    created_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        verbose_name="Создал",
+    )
+
+    class Meta:
+        verbose_name = "Рекламный отчёт лидов"
+        verbose_name_plural = "Рекламные отчёты лидов"
+        unique_together = [("company", "date")]
+        ordering = ["-date"]
+        indexes = [
+            models.Index(fields=["company", "date"]),
+        ]
+
+    @property
+    def cost_per_lead(self) -> Decimal:
+        if self.leads > 0:
+            return (self.spend / Decimal(str(self.leads))).quantize(Decimal("0.01"))
+        return Decimal("0.00")
+
+    def __str__(self):
+        return f"{self.company} — {self.date}: {self.spend} ({self.leads} лидов)"
 
 
 

@@ -1,0 +1,379 @@
+from django.urls import path
+from .views import *
+from .pos_views import *
+from .analytics_market import *
+from .analytics_dashboard import *
+from .document import SaleReceiptAPIView, SaleInvoiceAPIView
+from apps.main.showcase.views_public import PublicCompanyProductDetailAPIView, PublicCompanyAPIView, PublicCompanyShowcaseAPIView
+from apps.main.inventory_views import (
+    ProductInventorySessionListCreateAPIView,
+    ProductInventorySessionRetrieveAPIView,
+    ProductInventorySessionApplyAPIView,
+    ProductInventorySessionCancelAPIView,
+)
+from apps.main.production_salary_views import (
+    ProductionRateListAPIView,
+    ProductionRateDetailAPIView,
+    ProductionPieceRateListAPIView,
+    ProductionPieceRateDetailAPIView,
+    ProductionWorkSessionListCreateAPIView,
+    ProductionWorkSessionDetailAPIView,
+    ProductionAccrualListAPIView,
+    ProductionSalarySummaryAPIView,
+    ProductionPayoutListCreateAPIView,
+)
+from apps.construction.views import CashFlowListCreateView
+
+
+urlpatterns = [
+
+    # 🔹 Контакты
+    path('socialapplications/<uuid:pk>/', SocialApplicationsRetrieveUpdateDestroyAPIView.as_view(), name='socialapplications-detail'),
+    path('socialapplications/', SocialApplicationsListCreateAPIView.as_view(), name='socialapplications-list-create'),
+    
+    path('applications/<uuid:pk>/', BidRetrieveUpdateDestroyAPIView.as_view(), name='applications-detail'),
+    path('applications/', BidListCreateAPIView.as_view(), name='applications-list-create'),
+
+    path('contacts/', ContactListCreateAPIView.as_view(), name='contact-list-create'),
+    path('contacts/<uuid:pk>/', ContactRetrieveUpdateDestroyAPIView.as_view(), name='contact-detail'),
+
+    # 🔹 Воронки
+    path('pipelines/', PipelineListCreateAPIView.as_view(), name='pipeline-list-create'),
+    path('pipelines/<uuid:pk>/', PipelineRetrieveUpdateDestroyAPIView.as_view(), name='pipeline-detail'),
+
+    # 🔹 Сделки
+    path('deals/', DealListCreateAPIView.as_view(), name='deal-list-create'),
+    path('deals/<uuid:pk>/', DealRetrieveUpdateDestroyAPIView.as_view(), name='deal-detail'),
+
+    # 🔹 Задачи
+    path('tasks/', TaskListCreateAPIView.as_view(), name='task-list-create'),
+    path('tasks/<uuid:pk>/', TaskRetrieveUpdateDestroyAPIView.as_view(), name='task-detail'),
+
+    # 🔹 Заказы и позиции заказов
+    path('orders/', OrderListCreateAPIView.as_view(), name='order-list-create'),
+    path('orders/<uuid:pk>/', OrderRetrieveUpdateDestroyAPIView.as_view(), name='order-detail'),
+    # (если нужна работа с отдельными позициями заказа — реализуй OrderItemAPIView)
+    # path('order-items/<uuid:pk>/', OrderItemAPIView.as_view(), name='order-item-detail'),
+
+    # 🔹 Продукты, категории, бренды
+    path('products/list/', ProductListView.as_view(), name='product-list'),
+    path('products/compact-list/', ProductCompactListView.as_view(), name='product-compact-list'),
+    path('products/scale-export/', WeightProductsScaleExportAPIView.as_view(), name='product-scale-export'),
+    path('products/create-by-barcode/', ProductCreateByBarcodeAPIView.as_view(), name='product-create-by-barcode'),
+    path('products/create-manual/', ProductCreateManualAPIView.as_view(), name='product-create-manual'),
+    path('products/bulk-update/', ProductBulkUpdateAPIView.as_view(), name='product-bulk-update'),
+    path('products/<uuid:pk>/', ProductRetrieveUpdateDestroyAPIView.as_view(), name='product-detail'),
+    path('products/<uuid:pk>/purchase-batches/', ProductPurchaseBatchListAPIView.as_view(), name='product-purchase-batches'),
+    path('products/<uuid:pk>/expiry-batches/', ProductExpiryBatchListAPIView.as_view(), name='product-expiry-batches'),
+    path("products/<uuid:product_id>/favorite/", ProductFavoriteAPIView.as_view(), name="product-favorite"),
+    path("products/bulk-update/", ProductBulkUpdateAPIView.as_view(), name="product-bulk-update"),
+    path("products/bulk-delete/", ProductBulkDeleteAPIView.as_view(), name="product-bulk-delete"),
+    path("products/<uuid:product_id>/move-to-raw/", ProductMoveToRawAPIView.as_view(), name="product-move-to-raw"),
+
+    # 🔹 Перемещение готовой продукции в сырьё (история / отмена)
+    path("finished-to-raw-transfers/", FinishedToRawTransferListAPIView.as_view(), name="finished-to-raw-list"),
+    path("finished-to-raw-transfers/<uuid:pk>/cancel/", FinishedToRawTransferCancelAPIView.as_view(), name="finished-to-raw-cancel"),
+
+    # 🔹 Инвентаризация (сверка остатков)
+    path("inventories/", InventoryListCreateAPIView.as_view(), name="inventory-list-create"),
+    path("inventories/<uuid:pk>/", InventoryRetrieveAPIView.as_view(), name="inventory-detail"),
+    path("inventories/<uuid:pk>/confirm/", InventoryConfirmAPIView.as_view(), name="inventory-confirm"),
+
+    # 🔹 Нехватка готовой продукции (событие + уведомления)
+    path("stock-shortages/", StockShortageCreateAPIView.as_view(), name="stock-shortage-create"),
+
+    # 🔹 Журнал движения склада (read-only)
+    path("stock-movements/", StockMovementListAPIView.as_view(), name="stock-movement-list"),
+    path("stock-movements/<uuid:pk>/", StockMovementDetailAPIView.as_view(), name="stock-movement-detail"),
+    path("production/report/", ProductionReportListAPIView.as_view(), name="production-report"),
+
+    # Зарплата в производстве
+    path("production/salary/rates/", ProductionRateListAPIView.as_view(), name="production-salary-rates"),
+    path("production/salary/rates/<uuid:employee_id>/", ProductionRateDetailAPIView.as_view(), name="production-salary-rate-detail"),
+    path("production/salary/piece-rates/", ProductionPieceRateListAPIView.as_view(), name="production-salary-piece-rates"),
+    path("production/salary/piece-rates/<uuid:product_id>/", ProductionPieceRateDetailAPIView.as_view(), name="production-salary-piece-rate-detail"),
+    path("production/salary/work-sessions/", ProductionWorkSessionListCreateAPIView.as_view(), name="production-salary-work-sessions"),
+    path("production/salary/work-sessions/<uuid:pk>/", ProductionWorkSessionDetailAPIView.as_view(), name="production-salary-work-session-detail"),
+    path("production/salary/accruals/", ProductionAccrualListAPIView.as_view(), name="production-salary-accruals"),
+    path("production/salary/summary/", ProductionSalarySummaryAPIView.as_view(), name="production-salary-summary"),
+    path("production/salary/payouts/", ProductionPayoutListCreateAPIView.as_view(), name="production-salary-payouts"),
+
+    # Инвентаризация товаров (остаток Product.quantity)
+    path("inventory/sessions/", ProductInventorySessionListCreateAPIView.as_view(), name="product-inventory-session-list"),
+    path("inventory/sessions/<uuid:pk>/", ProductInventorySessionRetrieveAPIView.as_view(), name="product-inventory-session-detail"),
+    path("inventory/sessions/<uuid:pk>/apply/", ProductInventorySessionApplyAPIView.as_view(), name="product-inventory-session-apply"),
+    path("inventory/sessions/<uuid:pk>/cancel/", ProductInventorySessionCancelAPIView.as_view(), name="product-inventory-session-cancel"),
+    path('products/barcode/<str:barcode>/', ProductByBarcodeAPIView.as_view(), name='product-by-barcode'),
+    path('products/warehouse-barcode/<str:barcode>/', ProductWarehouseBarcodeAPIView.as_view(), name='product-warehouse-barcode'),
+    path('products/global-barcode/<str:barcode>/', ProductByGlobalBarcodeAPIView.as_view(), name='product-by-barcode'),
+    path('products/form-layout/', ProductFormLayoutAPIView.as_view(), name='product-form-layout'),
+    
+    #photo
+    path("products/<uuid:product_id>/images/",
+         ProductImageListCreateAPIView.as_view(), name="productimage-list-create"),
+    path("products/<uuid:product_id>/images/<uuid:image_id>/",
+         ProductImageRetrieveUpdateDestroyAPIView.as_view(), name="productimage-rud"),
+
+
+    path('categories/', ProductCategoryListCreateAPIView.as_view(), name='category-list'),
+    path('categories/<uuid:pk>/', ProductCategoryRetrieveUpdateDestroyAPIView.as_view(), name='category-detail'),
+
+    path('brands/', ProductBrandListCreateAPIView.as_view(), name='brand-list'),
+    path('brands/<uuid:pk>/', ProductBrandRetrieveUpdateDestroyAPIView.as_view(), name='brand-detail'),
+
+    # 🔹 Склад и складские события
+    path('warehouses/', WarehouseListCreateAPIView.as_view(), name='warehouse-list-create'),
+    path('warehouses/<uuid:pk>/', WarehouseRetrieveUpdateDestroyAPIView.as_view(), name='warehouse-retrieve-update-destroy'),
+
+    path('warehouse-events/', WarehouseEventListCreateAPIView.as_view(), name='warehouse-event-list-create'),
+    path('warehouse-events/<uuid:pk>/', WarehouseEventRetrieveUpdateDestroyAPIView.as_view(), name='warehouse-event-retrieve-update-destroy'),
+
+    # 🔹 Интеграции и аналитика
+    path('integrations/', IntegrationListCreateAPIView.as_view(), name='integration-list-create'),
+    path('integrations/<uuid:pk>/', IntegrationRetrieveUpdateDestroyAPIView.as_view(), name='integration-detail'),
+
+    path('analytics/', AnalyticsListAPIView.as_view(), name='analytics-list'),
+    path('analytics/dashboard/', OwnerDashboardAnalyticsAPIView.as_view(), name='analytics-dashboard'),
+    path('analytics/dashboard/my/', MyDashboardAnalyticsAPIView.as_view(), name='analytics-dashboard-my'),
+    path("analytics/cards/details/", AnalyticsCardDetailsAPIView.as_view(), name="analytics-card-details"),
+
+    # 🔹 Отзывы
+    path('reviews/', ReviewListCreateAPIView.as_view(), name='review-list-create'),
+    path('reviews/<uuid:pk>/', ReviewRetrieveUpdateDestroyAPIView.as_view(), name='review-detail'),
+
+    # 🔹 Уведомления
+    path('notifications/', NotificationListView.as_view(), name='notification-list'),
+    path('notifications/mark-all-read/', MarkAllNotificationsReadView.as_view(), name='mark-all-notifications-read'),
+    path('notifications/<uuid:pk>/read/', MarkNotificationReadView.as_view(), name='notification-read'),
+    path('notifications/<uuid:pk>/', NotificationDetailView.as_view(), name='notification-detail'),
+    path('pos/quick-slots/', POSQuickSlotsAPIView.as_view(), name='pos-quick-slots'),
+
+    # 🔹 События
+    path('events/', EventListCreateAPIView.as_view(), name='event-list-create'),
+    path('events/<uuid:pk>/', EventRetrieveUpdateDestroyAPIView.as_view(), name='event-detail'),
+    path('orders/analytics/', OrderAnalyticsView.as_view(), name='order-analytics'),
+    
+    path("clients/", ClientListCreateAPIView.as_view(), name="client-list"),
+    path("clients/<uuid:pk>/", ClientRetrieveUpdateDestroyAPIView.as_view(), name="client-detail"),
+    path(
+        "clients/<uuid:client_id>/agent-analytics/",
+        ClientAgentAnalyticsAPIView.as_view(),
+        name="client-agent-analytics",
+    ),
+    path(
+        "clients/<uuid:client_id>/kpis/",
+        ClientKPIsAPIView.as_view(),
+        name="client-kpis",
+    ),
+    path(
+        "clients/<uuid:client_id>/deals/",
+        ClientDealListCreateAPIView.as_view(),
+        name="client-deals-list-create",
+    ),
+    path(
+        "clients/<uuid:client_id>/deals/<uuid:pk>/",
+        ClientDealRetrieveUpdateDestroyAPIView.as_view(),
+        name="client-deals-detail",
+    ),
+    path("clients/<uuid:client_id>/deals/pay-any/", ClientDealsPayAnyAPIView.as_view(), name="client-deals-pay-any"),
+
+    # pay/refund (nested)
+    path(
+        "clients/<uuid:client_id>/deals/<uuid:pk>/pay/",
+        ClientDealPayAPIView.as_view(),
+        name="client-deal-pay",
+    ),
+    path(
+        "clients/<uuid:client_id>/deals/<uuid:pk>/refund/",
+        ClientDealRefundAPIView.as_view(),
+        name="client-deal-refund",
+    ),
+
+    # ✅ legacy alias: unpay -> refund (вернёт всё по последнему/указанному взносу)
+    path(
+        "clients/<uuid:client_id>/deals/<uuid:pk>/unpay/",
+        ClientDealRefundAPIView.as_view(),
+        name="client-deal-unpay",
+    ),
+
+    # ===== flat =====
+    path("clientdeals/", ClientDealListCreateAPIView.as_view(), name="deal-list-create"),
+    path("clientdeals/<uuid:pk>/", ClientDealRetrieveUpdateDestroyAPIView.as_view(), name="deal-detail"),
+
+    path("clientdeals/<uuid:pk>/pay/", ClientDealPayAPIView.as_view(), name="deal-pay"),
+    path("clientdeals/<uuid:pk>/refund/", ClientDealRefundAPIView.as_view(), name="deal-refund"),
+
+    # ✅ legacy alias: unpay -> refund
+    path("clientdeals/<uuid:pk>/unpay/", ClientDealRefundAPIView.as_view(), name="deal-unpay"),
+
+    # ✅ если у тебя где-то уже был такой путь — оставь как алиас тоже
+    path("deals/<uuid:pk>/unpay/", ClientDealRefundAPIView.as_view(), name="deal-unpay-legacy"),
+
+    # ===== extra =====
+    path("clients/with-debts/", ClientWithDebtsListAPIView.as_view(), name="clients-with-debts"),
+    path(
+        "clients/<uuid:client_id>/reconciliation/",
+        ClientReconciliationClassicAPIView.as_view(),
+        name="client-reconciliation",
+    ),
+    path("clients/<uuid:client_id>/reconciliation/json/", ClientReconciliationJSONAPIView.as_view()),
+    path(
+        "clients/<uuid:client_id>/subscription-schedule/",
+        ClientSubscriptionScheduleAPIView.as_view(),
+        name="client-subscription-schedule",
+    ),
+    
+    path("pos/sales/", SaleListAPIView.as_view(), name="pos-sale-list"),
+    path("pos/sale-consultants/", SaleConsultantsAPIView.as_view(), name="pos-sale-consultants"),
+    path("pos/cashier-settings/", MarketCashierSettingsAPIView.as_view(), name="pos-cashier-settings"),
+    path("pos/cashier-settings/verify-delete-code/", VerifyDeleteCodeAPIView.as_view(), name="pos-verify-delete-code"),
+    path("pos/sales/start/", SaleStartAPIView.as_view(), name="pos-sale-start"),
+    path("pos/carts/<uuid:pk>/custom-item/", SaleAddCustomItemAPIView.as_view(), name="pos-cart-add-custom-item"),
+    path("pos/carts/<uuid:pk>/", CartDetailAPIView.as_view(), name="pos-cart-detail"),
+    path("sales/bulk-delete/", SaleBulkDeleteAPIView.as_view(), name="sale-bulk-delete"),
+    path("pos/sales/<uuid:pk>/", SaleRetrieveAPIView.as_view(), name="pos-sale-detail"),
+    path("pos/sales/<uuid:pk>/scan/", SaleScanAPIView.as_view(), name="pos-sale-scan"),
+    path("pos/sales/<uuid:pk>/add-item/", SaleAddItemAPIView.as_view(), name="pos-sale-add-item"),
+    path("pos/sales/<uuid:pk>/checkout/", SaleCheckoutAPIView.as_view(), name="pos-sale-checkout"),
+    path("pos/sales/<uuid:pk>/pay-debt/", SalePayDebtAPIView.as_view(), name="pos-sale-pay-debt"),
+    path("pos/sales/<uuid:pk>/return/", SaleReturnAPIView.as_view(), name="pos-sale-return"),
+    path("pos/sales/<uuid:pk>/mobile-scanner/", SaleMobileScannerTokenAPIView.as_view(), name="pos-sale-mobile-scanner"),
+    path(
+        "pos/carts/<uuid:cart_id>/items/<uuid:item_id>/",
+        CartItemUpdateDestroyAPIView.as_view(),
+        name="pos-cart-item-update-destroy",
+    ),
+    path(
+        "pos/cart-item-deletions/",
+        CartItemDeletionLogListAPIView.as_view(),
+        name="pos-cart-item-deletions",
+    ),
+    path("pos/printer-settings/", PosPrinterSettingAPIView.as_view(), name="pos-printer-settings"),
+    path("pos/sales/<uuid:pk>/receipt/", SaleReceiptDataAPIView.as_view(), name="sale-receipt-download"),
+    path("sales/<uuid:pk>/invoice/", SaleInvoiceDownloadAPIView.as_view()),
+    
+    path("sales/json/<uuid:pk>/receipt/", SaleReceiptAPIView.as_view(), name="sale-receipt"),
+    path("sales/json/<uuid:pk>/invoice/", SaleInvoiceAPIView.as_view(), name="sale-invoice"),
+    
+    path("transactions/", TransactionRecordListCreateView.as_view(), name="transaction-list"),
+    path("transactions/<uuid:pk>/", TransactionRecordRetrieveUpdateDestroyView.as_view(), name="transaction-detail"),
+    
+    path("contractor-works/", ContractorWorkListCreateAPIView.as_view(), name="contractorwork-list"),
+    path("contractor-works/<uuid:pk>/", ContractorWorkRetrieveUpdateDestroyAPIView.as_view(), name="contractorwork-detail"),
+
+    # nested по отделу (если нужно)
+    path("departments/<uuid:department_id>/contractor-works/", ContractorWorkListCreateAPIView.as_view(), name="department-contractorwork-list"),
+    path("departments/<uuid:department_id>/contractor-works/<uuid:pk>/", ContractorWorkRetrieveUpdateDestroyAPIView.as_view(), name="department-contractorwork-detail"),
+    
+    path("debts/", DebtListCreateAPIView.as_view(), name="debt-list"),
+    path("debts/<uuid:pk>/", DebtRetrieveUpdateDestroyAPIView.as_view(), name="debt-detail"),
+    path("debts/<uuid:pk>/pay/", DebtPayAPIView.as_view(), name="debt-pay"),
+    path("debts/<uuid:pk>/payments/", DebtPaymentListAPIView.as_view(), name="debt-payments"),
+    path("cashflows/", CashFlowListCreateView.as_view(), name="main-cashflows-alias"),
+    
+    path("object-items/", ObjectItemListCreateAPIView.as_view()),
+    path("object-items/<uuid:pk>/", ObjectItemRetrieveUpdateDestroyAPIView.as_view()),
+
+    path("object-sales/", ObjectSaleListCreateAPIView.as_view()),
+    path("object-sales/<uuid:pk>/", ObjectSaleRetrieveUpdateDestroyAPIView.as_view()),
+    path("object-sales/<uuid:sale_id>/items/", ObjectSaleAddItemAPIView.as_view()),
+    
+    path("items-make/", ItemListCreateAPIView.as_view(), name="item-make-list-create"),
+    path("items-make/<uuid:pk>/process/", ItemMakeProcessAPIView.as_view(), name="item-make-process"),
+    path("items-make/<uuid:pk>/purchase/", ItemMakePurchaseAPIView.as_view(), name="item-make-purchase"),
+    path("items-make/<uuid:pk>/", ItemRetrieveUpdateDestroyAPIView.as_view(), name="item-make-detail"),
+
+    # -------------------------
+    # Поставщики -> товары -> оприходование
+    # -------------------------
+    path("suppliers/", SupplierListAPIView.as_view(), name="supplier-list"),
+    path("suppliers/receipts/", SupplierReceiptListAPIView.as_view(), name="supplier-receipts"),
+    path("suppliers/receipts/<uuid:pk>/", SupplierReceiptRetrieveAPIView.as_view(), name="supplier-receipt-detail"),
+    path("suppliers/returns/", SupplierReturnListAPIView.as_view(), name="supplier-returns-list"),
+    path("suppliers/returns/<uuid:pk>/", SupplierReturnRetrieveAPIView.as_view(), name="supplier-returns-detail"),
+    path("suppliers/<uuid:supplier_id>/returns/", SupplierReturnCreateAPIView.as_view(), name="supplier-returns-create"),
+    path("supplier-returns/", SupplierReturnListAPIView.as_view(), name="supplier-returns-list-alias"),
+    path("supplier-returns/<uuid:pk>/", SupplierReturnRetrieveAPIView.as_view(), name="supplier-returns-detail-alias"),
+    path("suppliers/<uuid:supplier_id>/products/", SupplierProductsListAPIView.as_view(), name="supplier-products"),
+    path("suppliers/<uuid:supplier_id>/purchases/", SupplierPurchasesListAPIView.as_view(), name="supplier-purchases"),
+    path("suppliers/<uuid:supplier_id>/receipt/", SupplierReceiptAPIView.as_view(), name="supplier-receipt"),
+    path("suppliers/<uuid:supplier_id>/recommendations/", SupplierRecommendationsAPIView.as_view(), name="supplier-recommendations"),
+    
+    path("subreals/", ManufactureSubrealListCreateAPIView.as_view(), name="subreal-list-create"),
+    path("subreals/<uuid:pk>/", ManufactureSubrealRetrieveUpdateDestroyAPIView.as_view(), name="subreal-detail"),
+    path("subreals/bulk/", ManufactureSubrealBulkCreateAPIView.as_view(), name="subreal-bulk-create"),
+
+    # -------------------------
+    # Приёмы
+    # -------------------------
+    path("acceptances/", AcceptanceListCreateAPIView.as_view(), name="acceptance-list-create"),
+    path("acceptances/<uuid:pk>/", AcceptanceRetrieveDestroyAPIView.as_view(), name="acceptance-detail"),
+
+    # -------------------------
+    # Возвраты
+    # -------------------------
+    path("returns/", ReturnFromAgentListCreateAPIView.as_view(), name="return-list-create"),
+    path("returns/<uuid:pk>/", ReturnFromAgentRetrieveDestroyAPIView.as_view(), name="return-detail"),
+    path("returns/<uuid:pk>/approve/", ReturnFromAgentApproveAPIView.as_view(), name="return-approve"),
+    path("returns/approve-bulk/", ReturnFromAgentBulkApproveAPIView.as_view(), name="return-approve-bulk"),
+    path("returns/<uuid:pk>/reject/", ReturnFromAgentRejectAPIView.as_view(), name="return-reject"),
+
+    # -------------------------
+    # Агент: свои товары и возвраты
+    # -------------------------
+    path("agents/me/products/", AgentMyProductsListAPIView.as_view(), name="agent-my-products"),
+    path("agents/me/returns/", AgentMyReturnsListCreateAPIView.as_view(), name="agent-my-returns"),
+    path("agents/me/subreals/", AgentMySubrealsListAPIView.as_view(), name="agent-my-subreals"),
+    path(
+        "owners/agents/products/",
+        OwnerAgentsProductsListAPIView.as_view(),
+        name="owner-agents-products-list",
+    ),
+    path("agents/me/cart/start/", AgentCartStartAPIView.as_view()),
+    path("agents/me/carts/<uuid:pk>/", CartDetailAPIView.as_view(), name="agent-cart-detail"),
+    path("agents/me/carts/<uuid:pk>/scan/", AgentSaleScanAPIView.as_view()),
+    path("agents/me/carts/<uuid:pk>/add-item/", AgentSaleAddItemAPIView.as_view()),
+    path("agents/me/carts/<uuid:pk>/custom-item/", AgentSaleAddCustomItemAPIView.as_view()),
+    path("agents/me/carts/<uuid:pk>/checkout/", AgentSaleCheckoutAPIView.as_view()),
+    path("agents/me/sales/", AgentMySalesListAPIView.as_view(), name="agent-my-sales-list"),
+    path("agents/me/sales/<uuid:pk>/", AgentMySaleRetrieveAPIView.as_view(), name="agent-my-sale-detail"),
+    path("agents/me/sales/<uuid:pk>/return/", AgentSaleReturnAPIView.as_view(), name="agent-sale-return"),
+    path("agents/me/carts/<uuid:cart_id>/items/<uuid:item_id>/", AgentCartItemUpdateDestroyAPIView.as_view(),name="agent-cart-item-update-destroy", ),
+    
+    
+    path("agent-carts/", AgentRequestCartListCreateAPIView.as_view()),
+    path("agent-carts/<uuid:pk>/", AgentRequestCartRetrieveUpdateDestroyAPIView.as_view()),
+    path("agent-carts/<uuid:pk>/submit/", AgentRequestCartSubmitAPIView.as_view()),
+    path("agent-carts/<uuid:pk>/approve/", AgentRequestCartApproveAPIView.as_view()),
+    path("agent-carts/<uuid:pk>/reject/", AgentRequestCartRejectAPIView.as_view()),
+
+    path("agent-cart-items/", AgentRequestItemListCreateAPIView.as_view()),
+    path("agent-cart-items/<uuid:pk>/", AgentRequestItemRetrieveUpdateDestroyAPIView.as_view()),
+    
+    path("agents/me/products/", AgentMyProductsListAPIView.as_view(), name="agent-my-products"),
+
+    path("agents/me/analytics/", AgentMyAnalyticsAPIView.as_view(), name="agent-my-analytics"),
+    path("owners/agents/<uuid:agent_id>/analytics/", OwnerAgentAnalyticsAPIView.as_view(), name="owner-agent-analytics",),
+    path("owners/analytics/", OwnerOverallAnalyticsAPIView.as_view(), name="owner-overall-analytics"),
+    
+    
+    path("analytics/market/", AnalyticsView.as_view(), name="analytics"),
+    path(
+        "market-sale-employee-pay-profiles/",
+        MarketSaleEmployeePayProfileListCreateAPIView.as_view(),
+        name="market-sale-employee-pay-profile-list",
+    ),
+    path(
+        "market-sale-employee-pay-profiles/<uuid:pk>/",
+        MarketSaleEmployeePayProfileRetrieveUpdateDestroyAPIView.as_view(),
+        name="market-sale-employee-pay-profile-detail",
+    ),
+
+    path("public/companies/<slug:slug>/", PublicCompanyAPIView.as_view()),
+    path("public/companies/<slug:slug>/showcase/", PublicCompanyShowcaseAPIView.as_view()),
+    path("public/companies/<slug:slug>/showcase/<uuid:product_id>/", PublicCompanyProductDetailAPIView.as_view()),
+    
+    path("public/knowledge-base/", PublicKnowledgeBaseCourseListCreateAPIView.as_view()),
+    path("public/knowledge-base/<uuid:course_id>/", PublicKnowledgeBaseCourseRetrieveAPIView.as_view()),
+
+]

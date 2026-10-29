@@ -162,6 +162,80 @@ def _broadcast_consalting_message(company_id, lead, wa_message, is_inbound, text
 
 
 class WazzupConsaltingService:
+    @classmethod
+    def edit_message(cls, message_id, new_text, user=None, company_id=None):
+        wa_msg = None
+        try:
+            uuid.UUID(str(message_id))
+            wa_msg = WhatsAppMessageConsalting.objects.filter(id=message_id).first()
+        except ValueError:
+            pass
+        if not wa_msg:
+            wa_msg = WhatsAppMessageConsalting.objects.filter(message_id=str(message_id)).first()
+
+        if not wa_msg:
+            raise ValueError("Сообщение не найдено.")
+
+        comp_id = company_id or wa_msg.company_id
+        account = WazzupAccountConsalting.objects.filter(company_id=comp_id, is_active=True).first()
+
+        wa_msg.text = new_text
+        wa_msg.save(update_fields=["text", "updated_at"])
+
+        if account and account.green_api_id_instance and account.green_api_token_instance and wa_msg.message_id:
+            phone = ""
+            if wa_msg.lead and wa_msg.lead.phone:
+                phone = _normalize_phone(wa_msg.lead.phone)
+            if phone:
+                chat_id = f"{phone}@c.us"
+                url = f"{account.green_api_url or 'https://7107.api.greenapi.com'}/waInstance{account.green_api_id_instance}/editMessage/{account.green_api_token_instance}"
+                try:
+                    r = requests.post(url, json={"chatId": chat_id, "idMessage": wa_msg.message_id, "message": new_text}, timeout=10)
+                    logger.info("GreenAPI editMessage status: %s", r.status_code)
+                except Exception as e:
+                    logger.warning("GreenAPI editMessage failed: %s", e)
+
+        _broadcast_message_edit(wa_msg)
+        return wa_msg
+
+    @classmethod
+    def delete_message(cls, message_id, user=None, company_id=None):
+        wa_msg = None
+        try:
+            uuid.UUID(str(message_id))
+            wa_msg = WhatsAppMessageConsalting.objects.filter(id=message_id).first()
+        except ValueError:
+            pass
+        if not wa_msg:
+            wa_msg = WhatsAppMessageConsalting.objects.filter(message_id=str(message_id)).first()
+
+        if not wa_msg:
+            raise ValueError("Сообщение не найдено.")
+
+        comp_id = company_id or wa_msg.company_id
+        account = WazzupAccountConsalting.objects.filter(company_id=comp_id, is_active=True).first()
+
+        msg_id_str = str(wa_msg.id)
+        message_id_val = wa_msg.message_id
+        lead_id_str = str(wa_msg.lead_id) if wa_msg.lead_id else None
+
+        if account and account.green_api_id_instance and account.green_api_token_instance and wa_msg.message_id:
+            phone = ""
+            if wa_msg.lead and wa_msg.lead.phone:
+                phone = _normalize_phone(wa_msg.lead.phone)
+            if phone:
+                chat_id = f"{phone}@c.us"
+                url = f"{account.green_api_url or 'https://7107.api.greenapi.com'}/waInstance{account.green_api_id_instance}/deleteMessage/{account.green_api_token_instance}"
+                try:
+                    r = requests.post(url, json={"chatId": chat_id, "idMessage": wa_msg.message_id}, timeout=10)
+                    logger.info("GreenAPI deleteMessage status: %s", r.status_code)
+                except Exception as e:
+                    logger.warning("GreenAPI deleteMessage failed: %s", e)
+
+        wa_msg.delete()
+        _broadcast_message_delete(comp_id, msg_id_str, message_id_val, lead_id_str)
+        return True
+
     """
     Интеграционный сервис Wazzup API v3 для воронки консалтинга.
     https://api.wazzup24.com/v3
@@ -195,7 +269,7 @@ class WazzupConsaltingService:
             logger.warning(f"Failed to mark chat read in Wazzup: {e}")
 
     @staticmethod
-    def send_message(account: WazzupAccountConsalting, lead: LeadConsalting, text: str, user: User = None, content_uri: str = None) -> WhatsAppMessageConsalting:
+    def send_message(account: WazzupAccountConsalting, lead: LeadConsalting, text: str, user: User = None, content_uri: str = None, media_type: str = "", content_type: str = "") -> WhatsAppMessageConsalting:
         """
         Отправка исходящего сообщения в Wazzup API (POST /v3/message)
         """
@@ -223,7 +297,9 @@ class WazzupConsaltingService:
                 direction=WhatsAppMessageConsalting.Direction.OUTBOUND,
                 text=effective_text,
                 content_uri=content_uri,
-                status=WhatsAppMessageConsalting.Status.PENDING
+                media_type=media_type or None,
+                status=WhatsAppMessageConsalting.Status.PENDING,
+                provider="wazzup"
             )
             check_and_set_first_reply(phone=clean_phone, lead=lead, company_id=account.company_id)
 
@@ -277,14 +353,23 @@ class WazzupConsaltingService:
             # Обновляем канбан воронку через WebSocket после коммита
             transaction.on_commit(lambda: realtime.lead_updated(lead_obj))
 
-            # Реальная отправка в Wazzup — в фоне, после коммита транзакции.
+            # Реальная отправка в Wazzup / GREEN-API — мгновенно в фоновом потоке после коммита
             from apps.consalting.tasks import send_wazzup_message
             wa_id = str(wa_message.id)
             acc_id = str(account.id)
             out_t = text or ""
             out_u = content_uri or ""
+            out_mt = media_type or ""
+            out_ct = content_type or ""
+            def _send_bg():
+                try:
+                    send_wazzup_message(wa_id, acc_id, out_t, out_u, out_mt, out_ct)
+                except Exception as _e:
+                    logger.error("send_wazzup_message error: %s", _e)
+
+            import threading
             transaction.on_commit(
-                lambda: send_wazzup_message.delay(wa_id, acc_id, out_t, out_u)
+                lambda: threading.Thread(target=_send_bg, daemon=True).start()
             )
 
         return wa_message
@@ -406,7 +491,15 @@ class WazzupConsaltingService:
 
                 created_lead = False
                 if not lead:
-                    funnel = FunnelConsalting.objects.filter(company_id=account.company_id).first()
+                    from .regional_routing import resolve_funnel_and_assignee
+                    reg_funnel, reg_stage, reg_rule, reg_user = resolve_funnel_and_assignee(
+                        company=account.company,
+                        phone=phone,
+                        wazzup_account_id=str(account.id),
+                        source="whatsapp"
+                    )
+
+                    funnel = reg_funnel or FunnelConsalting.objects.filter(company_id=account.company_id).first()
                     if not funnel:
                         funnel = FunnelConsalting.objects.create(
                             company_id=account.company_id,
@@ -414,7 +507,7 @@ class WazzupConsaltingService:
                             name="Воронка консалтинга"
                         )
 
-                    stage = FunnelStageConsalting.objects.filter(funnel=funnel).order_by("order").first()
+                    stage = reg_stage or FunnelStageConsalting.objects.filter(funnel=funnel).order_by("order").first()
                     if not stage:
                         stage = FunnelStageConsalting.objects.create(
                             company_id=account.company_id,
@@ -429,10 +522,11 @@ class WazzupConsaltingService:
                         branch_id=account.branch_id,
                         funnel=funnel,
                         stage=stage,
+                        owner=reg_user,
                         title=f"Заявка из {account.get_integration_type_display()} ({phone})",
                         phone=phone,
                         full_name=author_name or f"Клиент {phone}",
-                        status=LeadConsalting.Status.NEW
+                        status=LeadConsalting.Status.IN_WORK if reg_user else LeadConsalting.Status.NEW
                     )
                     created_lead = True
 
@@ -627,3 +721,45 @@ class WazzupConsaltingService:
         """Совместимый метод: полная обработка realtime + side_effects."""
         realtime_res = WazzupConsaltingService.handle_wazzup_webhook_realtime(payload)
         WazzupConsaltingService.handle_wazzup_webhook_side_effects(payload, realtime_res)
+
+
+def _broadcast_message_edit(wa_msg):
+    from channels.layers import get_channel_layer
+    from asgiref.sync import async_to_sync
+    channel_layer = get_channel_layer()
+    if channel_layer and wa_msg.company_id:
+        event_group = chat_events_group(wa_msg.company_id)
+        msg_payload = {
+            "type": "wazzup_event",
+            "event": {
+                "type": "message_edited",
+                "data": {
+                    "id": str(wa_msg.id),
+                    "message_id": wa_msg.message_id,
+                    "text": wa_msg.text,
+                    "lead_id": str(wa_msg.lead_id) if wa_msg.lead_id else None,
+                    "updated_at": timezone.now().isoformat() if hasattr(timezone, 'now') else None,
+                }
+            }
+        }
+        async_to_sync(channel_layer.group_send)(event_group, msg_payload)
+
+
+def _broadcast_message_delete(company_id, msg_id_str, message_id_val, lead_id_str):
+    from channels.layers import get_channel_layer
+    from asgiref.sync import async_to_sync
+    channel_layer = get_channel_layer()
+    if channel_layer and company_id:
+        event_group = chat_events_group(company_id)
+        msg_payload = {
+            "type": "wazzup_event",
+            "event": {
+                "type": "message_deleted",
+                "data": {
+                    "id": msg_id_str,
+                    "message_id": message_id_val,
+                    "lead_id": lead_id_str,
+                }
+            }
+        }
+        async_to_sync(channel_layer.group_send)(event_group, msg_payload)

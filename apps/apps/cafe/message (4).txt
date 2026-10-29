@@ -1,0 +1,330 @@
+Информация о сервисе
+Все запросы необходимо отправлять на 
+localhost:8080
+Перед авторизацией нужно установить и запустить FiscalConnectorSetup.exe.
+Верификация SAM карты через ПИН код
+PATH: /driver/verify-pin
+METHOD: POST
+Тело JSON запроса:
+Название поле	Тип	Обязательность	Описание
+registrationNumber	String	+	РНМ кассы (16 символов)
+pin	String	+	PIN код кассы (5 сим)
+
+Тело ответа:
+Название поле	Тип	Описание
+registrationNumber	String	РНМ кассы
+fiscalModuleNumber	String	Номер ФМ кассы
+fmExpirationDate	DateTime	Время истечения ФМ
+
+Дополнительная информация: 
+Метод verifyPin должен вызываться только один раз при инициализации работы с SAM-картой. Повторный вызов необходим только при получении ошибки с кодом 40417 (NOT_VERIFY_PIN) или другие ошибки связанные с SAM картой (таблица ниже).
+Если SAM-карта была извлечена из кардридера и затем вставлена обратно, для продолжения работы с ней необходимо снова выполнить verifyPin.
+Авторизация в системе
+PATH: /driver/auth
+METHOD: POST
+Тело JSON запроса:
+Название поле	Тип	Обязательность	Описание
+login	String	+	Почта
+password	String	+	Пароль
+
+Тело ответа:
+Название поле	Тип	Описание
+accessToken	String	Токен доступа
+fullName	String	Полное имя НП
+cashierName	String	Кассир
+tin	String	ИНН НП
+registrationNumber	String	Регистрационный номер ККМ
+fiscalMemoryNumber	String	Номер фискального модуля
+taxSystemCodes	ArrayList	СНО
+calcItemAttrCodes	ArrayList	Код признак предмета расчета
+locationOriginalAddress	String	Адрес
+entrepreneurshipObjectCode	Integer	Код объект предпринимательства 
+businessActivityCode	Integer	Код вида деятельности
+taxAuthorityDepartmentCode	Integer	Код УГНС
+
+Возможные исключения:
+Название	Код ошибки	HTTP status	Сообщение
+SAM_CARD_NOT_SELECTED
+	40416	NOT_FOUND (404)	SAM карта не выбрана. Выберите SAM карту
+BAD_CREDENTIALS	4005	BAD_REQUEST (400)	Bad credentials
+
+Дополнительная информация: 
+Метод auth требует подключения к интернету и должен вызываться перед открытием смены.
+Метод возвращает токен, срок действия которого составляет 5 минут. После получения токена смену необходимо открыть в течение этого времени.
+Если за 5 минут смена не была открыта, требуется повторная авторизация.
+После закрытия смены токен становится недействительным, и для повторного открытия смены также требуется новая авторизация.
+Дополнительно повторная авторизация требуется при получении ошибки с кодом 4011 (REAUTHORIZATION_REQUIRED). 
+Получение состояние кассы
+PATH: /driver/state-shift
+METHOD: GET
+Headers запроса:
+Название header	Значение
+Authorization	accessToken
+
+Тело ответа:
+Название поле	Тип	Описание
+shiftOpened	Boolean	Булево значение что смена открыта или закрыта
+openShiftDateTime	DateTime	Дата и время открытия смены
+fmExpirationDate	DateTime	Время истечения ФМ
+
+Возможные исключения:
+Название	Код ошибки	Http status	Сообщение
+NEED_TO_CLOSE_SHIFT	40920	CONFLICT (409)	Смена открыта более 24 часов. Пожалуйста, закройте смену.
+
+Открытие смены
+PATH: /driver/open-shift
+METHOD: POST
+Headers запроса:
+Название header	Значение
+Authorization	accessToken
+WIDTH-RECEIPT	Ширины PDF чека (default= 384)
+Response-Type	PDF, JSON
+
+Тело ответа:
+PDF
+Название поле	Тип
+Чек об открытии смены в формате PDF	byte[]
+
+JSON
+
+Возможные исключения:
+Название	Код ошибки	Http status	Сообщение
+SHIFT_IS_NOT_OPENABLE	40310	FORBIDDEN
+(403)	Невозможно открыть смену, так как касса не активна или пользователь не активен
+SHIFT_EXCEPTION	40915	CONFLICT (409)	Смена не открылась {Описание ошибки}
+
+Дополнительная информация: 
+Метод open-shift требует подключения к интернету.
+Остальные операции с кассой могут выполняться без подключения к интернету, включая закрытие смены.
+Для повторного открытия смены интернет-подключение обязательно.
+
+
+
+
+
+X-отчет
+PATH: /driver/x-report
+METHOD: GET
+Headers запроса:
+Название header	Значение
+Authorization	accessToken
+WIDTH-RECEIPT	Ширины PDF чека (default= 384)
+Response-Type	PDF, JSON
+
+Тело ответа:
+PDF
+Название поле	Тип
+X-отчет в формате PDF	byte[]
+
+JSON
+Возможные исключения:
+Название	Код ошибки	Http status	Сообщение
+SHIFT_NOT_OPENED	40918	CONFLICT (409)	Смена не открыта.
+
+Получение денег находящихся в кассе
+PATH: /driver/cash-transaction
+METHOD: GET
+Headers запроса:
+Название header	Значение
+Authorization	accessToken
+
+Тело ответа:
+Название поле	Тип	Описание
+totalAmount	Double	Общее сумма денежных средств в кассе
+withdrawTotal	Double	Общее сумма изъятых денежных средств в кассе
+withdrawCount	Integer	Общее кол-во изъятых денежных средств в кассе
+depositTotal	Double	Общее сумма вложенных денежных средств в кассе
+depositCount	Integer	Общее кол-во вложенных денежных средств в кассе
+
+Получение списка доступных налоговых ставок
+PATH: /driver/cash-register/available-tax-rates
+METHOD: GET
+Headers запроса:
+Название header	Значение
+Authorization	accessToken
+
+Тело ответа:
+Название поле	Тип	Описание
+vatRate	String enum	Значение ставки НДС {VAT_12, VAT_0}
+stRate	String enum	Значение ставки НСП {ST_0, ST_1, ST_2, ST_3, ST_5}
+calculationItemAttributeCode	Integer	Код признак предмет расчета
+
+
+
+Внесение денежных средств
+PATH: /driver/cash-transaction/deposit
+METHOD: POST
+Headers запроса:
+Название header	Значение
+Authorization	accessToken
+WIDTH-RECEIPT	Ширины PDF чека (default= 384)
+Response-Type	PDF, JSON
+
+Тело запроса:
+Название поле	Тип	Обязательность	Описание
+amount	Double	+	Сумма внесения
+
+Тело ответа:
+PDF
+Название поле	Тип
+Отчет о внесении наличных в формате PDF	byte[]
+
+JSON
+Возможные исключения:
+Название	Код ошибки	Http status	Сообщение
+SHIFT_NOT_OPENED	40918	CONFLICT (409)	Смена не открыта.
+
+
+
+
+Изъятие денежных средств
+PATH: /driver/cash-transaction/withdraw
+METHOD: POST
+Headers запроса:
+Название header	Значение
+Authorization	accessToken
+WIDTH-RECEIPT	Ширины PDF чека (default= 384)
+Response-Type	PDF, JSON
+
+Тело запроса:
+Название поле	Тип	Обязательность	Описание
+amount	Double	+	Сумма изъятия
+
+Тело ответа:
+PDF
+Название поле	Тип
+Отчет об изъятии наличных в формате PDF	byte[]
+
+JSON
+Возможные исключения:
+Название	Код ошибки	Http status	Сообщение
+SHIFT_NOT_OPENED	40918	CONFLICT (409)	Смена не открыта.
+NOT ENOUGH MONEY EXCEPTION	40917	CONFLICT (409)	Не хватает наличных денег на кассе.
+
+Пробитие чека 
+PATH: /driver/cash-register/receipt
+METHOD: POST
+Headers запроса:
+Название header	Значение
+Authorization	accessToken
+WIDTH-RECEIPT	Ширины PDF чека (default= 384)
+Response-Type	PDF, JSON
+
+Тело запроса:
+Название поле	Тип	Обязательность	Описание
+operationType	String	+	Тип операции (INCOME, INCOME_RETURN, EXPENDITURE, EXPENDITURE_RETURN)
+paySum	Double	+	Вносимая сумма
+deliverySum	Double	+	Сумма сдачи
+totalSum	Double	+	Общая сумма чека
+totalCashSum	Double	+	Сумма наличных
+totalCashlessSum	Double	+	Сумма безналичных
+originFdNumber	Integer	-	Номер ФД чека основания
+originFnSerialNumber	String	-	Номер ФМ чека основания
+positions	ArrayList<Positions >	+	Позиции в чеке
+
+ArrayList<Positions >:
+Название поле	Тип	Обязательность	Описание
+calcItemAttributeCode	Integer	+	Код признак предмет расчета
+sgtin	String	-	ТНВЭД код
+name	String	+	Наименование товара/услуги
+price	Double	+	Цена ща единицу
+quantity	Double	+	Количество
+cost	Double	+	Общая сумма позиции (Цена ща ед. * Количество)
+measure	String	+	Единица измерения
+vat	Byte	+	Код НДС
+st	byte	+	Код НСП
+
+Тело ответа:
+PDF
+Название поле	Тип
+Чек в формате PDF	byte[]
+
+JSON
+Возможные исключения:
+Название	Код ошибки	Http status	Сообщение
+SHIFT_NOT_OPENED	40918	CONFLICT (409)	Смена не открыта.
+NOT ENOUGH MONEY EXCEPTION	40917	CONFLICT (409)	Не хватает наличных денег на кассе. (При возврате или при покупке)
+
+
+
+
+
+Закрытие смены
+PATH: /driver/close-shift
+METHOD: POST
+Headers запроса:
+Название header	Значение
+Authorization	accessToken
+WIDTH-RECEIPT	Ширины PDF чека (default= 384)
+Response-Type	PDF, JSON
+
+Тело ответа:
+PDF
+Название поле	Тип
+Чек о закрытии смены в формате PDF	byte[]
+
+JSON
+Возможные исключения:
+Название	Код ошибки	Http status	Сообщение
+SHIFT_NOT_OPENED	40918	CONFLICT (409)	Смена не открыта.
+UNABLE_CLOSE_SHIFT	40919	CONFLICT (409)	Невозможно закрыть смену. Нужно изъять наличных средств на кассе.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Справочник по кодам исключений.
+name	HttpStatus	Code	Description
+BAD_REQUEST	BAD_REQUEST	4000	{Описание ошибки}
+BAD_CREDENTIALS	BAD_REQUEST	4005	Bad credentials
+SAM_CARD_NOT_SET_EXCEPTION	BAD_REQUEST	4007	SAM карта не вставлен
+PIN_VERIFICATION_FAILED	BAD_REQUEST	4008	Не правильный PIN code от SAM карты
+SAM_CARD_EXCEPTION	BAD_REQUEST	4009	Неизвестная ошибка при работе с SAM картой
+SAM_CARD_NOT_EQUALS_EXCEPTION	BAD_REQUEST	40010	Вставленный SAM карта не совпадает с указанным РНМ
+SHIFT_ALREADY_OPENED	BAD_REQUEST	40011	Смена уже открыта. Проверьте состояние смены
+SAM_CARD_CONNECTION_EXCEPTION	BAD_REQUEST	40012	Не правильно вставлен SAM карта. Не удается подключится.
+REAUTHORIZATION_REQUIRED	UNAUTHORIZED	4011	Требуется повторная авторизация
+ACCESS_DENIED	FORBIDDEN	4030	Access denied.
+USER_BLOCKED	FORBIDDEN	4032	User blocked
+ACCESS_DENIED_FOR_INSPECTOR	FORBIDDEN	4033	У вас недостаточно прав
+FISCAL_MEMORY_ACCESS_DENIED	FORBIDDEN	4037	Данный ФМ не относится к указанному НП
+CASH_REGISTER_SUSPEND	FORBIDDEN	4038	Ваш доступ к кассе заблокирован из-за оплаты. Пожалуйста, проведите оплату для восстановления доступа и обратитесь по номеру +996(776) 000 116
+CASH_REGISTER_BLOCKED	FORBIDDEN	4039	Ваш доступ к кассе временно заблокирован. Пожалуйста, обратитесь по номеру +996(776) 000 116
+SHIFT_IS_NOT_OPENABLE	FORBIDDEN	40310	Невозможно открыть смену, так как касса не активна или пользователь не активен
+COMPANY_NOT_FOUND	NOT_FOUND	4041	Налогоплательщик не найден в базе ГНС
+DICTIONARY_NOT_FOUND	NOT_FOUND	4042	Dictionary is not found by code
+TOKEN_NOT_FOUND_BY_USER	NOT_FOUND	4043	Access token is not found with user id:
+FISCAL_MEMORY_NOT_REGISTERED	NOT_FOUND	40415	ФМ не зарегистрирован в ФПО
+SAM_CARD_NOT_SELECTED	NOT_FOUND	40416	SAM карта не выбрана. Выберите SAM карту
+NOT_VERIFY_PIN	NOT_FOUND	40417	SAM карта не верифицирована через ПИН. Верифицируйте SAM карту
+FM_NOT_REGISTERED	CONFLICT	40914	ФМ не зарегистрирован.
+SHIFT_EXCEPTION	CONFLICT	40915	Смена не открылась.
+NOT_ENOUGH_MONEY_EXCEPTION	CONFLICT	40917	Не хватает наличных денег на кассе.
+SHIFT_NOT_OPENED	CONFLICT	40918	Смена не открыта.
+UNABLE_CLOSE_SHIFT	CONFLICT	40919	Невозможно закрыть смену. Нужно изъять наличных средств на кассе.
+NEED_TO_CLOSE_SHIFT	CONFLICT	40920	Смена открыта больше 24 часа. Закройте смену.
+UPGRADE_REQUIRED	UPGRADE_REQUIRED	4260	Требуется обновление
+FPO _SERVICE_IS_NOT_AVAILABLE	INTERNAL_SERVER_ERROR	5002	Не доступен сервис FPO. Просьба обратиться в ГУ 'Салык Сервис'
+CONNECTION_TIMEOUT	GATEWAY_TIMEOUT	5040	Превышено время ожидания ответа
+
+
+
+
+
+
+
+
+
+
+
+
+

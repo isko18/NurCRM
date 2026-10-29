@@ -7,7 +7,10 @@ from django.db.models.signals import pre_delete
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
-from apps.main.models import Product, ProductImage, Notification, ManufactureSubreal, ReturnFromAgent
+from decimal import Decimal
+from django.db.models import Sum
+from apps.main.models import Product, ProductImage, Notification, ManufactureSubreal, ReturnFromAgent, ProductVariant
+from apps.main.models import Debt, DebtPayment
 
 logger = logging.getLogger("crm.webhooks")
 
@@ -163,16 +166,18 @@ def product_webhook_on_delete(sender, instance: Product, **kwargs):
 # Канал доставки — существующий GET /main/notifications/.
 # ─────────────────────────────────────────────────────────────
 def _safe_create_notification(*, company, user, message, branch=None,
-                              type="system", title="", level="info", url=""):
+                              type="system", title="", level="info", url="",
+                              category="system", data=None):
     """Создаёт уведомление и публикует его в WS; не роняет основную операцию при ошибке."""
     if not user:
         return
     try:
-        from apps.main.realtime import create_and_publish_notification
+        from apps.main.notifications_market import publish_event
 
-        create_and_publish_notification(
-            company=company, branch=branch, user=user, message=message,
-            type=type, title=title, level=level, url=url,
+        publish_event(
+            company=company, branch=branch, recipients=[user], event_type=type,
+            title=title, message=message, level=level, url=url,
+            category=category, meta=data or {},
         )
     except Exception:
         logger.error(
@@ -194,9 +199,17 @@ def notify_agent_on_transfer(sender, instance: ManufactureSubreal, created, **kw
         branch=instance.branch,
         user=instance.agent,
         message=message,
-        type="agent_transfer",
-        title="Передача товара",
+        type="market.transfer.received",
+        title="Вам передана новая партия товара",
         level="info",
+        url="/crm/pending",
+        data={
+            "source_kind": "subreal_transfer",
+            "source_id": str(instance.id),
+            "product_id": str(instance.product_id) if instance.product_id else None,
+            "qty": str(instance.qty_transferred),
+            "cta_label": "Принять",
+        },
     ))
 
 
@@ -222,7 +235,223 @@ def notify_agent_on_return_decision(sender, instance: ReturnFromAgent, created, 
         branch=instance.branch,
         user=instance.returned_by,
         message=message,
-        type="agent_return",
+        type="market.product.status_changed",
         title=f"{kind} {verb}",
         level="success" if instance.status == ReturnFromAgent.Status.ACCEPTED else "warning",
+        url="/crm/documents",
+        data={
+            "source_kind": "return_request",
+            "source_id": str(instance.id),
+            "status": "approved" if instance.status == ReturnFromAgent.Status.ACCEPTED else "rejected",
+            "is_defect": bool(instance.is_defect),
+        },
     ))
+
+
+# ─────────────────────────────────────────────────────────────
+# Долги клиентов: market.debt.created / market.debt.paid
+# Кому: владельцы и администраторы компании.
+# ─────────────────────────────────────────────────────────────
+@receiver(post_save, sender=Debt)
+def notify_debt_created(sender, instance: Debt, created: bool, **kwargs):
+    if not created:
+        return
+
+    def _publish():
+        from apps.main.notifications_market import (
+            DEBT_CREATED, fmt_money, owner_like_users, publish_event,
+        )
+
+        recipients = owner_like_users(instance.company)
+        if not recipients:
+            return
+        publish_event(
+            company=instance.company,
+            branch=instance.branch,
+            recipients=recipients,
+            event_type=DEBT_CREATED,
+            title="Новый долг",
+            message=f"{instance.name}: {fmt_money(instance.amount)} сом",
+            level="info",
+            url="/crm/debts",
+            cta_label="Открыть долги",
+            source_kind="debt",
+            source_id=instance.id,
+            meta={
+                "debt_id": str(instance.id),
+                "amount": f"{instance.amount:.2f}",
+                "client_name": instance.name,
+                "phone": instance.phone,
+            },
+        )
+
+    transaction.on_commit(_publish)
+
+
+@receiver(post_save, sender=DebtPayment)
+def notify_debt_paid(sender, instance: DebtPayment, created: bool, **kwargs):
+    if not created:
+        return
+
+    def _publish():
+        from apps.main.notifications_market import (
+            DEBT_PAID, fmt_money, owner_like_users, publish_event,
+        )
+
+        debt = instance.debt
+        recipients = owner_like_users(instance.company)
+        if not recipients:
+            return
+        balance = debt.balance
+        tail = "долг закрыт" if balance <= 0 else f"остаток {fmt_money(balance)} сом"
+        publish_event(
+            company=instance.company,
+            branch=instance.branch,
+            recipients=recipients,
+            event_type=DEBT_PAID,
+            title="Погашение долга",
+            message=f"{debt.name}: +{fmt_money(instance.amount)} сом, {tail}",
+            level="success",
+            url="/crm/debts",
+            cta_label="Открыть долги",
+            source_kind="debt_payment",
+            source_id=instance.id,
+            meta={
+                "debt_id": str(debt.id),
+                "payment_id": str(instance.id),
+                "amount": f"{instance.amount:.2f}",
+                "balance": f"{balance:.2f}",
+                "client_name": debt.name,
+            },
+        )
+
+    transaction.on_commit(_publish)
+
+
+# --- BE2-19: быстрая синхронизация каталога кассы ---
+
+from django.db.models.signals import post_delete  # noqa: E402
+
+from apps.main.models import ProductDeletion, ProductPromotionTier  # noqa: E402
+
+
+@receiver(post_delete, sender=Product)
+def product_deletion_tombstone(sender, instance: Product, **kwargs):
+    """Удалённый товар попадает в deleted ответа products/list/?updated_since=."""
+    try:
+        if instance.company_id:
+            with transaction.atomic():
+                ProductDeletion.objects.create(company_id=instance.company_id, product_id=instance.pk)
+    except Exception:
+        # Каскадное удаление компании: писать уже некуда — это не должно мешать удалению.
+        logger.warning("product tombstone failed for %s", instance.pk, exc_info=True)
+
+
+@receiver(post_save, sender=ProductPromotionTier)
+@receiver(post_delete, sender=ProductPromotionTier)
+def promotion_tier_touches_product(sender, instance: ProductPromotionTier, **kwargs):
+    """Изменили акцию — товар должен прийти кассе при следующей быстрой синхронизации."""
+    Product.objects.filter(pk=instance.product_id).update()
+
+
+# --- 09: статус продажи в долг следует за погашением её сделки ---
+
+from apps.main.models import DealPayment, sync_sale_status_from_deal  # noqa: E402
+
+
+@receiver(post_save, sender=DealPayment)
+@receiver(post_delete, sender=DealPayment)
+def deal_payment_syncs_sale_status(sender, instance: DealPayment, **kwargs):
+    """После оплаты или возврата платежа по сделке — пересчитать статус связанной продажи."""
+    deal_id = instance.deal_id
+    transaction.on_commit(lambda: sync_sale_status_from_deal(deal_id))
+
+
+# --- ТЗ часть 10: синхронизация остатка товара с суммой остатков размеров и сброс кеша ИИ-бота ---
+
+@receiver(post_save, sender=Product)
+@receiver(post_delete, sender=Product)
+def product_bot_cache_invalidation(sender, instance: Product, **kwargs):
+    company_id = getattr(instance, "company_id", None)
+    if company_id:
+        try:
+            from django.core.cache import cache
+            cache.delete(f"tg_catalog_data:{company_id}")
+        except Exception:
+            pass
+
+
+@receiver(post_save, sender=ProductVariant)
+@receiver(post_delete, sender=ProductVariant)
+def product_variant_sync_product_stock_and_cache(sender, instance: ProductVariant, **kwargs):
+    """
+    ТЗ часть 10, п. 3.5: остаток товара равен сумме остатков активных вариантов.
+    ТЗ часть 10, п. 3.6: сброс кеша каталога для ИИ-бота при изменении варианта.
+    """
+    product_id = getattr(instance, "product_id", None)
+    company_id = getattr(instance, "company_id", None)
+    if product_id:
+        try:
+            variants_qs = ProductVariant.objects.filter(product_id=product_id)
+            if variants_qs.filter(is_active=True).exists():
+                total = variants_qs.filter(is_active=True).aggregate(total=Sum("quantity"))["total"] or Decimal("0")
+                Product.objects.filter(pk=product_id).update(quantity=total)
+        except Exception:
+            logger.exception("Failed to sync product stock from variants for product %s", product_id)
+
+    if company_id:
+        try:
+            from django.core.cache import cache
+            cache.delete(f"tg_catalog_data:{company_id}")
+        except Exception:
+            pass
+
+
+
+# ─────────────────────────────────────────────────────────────
+# Кэш аналитики маркета: сбрасываем после любой записи денег/продаж/смен
+# (раньше — только после возвратов и обменов, новая продажа появлялась до 5 мин).
+# ─────────────────────────────────────────────────────────────
+def _bump_market_analytics(sender, instance, **kwargs):
+    company_id = getattr(instance, "company_id", None)
+    if not company_id:
+        return
+    from apps.main.cache_utils import bump_market_analytics_version
+
+    transaction.on_commit(lambda: bump_market_analytics_version(company_id))
+
+
+def _connect_market_analytics_invalidation():
+    from django.apps import apps as django_apps
+
+    for label in (
+        "main.Sale",
+        "main.SaleReturn",
+        "main.ClientDeal",
+        "main.DealPayment",
+        "main.DebtPayment",
+        "construction.CashFlow",
+        "construction.CashShift",
+    ):
+        try:
+            model = django_apps.get_model(label)
+        except LookupError:
+            continue
+        uid = f"market-analytics-bump:{label}"
+        post_save.connect(_bump_market_analytics, sender=model, dispatch_uid=uid + ":save")
+        post_delete.connect(_bump_market_analytics, sender=model, dispatch_uid=uid + ":delete")
+
+
+_connect_market_analytics_invalidation()
+
+
+@receiver(post_save, sender=ProductVariant)
+def tz_n27_variant_back_in_stock(sender, instance, **kwargs):
+    """ТЗ Н-27: остаток варианта стал > 0 — заявки «сообщить о поступлении» помечаются ready."""
+    if instance.is_active and (instance.quantity or 0) > 0:
+        from apps.main.variant_utils import notify_variants_in_stock
+
+        try:
+            notify_variants_in_stock([instance.id])
+        except Exception:  # не мешаем сохранению варианта
+            logger.exception("notify_variants_in_stock failed")

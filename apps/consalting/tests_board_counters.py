@@ -92,3 +92,64 @@ class BoardCountersTests(TestCase):
         self.assertEqual(data["scope_counts"]["all"], 2)
         self.assertEqual(data["totals"]["count"], 2)
         self.assertEqual(data["totals"]["amount"], 130000.0)
+
+    def test_main_board_includes_leads_routed_to_regional_funnels(self):
+        """The main board is a company-wide view, not a third routing target."""
+        regional_funnel = FunnelConsalting.objects.create(
+            company=self.company,
+            name="Ош",
+        )
+        regional_stage = FunnelStageConsalting.objects.create(
+            company=self.company,
+            funnel=regional_funnel,
+            name="Новая заявка",
+            order=1,
+            stage_type="new_lead",
+        )
+        routed_lead = LeadConsalting.objects.create(
+            company=self.company,
+            funnel=regional_funnel,
+            stage=regional_stage,
+            title="Лид из Оша",
+        )
+
+        res = self.mgr_client.get(f"/api/consalting/funnels/{self.funnel.id}/board/?owner_scope=all")
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["totals"]["count"], 4)
+        self.assertEqual(res.data["funnel"]["leads_count"], 4)
+        intake_column = next(
+            column for column in res.data["columns"]
+            if column["stage"]["name"] == "Первичный контакт"
+        )
+        self.assertEqual(intake_column["count"], 4)
+        self.assertIn(
+            str(routed_lead.id),
+            [lead["id"] for lead in intake_column["leads"]],
+        )
+        routed_lead.refresh_from_db()
+        self.assertEqual(routed_lead.funnel_id, regional_funnel.id)
+
+    def test_funnel_list_uses_live_count_for_main_aggregate_board(self):
+        """The list badge must include leads routed to regional funnels too."""
+        regional_funnel = FunnelConsalting.objects.create(company=self.company, name="Бишкек")
+        regional_stage = FunnelStageConsalting.objects.create(
+            company=self.company,
+            funnel=regional_funnel,
+            name="Новая заявка",
+            order=1,
+            stage_type="new_lead",
+        )
+        LeadConsalting.objects.create(
+            company=self.company,
+            funnel=regional_funnel,
+            stage=regional_stage,
+            title="Региональный лид",
+        )
+
+        res = self.mgr_client.get("/api/consalting/funnels/")
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        counts = {item["id"]: item["leads_count"] for item in res.data}
+        self.assertEqual(counts[str(self.funnel.id)], 4)
+        self.assertEqual(counts[str(regional_funnel.id)], 1)

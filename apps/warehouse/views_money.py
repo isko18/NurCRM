@@ -1,3 +1,5 @@
+from django.utils import timezone
+import uuid
 from decimal import Decimal
 
 import django_filters
@@ -13,6 +15,35 @@ from apps.utils import _is_owner_like
 
 from .views import CompanyBranchRestrictedMixin, filter_qs_company_branch_or_global
 from . import models, serializers_money, services_money
+from .services import error_payload, error_status
+
+
+def _flag(request, name) -> bool:
+    """Булев флаг из тела запроса или query string (true/1/yes)."""
+    data = getattr(request, "data", None) or {}
+    raw = data.get(name) if hasattr(data, "get") else None
+    if raw is None:
+        raw = request.query_params.get(name)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _post_money(request, doc):
+    services_money.post_money_document(
+        doc,
+        user=request.user,
+        allow_negative_cash=_flag(request, "allow_negative_cash"),
+        allow_advance=_flag(request, "allow_advance"),
+    )
+
+
+class ServiceError(ValidationError):
+    """DRF-исключение с телом/статусом ошибки сервиса (400 или 403 для прав)."""
+
+    def __init__(self, exc):
+        super().__init__(error_payload(exc))
+        self.status_code = error_status(exc)
 
 
 def _cash_registers_visible_qs(view):
@@ -41,6 +72,28 @@ def _cash_registers_visible_qs(view):
     return qs
 
 
+def _hidden_partner_register_ids(view, register_ids):
+    """
+    stock-partnership §7.14 (D8): сальдо и обороты кассы партнёра видны, только если партнёр
+    разрешил забирать у него без подтверждения. → id чужих касс, чьи суммы надо скрыть.
+    """
+    company = view._company()
+    if company is None:
+        return set()
+    foreign = dict(
+        models.CashRegister.objects.filter(id__in=register_ids).exclude(company=company).values_list("id", "company_id")
+    )
+    hidden = set()
+    allowed_cache = {}
+    for rid, cid in foreign.items():
+        if cid not in allowed_cache:
+            p = models.get_stock_partnership(company.id, cid)
+            allowed_cache[cid] = bool(p and p.allows_direct_pull_from(cid))
+        if not allowed_cache[cid]:
+            hidden.add(rid)
+    return hidden
+
+
 class MoneyDocumentFilter(django_filters.FilterSet):
     """Параметр ?agent= — агент контрагента (у MoneyDocument нет поля agent)."""
 
@@ -67,7 +120,33 @@ class CashRegisterListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
     search_fields = ["name", "location"]
 
     def get_queryset(self):
-        return _cash_registers_visible_qs(self).order_by("name")
+        qs = _cash_registers_visible_qs(self).order_by("name")
+        wh_raw = (self.request.query_params.get("for_warehouse") or "").strip()
+        if wh_raw:
+            qs = self._for_warehouse(qs, wh_raw)
+        return qs
+
+    def _for_warehouse(self, qs, wh_raw):
+        """
+        ?for_warehouse=<uuid> — кассы, которые подойдут для денег документа этого склада
+        (как при проведении: кассы филиала склада, иначе кассы компании без филиала).
+        Пустой список — фронт заранее предупреждает «Создайте кассу».
+        """
+        import uuid as _uuid
+
+        try:
+            wh_id = _uuid.UUID(wh_raw)
+        except ValueError:
+            raise ValidationError({"for_warehouse": "Неверный UUID."})
+        wh = self._filter_qs_company_branch(models.Warehouse.objects.all()).filter(id=wh_id).first()
+        if wh is None:
+            raise ValidationError({"for_warehouse": "Склад не найден или недоступен."})
+        qs = qs.filter(company_id=wh.company_id)
+        if wh.branch_id is not None:
+            branch_qs = qs.filter(branch_id=wh.branch_id)
+            if branch_qs.exists():
+                return branch_qs
+        return qs.filter(branch__isnull=True)
 
     def perform_create(self, serializer):
         company = self._company()
@@ -77,14 +156,50 @@ class CashRegisterListCreateView(CompanyBranchRestrictedMixin, generics.ListCrea
             raise ValidationError({"company": "Обязательное поле."})
         serializer.save(company=company, branch=branch)
 
+    def _balances(self, register_ids, at=None):
+        """{register_id: остаток} по проведённым документам (без миграционных); at — на конец даты."""
+        qs = services_money.cash_balance_qs().filter(cash_register_id__in=register_ids)
+        if at is not None:
+            qs = qs.filter(date__date__lte=at)
+        out = {}
+        for row in qs.values("cash_register_id").annotate(
+            receipts=Sum("amount", filter=Q(doc_type=models.MoneyDocument.DocType.MONEY_RECEIPT), default=Decimal("0.00")),
+            expenses=Sum("amount", filter=Q(doc_type=models.MoneyDocument.DocType.MONEY_EXPENSE), default=Decimal("0.00")),
+        ):
+            out[row["cash_register_id"]] = Decimal(row["receipts"] or 0) - Decimal(row["expenses"] or 0)
+        return out
+
     def list(self, request, *args, **kwargs):
         response = super().list(request, *args, **kwargs)
         qs = self.filter_queryset(self.get_queryset())
         register_ids = list(qs.values_list("pk", flat=True))
+        hidden = _hidden_partner_register_ids(self, register_ids)
+        register_ids = [rid for rid in register_ids if rid not in hidden]
+
+        # QA B06: остаток каждой кассы (и на дату ?date=YYYY-MM-DD) — колонка «Остаток».
+        from django.utils.dateparse import parse_date
+
+        at = parse_date(request.query_params.get("date") or "") if request.query_params.get("date") else None
+        balances = self._balances(register_ids) if register_ids else {}
+        balances_at = self._balances(register_ids, at=at) if (register_ids and at) else {}
+        rows = response.data.get("results") if isinstance(response.data, dict) else response.data
+        for row in rows or []:
+            try:
+                rid = uuid.UUID(str(row.get("id")))
+            except (ValueError, TypeError):
+                continue
+            if rid in hidden:
+                row["balance"] = None
+                if at:
+                    row["balance_at"] = None
+                continue
+            row["balance"] = str(balances.get(rid, Decimal("0.00")).quantize(Decimal("0.01")))
+            if at:
+                row["balance_at"] = str(balances_at.get(rid, Decimal("0.00")).quantize(Decimal("0.01")))
+
         if register_ids:
-            agg = models.MoneyDocument.objects.filter(
+            agg = services_money.cash_balance_qs().filter(
                 cash_register_id__in=register_ids,
-                status=models.MoneyDocument.Status.POSTED,
             ).aggregate(
                 receipts_total=Sum(
                     "amount",
@@ -140,10 +255,13 @@ class CashRegisterOperationsView(CompanyBranchRestrictedMixin, generics.Retrieve
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
+        if instance.id in _hidden_partner_register_ids(self, [instance.id]):
+            data = serializers_money.CashRegisterSerializer(instance).data
+            data.update({"balance": None, "receipts": [], "expenses": [], "receipts_total": None, "expenses_total": None})
+            return Response(data)
         docs = list(
-            models.MoneyDocument.objects.filter(
+            services_money.cash_balance_qs().filter(
                 cash_register=instance,
-                status=models.MoneyDocument.Status.POSTED,
             ).select_related("cash_register", "counterparty", "payment_category").order_by("-date")
         )
         receipts = []
@@ -177,6 +295,13 @@ class PaymentCategoryListCreateView(CompanyBranchRestrictedMixin, generics.ListC
     filterset_fields = ["company", "branch"]
     search_fields = ["title"]
 
+    def get_queryset(self):
+        # QA B13: системные категории — общие на компанию (branch=NULL), их видят и филиалы;
+        # старые копии системных категорий по филиалам скрыты (сливаются командой
+        # merge_system_payment_categories).
+        qs = filter_qs_company_branch_or_global(self, self.queryset.all())
+        return qs.exclude(system_code__isnull=False, branch__isnull=False)
+
     def perform_create(self, serializer):
         try:
             self._save_with_company_branch(serializer)
@@ -196,9 +321,12 @@ class PaymentCategoryDetailView(CompanyBranchRestrictedMixin, generics.RetrieveU
     serializer_class = serializers_money.PaymentCategorySerializer
     queryset = models.PaymentCategory.objects.all()
 
+    def get_queryset(self):
+        return filter_qs_company_branch_or_global(self, self.queryset.all())
+
     def perform_update(self, serializer):
         if serializer.instance.system_code:
-            raise ValidationError({"detail": "Системную категорию платежа нельзя изменять."})
+            raise ValidationError({"detail": "Системную категорию платежа нельзя изменять.", "code": "category_system"})
         try:
             self._save_with_company_branch(serializer)
         except IntegrityError as e:
@@ -212,7 +340,7 @@ class PaymentCategoryDetailView(CompanyBranchRestrictedMixin, generics.RetrieveU
 
     def perform_destroy(self, instance):
         if instance.system_code:
-            raise ValidationError({"detail": "Системную категорию платежа нельзя удалить."})
+            raise ValidationError({"detail": "Системную категорию платежа нельзя удалить.", "code": "category_system"})
         super().perform_destroy(instance)
 
 
@@ -261,9 +389,9 @@ class MoneyDocumentListCreateView(CompanyBranchRestrictedMixin, generics.ListCre
             doc = serializer.instance
             if wants_post:
                 try:
-                    services_money.post_money_document(doc)
+                    _post_money(request, doc)
                 except Exception as e:
-                    raise ValidationError({"detail": str(e)})
+                    raise ServiceError(e)
 
         # refetch for consistent response
         doc = (
@@ -305,9 +433,9 @@ class MoneyDocumentDetailView(CompanyBranchRestrictedMixin, generics.RetrieveUpd
             self.perform_update(serializer)
             if wants_post and serializer.instance.status != models.MoneyDocument.Status.POSTED:
                 try:
-                    services_money.post_money_document(serializer.instance)
+                    _post_money(request, serializer.instance)
                 except Exception as e:
-                    raise ValidationError({"detail": str(e)})
+                    raise ServiceError(e)
 
         instance = (
             models.MoneyDocument.objects
@@ -329,9 +457,9 @@ class MoneyDocumentPostView(CompanyBranchRestrictedMixin, generics.GenericAPIVie
     def post(self, request, pk=None):
         doc = self.get_object()
         try:
-            services_money.post_money_document(doc)
+            _post_money(request, doc)
         except Exception as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(error_payload(e), status=error_status(e))
         return Response(self.get_serializer(doc).data)
 
 
@@ -347,9 +475,9 @@ class MoneyDocumentUnpostView(CompanyBranchRestrictedMixin, generics.GenericAPIV
     def post(self, request, pk=None):
         doc = self.get_object()
         try:
-            services_money.unpost_money_document(doc)
+            services_money.unpost_money_document(doc, user=request.user)
         except Exception as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(error_payload(e), status=error_status(e))
         return Response(self.get_serializer(doc).data)
 
 
@@ -484,7 +612,7 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
                 {
                     "source": "document",
                     "id": str(d.id),
-                    "date": d.date.isoformat() if getattr(d, "date", None) else None,
+                    "date": timezone.localtime(d.date).isoformat() if getattr(d, "date", None) else None,
                     "number": d.number,
                     "status": d.status,
                     "doc_type": d.doc_type,
@@ -550,3 +678,88 @@ class CounterpartyMoneyOperationsView(CompanyBranchRestrictedMixin, generics.Lis
             headers=getattr(money_resp, "headers", None),
         )
 
+
+class WarehouseCashConfirmationSettingsView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    """
+    Настройки подтверждения кассы склада:
+    GET /warehouse/cash/confirmation-settings/ -> {"enabled": false}
+    PATCH /warehouse/cash/confirmation-settings/ -> {"enabled": true|false}
+    """
+    serializer_class = serializers_money.WarehouseCashConfirmationSettingsSerializer
+
+    def get_object(self):
+        company = self._company()
+        if not company:
+            raise PermissionDenied("У пользователя не настроена компания.")
+        settings, _ = models.WarehouseCashConfirmationSettings.objects.get_or_create(
+            company=company,
+            defaults={"enabled": False},
+        )
+        return settings
+
+    def get(self, request, *args, **kwargs):
+        settings = self.get_object()
+        return Response(self.get_serializer(settings).data)
+
+    def patch(self, request, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            raise PermissionDenied("Изменять настройки кассы может только владелец или администратор.")
+        settings = self.get_object()
+        serializer = self.get_serializer(settings, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    def put(self, request, *args, **kwargs):
+        return self.patch(request, *args, **kwargs)
+
+    def post(self, request, *args, **kwargs):
+        return self.patch(request, *args, **kwargs)
+
+
+
+
+class WarehousePeriodCloseView(CompanyBranchRestrictedMixin, generics.GenericAPIView):
+    """
+    Закрытие периода (QA B07).
+    GET   /api/warehouse/settings/period-close/ → {"closed_until": "2026-09-30" | null}
+    PATCH /api/warehouse/settings/period-close/ {"closed_until": "2026-09-30" | null} — только владелец.
+
+    Документы с датой <= closed_until нельзя проводить, отменять, редактировать и удалять
+    без права can_post_closed_period.
+    """
+
+    serializer_class = serializers_money.WarehousePeriodCloseSerializer
+
+    def _settings(self):
+        company = self._company()
+        if company is None:
+            raise ValidationError({"company": "Компания не найдена."})
+        obj, _ = models.WarehouseAccountingSettings.objects.get_or_create(company=company)
+        return obj
+
+    def get(self, request, *args, **kwargs):
+        return Response(self.get_serializer(self._settings()).data)
+
+    def patch(self, request, *args, **kwargs):
+        from .op_permissions import is_company_owner
+
+        if not is_company_owner(request.user):
+            raise PermissionDenied({"detail": "Закрывать период может только владелец.", "code": "permission_period_close"})
+        obj = self._settings()
+        ser = self.get_serializer(obj, data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+        old_closed = obj.closed_until
+        ser.save(updated_by=request.user)
+        if obj.closed_until != old_closed:
+            from apps.construction.audit import log_change
+            log_change(
+                company=obj.company, user=request.user, action="closed_until", object_type="period",
+                object_id=obj.company_id, object_name="Закрытие периода",
+                before={"closed_until": str(old_closed) if old_closed else None},
+                after={"closed_until": str(obj.closed_until) if obj.closed_until else None}, request=request,
+            )
+        return Response(ser.data)
+
+    def put(self, request, *args, **kwargs):
+        return self.patch(request, *args, **kwargs)

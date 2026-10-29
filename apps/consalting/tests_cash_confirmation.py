@@ -1,5 +1,5 @@
 from decimal import Decimal
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework import status
@@ -14,6 +14,7 @@ from apps.consalting.models import (
 from apps.consalting.funnel.completion import apply_completion_side_effects
 
 
+@override_settings(ALLOWED_HOSTS=["*"], SECURE_SSL_REDIRECT=False)
 class CashConfirmationTests(TestCase):
     def setUp(self):
         self.owner = User.objects.create(
@@ -127,9 +128,66 @@ class CashConfirmationTests(TestCase):
         self.assertEqual(res_get.data["mode"], "cash_only")
 
         res_put = self.mgr_client.put("/api/consalting/cashbox/confirmation-settings/", {
-            "mode": "always", "skip_for_cashier": False, "overdue_hours": 12
+            "mode": "required", "skip_for_cashier": False, "overdue_hours": 12
         })
         self.assertEqual(res_put.status_code, status.HTTP_200_OK)
-        self.assertEqual(res_put.data["mode"], "always")
+        self.assertEqual(res_put.data["mode"], "required")
         self.assertFalse(res_put.data["skip_for_cashier"])
         self.assertEqual(res_put.data["overdue_hours"], 12)
+
+        # POST also works as canon (§9.0 п.2)
+        res_post = self.mgr_client.post("/api/consalting/cashbox/confirmation-settings/", {
+            "mode": "off", "skip_for_cashier": True, "overdue_hours": 48
+        })
+        self.assertEqual(res_post.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_post.data["mode"], "off")
+        self.assertTrue(res_post.data["skip_for_cashier"])
+        self.assertEqual(res_post.data["overdue_hours"], 48)
+
+    def test_skip_for_cashier_false_prevents_self_confirmation(self):
+        """Если skip_for_cashier=False, автор не может подтвердить собственную заявку."""
+        self.settings.skip_for_cashier = False
+        self.settings.save()
+
+        # Owner creates request for himself
+        req = CashRequestConsalting.objects.create(
+            company=self.company, user=self.owner, client=self.client_entity,
+            kind="handover", direction="income", amount=Decimal("15000.00"), status="pending"
+        )
+        res = self.mgr_client.post(f"/api/consalting/cashbox/requests/{req.id}/confirm/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_cash_request_overdue_computed_flag(self):
+        """Заявки старше overdue_hours получают is_overdue=True в API."""
+        from datetime import timedelta
+        req = CashRequestConsalting.objects.create(
+            company=self.company, user=self.emp, client=self.client_entity,
+            kind="handover", direction="income", amount=Decimal("5000.00"), status="pending"
+        )
+        req.created_at = timezone.now() - timedelta(hours=30)
+        req.save()
+
+        res = self.mgr_client.get("/api/consalting/cashbox/requests/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        req_item = next(r for r in res.data["results"] if r["id"] == str(req.id))
+        self.assertTrue(req_item["is_overdue"])
+
+    def test_consulting_cashboxes_api(self):
+        """GET и POST /api/consalting/cashbox/cashboxes/ с аналитикой."""
+        # 1. Создание кассы
+        res = self.mgr_client.post("/api/consalting/cashbox/cashboxes/", {"name": "Касса Бишкек"})
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        cb_id = res.data["id"]
+
+        # 2. Получение списка касс
+        res_list = self.mgr_client.get("/api/consalting/cashbox/cashboxes/")
+        self.assertEqual(res_list.status_code, status.HTTP_200_OK)
+        cb_item = next(c for c in res_list.data if c["id"] == cb_id)
+        self.assertEqual(cb_item["name"], "Касса Бишкек")
+        self.assertEqual(cb_item["balance"], 0.0)
+
+        # 3. Детальная касса
+        res_det = self.mgr_client.get(f"/api/consalting/cashbox/cashboxes/{cb_id}/")
+        self.assertEqual(res_det.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_det.data["name"], "Касса Бишкек")
+

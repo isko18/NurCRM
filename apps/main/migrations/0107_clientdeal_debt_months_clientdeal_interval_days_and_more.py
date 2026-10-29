@@ -11,29 +11,4 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.AddField(
-            model_name='clientdeal',
-            name='debt_months',
-            field=models.PositiveSmallIntegerField(blank=True, db_column='debt_months_v2', null=True, verbose_name='Срок (мес.)'),
-        ),
-        migrations.AddField(
-            model_name='clientdeal',
-            name='interval_days',
-            field=models.PositiveSmallIntegerField(blank=True, default=1, null=True, verbose_name='Интервал (дни)'),
-        ),
-        migrations.AddField(
-            model_name='clientdeal',
-            name='interval_months',
-            field=models.PositiveSmallIntegerField(blank=True, default=1, null=True, verbose_name='Интервал (месяцы)'),
-        ),
-        migrations.AddField(
-            model_name='clientdeal',
-            name='sale',
-            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='deals', to='main.sale', verbose_name='Связанная продажа'),
-        ),
-        migrations.AddField(
-            model_name='clientdeal',
-            name='schedule_version',
-            field=models.CharField(choices=[('v1', 'v1'), ('v2', 'v2')], default='v1', max_length=8, verbose_name='Версия графика'),
-        ),
     ]

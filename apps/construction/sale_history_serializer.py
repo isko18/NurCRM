@@ -1,26 +1,50 @@
 # apps/construction/serializers/sale_history.py
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from apps.main.models import Sale, SaleItem
 
 
 class SaleItemHistorySerializer(serializers.ModelSerializer):
+    product_name = serializers.SerializerMethodField()
+    qty = serializers.DecimalField(source="quantity", max_digits=12, decimal_places=3, read_only=True)
+    price = serializers.DecimalField(source="unit_price", max_digits=12, decimal_places=2, read_only=True)
+    line_total = serializers.SerializerMethodField()
+
     class Meta:
         model = SaleItem
         fields = [
             "id",
             "product",
+            "product_name",
             "name_snapshot",
             "barcode_snapshot",
             "unit_price",
             "quantity",
+            "qty",
+            "price",
+            "line_total",
         ]
         read_only_fields = fields
+
+    def get_product_name(self, obj):
+        return getattr(getattr(obj, "product", None), "name", None) or obj.name_snapshot
+
+    def get_line_total(self, obj):
+        quantity = obj.quantity or Decimal("0")
+        price = obj.unit_price or Decimal("0")
+        discount = getattr(obj, "line_discount", None) or Decimal("0")
+        return (price * quantity - discount).quantize(Decimal("0.01"))
 
 
 class SaleHistorySerializer(serializers.ModelSerializer):
     change = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     client_name = serializers.SerializerMethodField()
+    # Продавец чека. `user` остаётся для обратной совместимости, `cashier_id` —
+    # явный стабильный ключ для фильтра/группировки на фронте (Q2 в ТЗ):
+    # по `cashier_display` тёзки склеиваются в одного человека.
+    cashier_id = serializers.SerializerMethodField()
     cashier_display = serializers.SerializerMethodField()
     items = SaleItemHistorySerializer(many=True, read_only=True)
 
@@ -51,6 +75,7 @@ class SaleHistorySerializer(serializers.ModelSerializer):
             "client",
             "client_name",
             "user",
+            "cashier_id",
             "cashier_display",
 
             "items",
@@ -62,6 +87,10 @@ class SaleHistorySerializer(serializers.ModelSerializer):
         if not c:
             return None
         return getattr(c, "name", None) or str(c)
+
+    def get_cashier_id(self, obj):
+        # Строкой — как в cashier_breakdown смены, чтобы фронт сравнивал их напрямую.
+        return str(obj.user_id) if obj.user_id else None
 
     def get_cashier_display(self, obj):
         u = getattr(obj, "user", None)

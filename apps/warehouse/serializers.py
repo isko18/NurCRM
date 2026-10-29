@@ -8,6 +8,7 @@ from django.apps import apps
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files.base import ContentFile
 from rest_framework import serializers
+from rest_framework.exceptions import APIException
 
 from apps.warehouse import models as m
 from apps.warehouse.models import q_qty
@@ -319,12 +320,39 @@ def _get_characteristics_model():
 
 def _sync_warehouse_product_alternate_barcodes(product: m.WarehouseProduct, codes):
     """
-    Полная замена доп. штрихкодов для товара. codes — список строк (уже нормализованных уникальных).
+    Полная замена доп. штрихкодов для товара. codes — список строк или словарей {barcode, name, quantity}.
     """
     company = product.company
     warehouse = product.warehouse
     main = _norm_str(product.barcode)
-    for b in codes:
+    norm = []
+    seen = set()
+    for x in codes or []:
+        if isinstance(x, dict):
+            b = _norm_str(x.get("barcode"))
+            n = str(x.get("name") or "").strip()
+            raw_qty = x.get("quantity")
+        else:
+            b = _norm_str(x)
+            n = ""
+            raw_qty = None
+        if not b or b in seen:
+            continue
+        seen.add(b)
+        qty = None
+        if raw_qty is not None and str(raw_qty).strip() != "":
+            try:
+                val = float(raw_qty)
+                if val <= 0 or not val.is_integer():
+                    raise ValueError()
+                qty = int(val)
+            except (ValueError, TypeError):
+                raise serializers.ValidationError(
+                    {"alternate_barcodes": f"Количество в доп. штрихкоде '{b}' должно быть положительным числом."}
+                )
+        norm.append((b, n, qty))
+
+    for b, n, _ in norm:
         if main and b == main:
             raise serializers.ValidationError(
                 {"alternate_barcodes": f"Код «{b}» совпадает с основным штрихкодом товара — оставьте его только в поле barcode."}
@@ -350,20 +378,132 @@ def _sync_warehouse_product_alternate_barcodes(product: m.WarehouseProduct, code
                 {"alternate_barcodes": f"Штрихкод «{b}» уже привязан к другому товару на этом складе."}
             )
     product.alternate_barcodes.all().delete()
-    for b in codes:
-        m.WarehouseProductAlternateBarcode.objects.create(product=product, barcode=b)
+    for b, n, q in norm:
+        m.WarehouseProductAlternateBarcode.objects.create(product=product, barcode=b, name=n, quantity=q)
 
 
-class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
+QUANTITY_READ_ONLY_ERROR = (
+    "Количество меняется только документами: инвентаризация, оприходование или списание. "
+    "Используйте «Корректировку остатка»."
+)
+
+
+QUANTITY_EDIT_COMMENT = "Изменение количества в карточке товара"
+
+
+class StockConflict(APIException):
+    status_code = 409
+    default_detail = "Конфликт остатка."
+    default_code = "stock_conflict"
+
+
+def save_product_changed_fields(instance, keys):
+    """
+    instance.save(update_fields=[...]) только по изменённым полям. Полный save()
+    перезаписал бы quantity значением, прочитанным в начале запроса, и затёр бы
+    списание, проведённое за это время (гонка из S2). quantity сюда не попадает никогда.
+    """
+    concrete = {f.name for f in instance._meta.concrete_fields}
+    fields = {k for k in keys if k in concrete} - {"id", "quantity", "company", "branch", "warehouse"}
+    # save() пересчитывает цену/наценку и автогенерирует code/plu.
+    if fields & {"price", "purchase_price", "markup_percent"}:
+        fields |= {"price", "markup_percent"}
+    if not instance.code:
+        fields.add("code")
+    if instance.is_weight and instance.plu is None:
+        fields.add("plu")
+    fields.add("updated_date")
+    instance.save(update_fields=sorted(fields))
+
+
+class StockQuantityGuardMixin:
+    """
+    Правила поля quantity в API товара (§5.4 stock-single-source-of-truth):
+    - update: изменённое количество из формы проводится документом INVENTORY
+      («Изменение количества в карточке товара»); совпадающее — ничего не делает;
+    - create: quantity > 0 — начальный остаток проведённым документом INVENTORY;
+    - upsert по штрихкоду не меняет quantity существующего товара (quantity > 0 → 409).
+    Поле quantity объявляется в сериализаторе явно (DecimalField, required=False, allow_null=True).
+    """
+
+    def validate_quantity(self, value):
+        if value is None:
+            return None
+        value = q_qty(Decimal(value))
+        if value < 0:
+            raise serializers.ValidationError("Количество не может быть отрицательным.")
+        return value
+
+    def _request_user(self):
+        req = self.context.get("request")
+        return getattr(req, "user", None) if req is not None else None
+
+    def _post_initial_stock(self, product, qty):
+        """Начальный остаток нового товара — проведённый INVENTORY (в текущей транзакции)."""
+        if qty is None or q_qty(Decimal(qty)) <= 0:
+            return
+        from apps.warehouse import stock as stock_service
+
+        try:
+            stock_service.post_inventory_adjustment(
+                product=product,
+                fact_qty=qty,
+                comment=stock_service.INITIAL_STOCK_COMMENT,
+                user=self._request_user(),
+            )
+        except ValueError as exc:
+            raise serializers.ValidationError({"quantity": [str(exc)]})
+        product.refresh_from_db(fields=["quantity"])
+
+    def _apply_quantity_change(self, product, qty):
+        """
+        Количество из формы редактирования: регистр не правится напрямую, а проводится
+        документ INVENTORY на одну позицию (как «Корректировка остатка»), с движением.
+        """
+        if qty is None or product.warehouse_id is None:
+            return
+        from apps.warehouse import stock as stock_service
+
+        current = stock_service.get_on_hand(warehouse=product.warehouse, product=product)
+        if q_qty(Decimal(qty)) == current:
+            return
+        if not product.is_weight and Decimal(qty) % 1 != 0:
+            raise serializers.ValidationError({"quantity": ["Для штучного товара количество должно быть целым."]})
+        try:
+            stock_service.post_inventory_adjustment(
+                product=product,
+                fact_qty=qty,
+                comment=QUANTITY_EDIT_COMMENT,
+                user=self._request_user(),
+            )
+        except ValueError as exc:
+            raise serializers.ValidationError({"quantity": [str(exc)]})
+        product.refresh_from_db(fields=["quantity"])
+
+    @staticmethod
+    def _raise_existing_barcode_conflict(existing, qty):
+        raise StockConflict({
+            "quantity": [
+                f"Товар со штрихкодом {existing.barcode} уже есть на этом складе "
+                f"(остаток {q_qty(Decimal(existing.quantity or 0))}). Количество существующего товара "
+                "не меняется при сохранении карточки: оформите приход или «Корректировку остатка»."
+            ],
+            "product_id": str(existing.pk),
+        })
+
+
+class WarehouseProductSerializer(StockQuantityGuardMixin, CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     characteristics = WarehouseProductCharacteristicsSerializer(required=False, allow_null=True)
     images = WarehouseProductImageSerializer(many=True, read_only=True)
     packages = WarehouseProductPackageSerializer(many=True, read_only=True)
     alternate_barcodes = serializers.ListField(
-        child=serializers.CharField(max_length=64),
         required=False,
         write_only=True,
+        allow_null=True,
     )
     supplier_name = serializers.CharField(source="supplier.name", read_only=True, allow_null=True)
+    # Остаток: на update read-only (см. StockQuantityGuardMixin), на create — начальный остаток.
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=3, required=False, allow_null=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -434,7 +574,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         if "country" in attrs:
             attrs["country"] = (attrs.get("country") or "").strip()
 
-        for f in ("quantity", "minimum_quantity", "purchase_price", "markup_percent", "price", "wholesale_price", "discount_percent"):
+        for f in ("minimum_quantity", "purchase_price", "markup_percent", "price", "wholesale_price", "discount_percent"):
             if f in attrs:
                 attrs[f] = _to_decimal(attrs.get(f), "0")
 
@@ -442,20 +582,39 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
             seen = set()
             norm_list = []
             for raw in attrs["alternate_barcodes"]:
-                b = _norm_str(raw)
+                if isinstance(raw, dict):
+                    b = _norm_str(raw.get("barcode"))
+                    n = str(raw.get("name") or "").strip()
+                    raw_qty = raw.get("quantity")
+                else:
+                    b = _norm_str(raw)
+                    n = ""
+                    raw_qty = None
                 if not b or b in seen:
                     continue
                 seen.add(b)
-                norm_list.append(b)
+                qty = None
+                if raw_qty is not None and str(raw_qty).strip() != "":
+                    try:
+                        val = float(raw_qty)
+                        if val <= 0 or not val.is_integer():
+                            raise ValueError()
+                        qty = int(val)
+                    except (ValueError, TypeError):
+                        raise serializers.ValidationError({
+                            "alternate_barcodes": f"Количество в доп. штрихкоде '{b}' должно быть положительным числом."
+                        })
+                norm_list.append({"barcode": b, "name": n, "quantity": qty})
             attrs["alternate_barcodes"] = norm_list
 
         return attrs
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        data["alternate_barcodes"] = list(
-            instance.alternate_barcodes.order_by("barcode").values_list("barcode", flat=True)
-        )
+        data["alternate_barcodes"] = [
+            {"barcode": item.barcode, "name": item.name, "quantity": item.quantity}
+            for item in instance.alternate_barcodes.order_by("barcode")
+        ]
         return data
 
     def _upsert_characteristics(self, product: m.WarehouseProduct, characteristics_data):
@@ -474,6 +633,7 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         Model.objects.update_or_create(**{fk_field: product}, defaults=defaults)
 
     def create(self, validated_data):
+        initial_qty = validated_data.pop("quantity", None)
         characteristics_data = validated_data.pop("characteristics", None)
         alternate_barcodes = validated_data.pop("alternate_barcodes", None)
         # initial_data может быть dict (JSON) или QueryDict (form/multipart) — оба поддерживают `in`
@@ -492,6 +652,9 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
                     .first()
                 )
                 if existing:
+                    # Upsert по штрихкоду обновляет карточку, но не остаток.
+                    if initial_qty is not None and initial_qty > 0:
+                        self._raise_existing_barcode_conflict(existing, initial_qty)
                     validated_data.pop("company", None)
                     validated_data.pop("branch", None)
                     validated_data.pop("warehouse", None)
@@ -500,20 +663,24 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
                         setattr(existing, k, v)
 
                     existing.barcode = barcode
-                    existing.save()
+                    save_product_changed_fields(existing, set(validated_data) | {"barcode"})
 
                     self._upsert_characteristics(existing, characteristics_data)
                     if has_alt:
                         _sync_warehouse_product_alternate_barcodes(existing, alternate_barcodes or [])
                     return existing
 
+            validated_data["quantity"] = Decimal("0.000")
             product = m.WarehouseProduct.objects.create(**validated_data)
             self._upsert_characteristics(product, characteristics_data)
             if has_alt:
                 _sync_warehouse_product_alternate_barcodes(product, alternate_barcodes or [])
+            self._post_initial_stock(product, initial_qty)
             return product
 
+    @transaction.atomic
     def update(self, instance, validated_data):
+        new_qty = validated_data.pop("quantity", None)  # проводится документом, см. _apply_quantity_change
         characteristics_data = validated_data.pop("characteristics", None)
         alternate_barcodes = validated_data.pop("alternate_barcodes", None)
         has_alt = "alternate_barcodes" in self.initial_data
@@ -527,10 +694,11 @@ class WarehouseProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
-        instance.save()
+        save_product_changed_fields(instance, set(validated_data))
         self._upsert_characteristics(instance, characteristics_data)
         if has_alt:
             _sync_warehouse_product_alternate_barcodes(instance, alternate_barcodes or [])
+        self._apply_quantity_change(instance, new_qty)
         return instance
 
 
@@ -555,6 +723,9 @@ class WarehouseProductCatalogSerializer(serializers.ModelSerializer):
             "barcode",
             "unit",
             "is_weight",
+            "plu",
+            "code",
+            "catalog_key",
             "quantity",
             "minimum_quantity",
             "purchase_price",

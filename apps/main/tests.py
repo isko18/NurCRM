@@ -455,6 +455,15 @@ class ProductWarehouseBarcodeAPITestCase(TestCase):
         self.assertEqual(resp.data["matched_barcode"], "0693123456789")
         self.assertEqual(resp.data["product"]["barcode"], "0693123456789")
 
+    def test_lookup_by_upc_equivalent_ean13(self):
+        self.product.barcode = "0762497741537"
+        self.product.save(update_fields=["barcode"])
+
+        resp = self._get("762497741537")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["product"]["id"], str(self.product.id))
+        self.assertEqual(resp.data["matched_barcode"], "762497741537")
+
     def test_lookup_by_alternate_barcode(self):
         resp = self._get("0693999999999")
         self.assertEqual(resp.status_code, 200)
@@ -474,6 +483,72 @@ class ProductWarehouseBarcodeAPITestCase(TestCase):
         force_authenticate(req, user=self.owner)
         resp = ProductWarehouseBarcodeAPIView.as_view()(req, barcode="")
         self.assertEqual(resp.status_code, 400)
+
+    def test_sync_and_search_by_alternate_barcode_name(self):
+        from apps.main.serializers import sync_product_alternate_barcodes, ProductSerializer
+        from apps.main.views import ProductListView
+
+        sync_product_alternate_barcodes(
+            self.product,
+            [{"barcode": "0693888888888", "name": "Упаковка 10 шт"}]
+        )
+        self.product.refresh_from_db()
+        alt = self.product.alternate_barcodes.first()
+        self.assertIsNotNone(alt)
+        self.assertEqual(alt.barcode, "0693888888888")
+        self.assertEqual(alt.name, "Упаковка 10 шт")
+
+        serializer = ProductSerializer(self.product)
+        self.assertEqual(
+            serializer.data["alternate_barcodes"],
+            [{"barcode": "0693888888888", "name": "Упаковка 10 шт", "quantity": None}]
+        )
+
+        req = self.api_factory.get("/main/products/?search=Упаковка")
+        force_authenticate(req, user=self.owner)
+        resp = ProductListView.as_view()(req)
+        self.assertEqual(resp.status_code, 200)
+        found_ids = [p["id"] for p in resp.data.get("results", [])]
+        self.assertIn(str(self.product.id), found_ids)
+
+    def test_sync_alternate_barcode_quantity(self):
+        from apps.main.serializers import sync_product_alternate_barcodes, ProductSerializer
+        from rest_framework.exceptions import ValidationError
+
+        sync_product_alternate_barcodes(
+            self.product,
+            [{"barcode": "0693888888889", "name": "Коробка 24 шт", "quantity": 24}]
+        )
+        self.product.refresh_from_db()
+        alt = self.product.alternate_barcodes.get(barcode="0693888888889")
+        self.assertEqual(alt.quantity, 24)
+
+        serializer = ProductSerializer(self.product)
+        self.assertEqual(
+            serializer.data["alternate_barcodes"],
+            [{"barcode": "0693888888889", "name": "Коробка 24 шт", "quantity": 24}]
+        )
+
+        # Non-positive or non-integer quantity must raise validation error
+        with self.assertRaises(ValidationError) as ctx:
+            sync_product_alternate_barcodes(
+                self.product,
+                [{"barcode": "0693888888890", "name": "Неверно", "quantity": 0}]
+            )
+        self.assertIn(
+            "Количество в доп. штрихкоде '069388888890' должно быть положительным числом.",
+            str(ctx.exception.detail.get("alternate_barcodes"))
+        )
+
+        with self.assertRaises(ValidationError) as ctx2:
+            sync_product_alternate_barcodes(
+                self.product,
+                [{"barcode": "0693888888891", "name": "Дробное", "quantity": 2.5}]
+            )
+        self.assertIn(
+            "Количество в доп. штрихкоде '069388888891' должно быть положительным числом.",
+            str(ctx2.exception.detail.get("alternate_barcodes"))
+        )
 
 
 class ProductCreateManualWholesalePriceTestCase(TestCase):

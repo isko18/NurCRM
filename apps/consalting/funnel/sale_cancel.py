@@ -41,8 +41,9 @@ def cancel_sale(sale, *, user, reason, comment, refund_mode, lead_action=None, p
             sub.save(update_fields=["status", "canceled_at"])
 
     # 2. ДОЛГ / РАССРОЧКА: неоплаченные строки графика аннулируем
-    if not partial and sale.subscription_deal_id:
-        DealInstallment.objects.filter(deal_id=sale.subscription_deal_id, paid_on__isnull=True).delete()
+    target_deal_id = sale.deal_id or sale.subscription_deal_id
+    if not partial and target_deal_id:
+        DealInstallment.objects.filter(deal_id=target_deal_id, paid_on__isnull=True).delete()
 
     # 3. ЗАРПЛАТА: отменяем начисление; если уже выплачено — создаём удержание
     for accrual in SalaryAccrualConsalting.objects.filter(sale=sale).exclude(status="canceled"):
@@ -70,14 +71,14 @@ def cancel_sale(sale, *, user, reason, comment, refund_mode, lead_action=None, p
     # 4. КАССА
     pending = CashRequestConsalting.objects.filter(sale=sale, status="pending").first()
     if pending and not partial:
-        pending.status = CashRequestConsalting.Status.REJECTED
+        pending.status = CashRequestConsalting.Status.CANCELED
         pending.save(update_fields=["status"])
     elif refund_mode in ("cash", "transfer"):
         CashRequestConsalting.objects.create(
             company=sale.company,
             user=user,
             kind="refund",
-            direction="outcome",
+            direction="expense",
             amount=p_amount,
             status=CashRequestConsalting.Status.PENDING,
             comment=f"Возврат по продаже: {comment or reason}",
@@ -88,11 +89,14 @@ def cancel_sale(sale, *, user, reason, comment, refund_mode, lead_action=None, p
         lead = sale.lead
         if lead_action == "return_to_work":
             lead.status = LeadConsalting.Status.IN_WORK
+            lead.queue_status = LeadConsalting.QueueStatus.IN_WORK
             lead.won_at = None
             lead.converted_at = None
         elif lead_action == "reject":
             lead.status = LeadConsalting.Status.LOST
-            lead.lost_reason = "Продажа отменена"
+            lead.queue_status = LeadConsalting.QueueStatus.REJECTED
+            lead.reject_reason = "Продажа отменена"
+            lead.loss_comment = "Продажа отменена"
             lead.closed_at = timezone.now()
         lead.save()
 

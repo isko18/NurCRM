@@ -9,16 +9,28 @@ from django.utils.dateparse import parse_date, parse_datetime
 
 import logging
 
-from apps.main.models import Cart, CartItem, Sale, SaleItem, Product
+from apps.main.models import Cart, CartItem, Sale, SaleItem, Product, ProductVariant
 from apps.main.pos_utils import cart_item_stock_consume_units, money as pos_money
 from apps.main.services.product_list_filters import apply_product_list_filters  # noqa: F401
 
 
 class NotEnoughStock(Exception):
-    pass
+    # ТЗ Н-15: shortages — все нехватки чека [{product_id, variant_id, available, requested}] для errors[]
+    def __init__(self, *args, shortages=None):
+        super().__init__(*args)
+        self.shortages = shortages or []
 
 
-@transaction.atomic
+# ТЗ Н-15: был @transaction.atomic — savepoint на каждую строку чека, а функция ничего не пишет
+def _performer_commission(item) -> Decimal:
+    """Процент мастеру с суммы строки (процент задаётся у услуги)."""
+    pct = getattr(getattr(item, "product", None), "performer_commission_percent", None)
+    if not item.performer_id or not pct:
+        return Decimal("0.00")
+    line = (item.unit_price or Decimal("0")) * (item.quantity or Decimal("0")) - (item.line_discount or Decimal("0"))
+    return pos_money(max(line, Decimal("0")) * Decimal(str(pct)) / Decimal("100"))
+
+
 def checkout_cart(
     cart: Cart,
     department=None,
@@ -27,10 +39,15 @@ def checkout_cart(
     payment_method=None,
     cash_received=None,
     payments=None,
+    cash_amount=None,
+    card_amount=None,
+    card_method=None,
+    prepayment_method=None,
     client=None,
     consultant=None,
     consultant_commission_enabled: bool = False,
     consultant_commission_percent=None,
+    lenient_variants: bool = False,
 ) -> Sale:
     """
     Перенос корзины в Sale (статус NEW) и списание остатков.
@@ -41,7 +58,7 @@ def checkout_cart(
     cart.recalc()
 
     items = list(
-        cart.items.select_related("product", "sale_package")
+        cart.items.select_related("product", "sale_package", "variant")
     )
     if not items:
         raise ValueError("Корзина пуста.")
@@ -68,17 +85,52 @@ def checkout_cart(
             raise ValueError(str(e)) from e
         consume_by_pid[it.product_id] += item_consume
 
+    # Проверка обязательности варианта (ТЗ-10 п. 3.5 Вариант А)
+    active_variant_pids = set(
+        ProductVariant.objects.filter(product_id__in=prod_ids, is_active=True).values_list("product_id", flat=True)
+    )
+    for it in items:
+        if lenient_variants:
+            break  # ТЗ Н-15: офлайн-досылка — вариант не выбран, списываем с товара
+        if it.product_id and it.product_id in active_variant_pids and not it.variant_id:
+            p_name = products[it.product_id].name if it.product_id in products else "Товар"
+            raise ValueError(f"Товар «{p_name}» имеет размеры/цвета. Выберите размер/цвет.")
+
+    # Остаток по вариантам (размер/цвет)
+    variant_ids = [it.variant_id for it in items if it.variant_id]
+    variants = {v.id: v for v in ProductVariant.objects.select_for_update().filter(id__in=variant_ids)}
+    consume_by_vid: dict = defaultdict(lambda: Decimal("0"))
+    for it in items:
+        if it.variant_id:
+            if it.variant_id not in variants or variants[it.variant_id].product_id != it.product_id:
+                raise ValueError("Вариант позиции не найден.")
+            consume_by_vid[it.variant_id] += cart_item_stock_consume_units(it)
     if not allow_negative_stock:
+        shortages, first_msg = [], None
+        for vid, need in consume_by_vid.items():
+            v = variants[vid]
+            if need > Decimal(str(v.quantity or 0)):
+                if first_msg is None:
+                    first_msg = (
+                        f"Недостаточно остатка «{products[v.product_id].name}» {v.size} {v.color}".strip()
+                        + f". Требуется {need}, доступно {v.quantity}."
+                    )
+                shortages.append({"product_id": v.product_id, "variant_id": vid,
+                                  "available": Decimal(str(v.quantity or 0)), "requested": need})
         for pid, need in consume_by_pid.items():
             p = products[pid]
             if getattr(p, "kind", None) == Product.Kind.SERVICE:
                 continue
             have = Decimal(str(p.quantity or 0))
             if need > have:
-                raise NotEnoughStock(
-                    f"Недостаточно остатка для «{getattr(p, 'name', '') or p.id}». "
-                    f"Требуется {need} (в учётных единицах склада), доступно {have}."
-                )
+                if first_msg is None:
+                    first_msg = (
+                        f"Недостаточно остатка для «{getattr(p, 'name', '') or p.id}». "
+                        f"Требуется {need} (в учётных единицах склада), доступно {have}."
+                    )
+                shortages.append({"product_id": pid, "variant_id": None, "available": have, "requested": need})
+        if shortages:
+            raise NotEnoughStock(first_msg, shortages=shortages)
 
     comm_enabled = bool(consultant and consultant_commission_enabled)
     comm_pct = (
@@ -125,35 +177,82 @@ def checkout_cart(
                 branch=branch,
                 sale=sale,
                 product=p,
+                is_custom=bool(p is None),
                 name_snapshot=name_snap,
                 barcode_snapshot=barcode_snap,
                 unit_price=it.unit_price,
                 quantity=it.quantity,
                 line_discount=getattr(it, "line_discount", None) or Decimal("0.00"),
+                manual_discount=getattr(it, "manual_discount", None) or Decimal("0.00"),
+                discount_source=getattr(it, "discount_source", None) or "none",
+                promotion_id=getattr(it, "promotion_id", None),
                 sale_package_id=it.sale_package_id,
                 purchase_price_snapshot=snap,
                 price_manually_edited=bool(getattr(it, "price_manually_edited", False)),
+                variant_id=it.variant_id,
+                performer_id=it.performer_id,
+                performer_commission_amount=_performer_commission(it),
+                is_wholesale=bool(getattr(it, "is_wholesale", False) or getattr(cart, "is_wholesale", False)),
             )
         )
     SaleItem.objects.bulk_create(sale_items)
+    for vid, need in consume_by_vid.items():
+        v = variants[vid]
+        v.quantity = Decimal(str(v.quantity or 0)) - need
+    if consume_by_vid:
+        ProductVariant.objects.bulk_update([variants[vid] for vid in consume_by_vid], ["quantity"])
 
     changed = []
+    low_stock = []
     for pid, qty_need in consume_by_pid.items():
         p = products[pid]
         if getattr(p, "kind", None) == Product.Kind.SERVICE:
             continue
-        p.quantity = Decimal(str(p.quantity or 0)) - qty_need
+        before = Decimal(str(p.quantity or 0))
+        p.quantity = before - qty_need
         changed.append(p)
+        threshold = getattr(p, "minimum_quantity", None)
+        if threshold is not None and threshold > 0 and before > threshold >= p.quantity:
+            low_stock.append(p)
+    if low_stock:
+        from apps.integrations.events import emit_event
+
+        for p in low_stock:
+            emit_event(
+                p.company_id,
+                "stock.low",
+                {
+                    "product": p.id,
+                    "name": p.name,
+                    "barcode": getattr(p, "barcode", None),
+                    "quantity": p.quantity,
+                    "minimum_quantity": p.minimum_quantity,
+                    "branch": getattr(p, "branch_id", None),
+                },
+            )
     if changed:
         Product.objects.bulk_update(changed, ["quantity"])
         changed_ids = [p.id for p in changed if getattr(p, "id", None)]
 
+        # ТЗ Н-31: одно событие stock_changed на всё списание (одна вставка в ленту)
+        try:
+            from apps.integrations.events import emit_event as _emit_stock
+            _emit_stock(cart.company_id, "stock_changed", {
+                "products": [str(i) for i in changed_ids][:200],
+                "reason": "sale",
+                "branch": getattr(cart, "branch_id", None),
+            })
+        except Exception:
+            pass
+
         def _send_webhooks():
             from apps.main.services.webhooks import send_product_webhook
 
+            # ТЗ Н-15: один запрос на все товары чека, а не по запросу на товар
+            fresh = {p.pk: p for p in Product.objects.filter(pk__in=changed_ids)}
             for pid in changed_ids:
                 try:
-                    prod = Product.objects.get(pk=pid)
+                    prod = fresh[pid]
                     send_product_webhook(prod, "product.updated")
                 except Exception:
                     logging.getLogger("crm.webhooks").error(
@@ -171,6 +270,13 @@ def checkout_cart(
     cart.status = Cart.Status.CHECKED_OUT
     cart.save(update_fields=["status", "updated_at"])
 
+    if cart.company_id:
+        try:
+            from django.core.cache import cache
+            cache.delete(f"tg_catalog_data:{cart.company_id}")
+        except Exception:
+            pass
+
     if getattr(cart, "shift_id", None) and sale.shift_id != cart.shift_id:
         sale.shift_id = cart.shift_id
         sale.save(update_fields=["shift"])
@@ -180,22 +286,37 @@ def checkout_cart(
         sale.save(update_fields=["client"])
 
     if payments:
-        sale.mark_paid(payments=payments, cash_received=cash_received)
+        sale.mark_paid(
+            payments=payments,
+            cash_received=cash_received,
+            cash_amount=cash_amount,
+            card_amount=card_amount,
+            card_method=card_method,
+            prepayment_method=prepayment_method,
+        )
     elif payment_method is not None:
-        sale.mark_paid(payment_method=payment_method, cash_received=cash_received)
+        sale.mark_paid(
+            payment_method=payment_method,
+            cash_received=cash_received,
+            cash_amount=cash_amount,
+            card_amount=card_amount,
+            card_method=card_method,
+            prepayment_method=prepayment_method,
+        )
 
     # Автоматическое создание долговой сделки (ClientDeal) при продаже в долг
     debt_amt = Decimal("0.00")
     if sale.payment_method == Sale.PaymentMethod.DEBT:
-        debt_amt = sale.total or Decimal("0.00")
+        debt_amt = sale.debt_initial or (sale.total - sale.paid_now)
     elif payments:
         debt_amt = sum(
             (Decimal(str(p.get("amount") or 0)) for p in payments if p.get("method") == Sale.PaymentMethod.DEBT),
             Decimal("0.00"),
         )
     if sale.client_id and debt_amt > Decimal("0.00"):
-        from apps.main.models import ClientDeal
+        from apps.main.models import ClientDeal, DealInstallment
         from datetime import timedelta
+        prepay_val = sale.paid_now or getattr(sale, "cash_received", Decimal("0.00")) or Decimal("0.00")
         if not ClientDeal.objects.filter(sale=sale).exists():
             unlinked_deal = (
                 ClientDeal.objects.filter(
@@ -211,20 +332,35 @@ def checkout_cart(
             if unlinked_deal and (abs((unlinked_deal.amount or Decimal("0.00")) - debt_amt) <= Decimal("0.01") or unlinked_deal.amount == Decimal("0.00")):
                 unlinked_deal.sale = sale
                 if not unlinked_deal.amount or unlinked_deal.amount == Decimal("0.00"):
-                    unlinked_deal.amount = debt_amt
-                unlinked_deal.save(update_fields=["sale", "amount", "updated_at"])
+                    unlinked_deal.amount = sale.total
+                if prepay_val > Decimal("0.00") and unlinked_deal.prepayment == Decimal("0.00"):
+                    unlinked_deal.prepayment = prepay_val
+                unlinked_deal.save(update_fields=["sale", "amount", "prepayment", "updated_at"])
+                deal_obj = unlinked_deal
             else:
-                ClientDeal.objects.create(
+                deal_obj = ClientDeal.objects.create(
                     company=sale.company,
                     branch=sale.branch,
                     client=sale.client,
                     sale=sale,
-                    title=f"Продажа в долг №{sale.id}",
+                    title=f"Продажа в долг №{sale.doc_number or sale.id}",
                     kind=ClientDeal.Kind.DEBT,
-                    amount=debt_amt,
-                    prepayment=Decimal("0.00"),
-                    debt_days=30,
+                    amount=sale.total,
+                    prepayment=prepay_val,
+                    # Один взнос на всю сумму со сроком через 30 дней (ТЗ ч.12, 2.2):
+                    # в графике v2 debt_days — число платежей, а не срок.
+                    debt_days=1,
+                    first_due_date=timezone.localdate() + timedelta(days=30),
                 )
+            if not DealInstallment.objects.filter(deal=deal_obj).exists():
+                rem_inst = max(Decimal("0.00"), sale.total - prepay_val)
+                if rem_inst > 0:
+                    DealInstallment.objects.create(
+                        deal=deal_obj,
+                        amount=rem_inst,
+                        due_date=timezone.localdate() + timedelta(days=30),
+                        paid_amount=Decimal("0.00"),
+                    )
 
     try:
         from apps.main.cache_utils import invalidate_cache_pattern

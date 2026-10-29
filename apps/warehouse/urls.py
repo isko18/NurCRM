@@ -6,6 +6,7 @@ from .views import (
     CategoryView, CategoryDetailView,
     ProductGroupView, ProductGroupDetailView,
     ProductView, ProductDetailView,
+    ProductStockAdjustmentView,
     WarehouseProductCatalogListView,
     ProductScanView,
     WarehouseBarcodeCheckAPIView,
@@ -42,6 +43,8 @@ from .views import (
 )
 from .views_documents import (
     DocumentListCreateView, DocumentDetailView, DocumentPostView, DocumentUnpostView,
+    DocumentReturnableView,
+    GenerateBarcodeView,
     DocumentCashApproveView, DocumentCashRejectView,
     CashApprovalRequestListView, CashApprovalRequestApproveView, CashApprovalRequestRejectView,
     AgentDocumentListCreateView, AgentDocumentDetailView,
@@ -66,8 +69,10 @@ from .views_money import (
     MoneyDocumentDetailView,
     MoneyDocumentPostView,
     MoneyDocumentUnpostView,
+    WarehousePeriodCloseView,
     MoneyDocumentRejectView,
     CounterpartyMoneyOperationsView,
+    WarehouseCashConfirmationSettingsView,
 )
 from .views_reconciliation import (
     CounterpartyReconciliationClassicAPIView,
@@ -82,6 +87,17 @@ from .views_partnership import (
     PartnerCompanyCatalogAPIView,
     DocumentPartnerTransferCreateAPIView,
     PartnerCashIncassationListCreateAPIView,
+    PartnershipTerminateAPIView,
+    PartnershipSettingsAPIView,
+    PartnershipCompanySearchAPIView,
+    PartnerWarehousesAPIView,
+    PartnerWarehouseProductsAPIView,
+    PartnerOperationListAPIView,
+    PartnerOperationApproveAPIView,
+    PartnerOperationRejectAPIView,
+    PartnerOperationCancelAPIView,
+    PartnerSalesListAPIView,
+    PartnerSaleDetailAPIView,
 )
 from .views_analytics import (
     WarehouseAgentMyAnalyticsAPIView,
@@ -122,9 +138,16 @@ urlpatterns = [
 
     # global product catalog across all company warehouses (list only)
     path("products/", WarehouseProductCatalogListView.as_view(), name="warehouse-products-catalog"),
+    path("products/generate-barcode/", GenerateBarcodeView.as_view(), name="warehouse-products-generate-barcode"),
 
     # product detail (global by product uuid)
     path("products/<uuid:product_uuid>/", ProductDetailView.as_view(), name="warehouse-product-detail"),
+    # корректировка остатка (проведённый документ INVENTORY)
+    path(
+        "products/<uuid:product_uuid>/stock-adjustment/",
+        ProductStockAdjustmentView.as_view(),
+        name="warehouse-product-stock-adjustment",
+    ),
 
     # product images
     path("products/<uuid:product_uuid>/images/", ProductImagesView.as_view(), name="product-images"),
@@ -216,6 +239,17 @@ urlpatterns += [
     path("stock-partnerships/companies/<uuid:company_id>/catalog/", PartnerCompanyCatalogAPIView.as_view(), name="warehouse-stock-partnership-catalog"),
     path("stock-partnerships/transfer/", DocumentPartnerTransferCreateAPIView.as_view(), name="warehouse-stock-partnership-transfer"),
     path("stock-partnerships/cash-incassations/", PartnerCashIncassationListCreateAPIView.as_view(), name="warehouse-stock-partnership-cash-incassations"),
+    path("stock-partnerships/companies/search/", PartnershipCompanySearchAPIView.as_view(), name="warehouse-stock-partnership-company-search"),
+    path("stock-partnerships/companies/<uuid:partner_company_id>/terminate/", PartnershipTerminateAPIView.as_view(), name="warehouse-stock-partnership-terminate"),
+    path("stock-partnerships/companies/<uuid:partner_company_id>/settings/", PartnershipSettingsAPIView.as_view(), name="warehouse-stock-partnership-settings"),
+    path("stock-partnerships/companies/<uuid:partner_company_id>/warehouses/", PartnerWarehousesAPIView.as_view(), name="warehouse-stock-partnership-warehouses"),
+    path("stock-partnerships/companies/<uuid:partner_company_id>/warehouses/<uuid:warehouse_id>/products/", PartnerWarehouseProductsAPIView.as_view(), name="warehouse-stock-partnership-warehouse-products"),
+    path("stock-partnerships/companies/<uuid:partner_company_id>/sales/", PartnerSalesListAPIView.as_view(), name="warehouse-stock-partnership-sales"),
+    path("stock-partnerships/companies/<uuid:partner_company_id>/sales/<uuid:document_id>/", PartnerSaleDetailAPIView.as_view(), name="warehouse-stock-partnership-sale-detail"),
+    path("stock-partnerships/operations/", PartnerOperationListAPIView.as_view(), name="warehouse-stock-partnership-operations"),
+    path("stock-partnerships/operations/<uuid:pk>/approve/", PartnerOperationApproveAPIView.as_view(), name="warehouse-stock-partnership-operation-approve"),
+    path("stock-partnerships/operations/<uuid:pk>/reject/", PartnerOperationRejectAPIView.as_view(), name="warehouse-stock-partnership-operation-reject"),
+    path("stock-partnerships/operations/<uuid:pk>/cancel/", PartnerOperationCancelAPIView.as_view(), name="warehouse-stock-partnership-operation-cancel"),
     path("documents/sale/", DocumentSaleListCreateView.as_view(), name="warehouse-documents-sale"),
     path("documents/purchase/", DocumentPurchaseListCreateView.as_view(), name="warehouse-documents-purchase"),
     path("documents/sale-return/", DocumentSaleReturnListCreateView.as_view(), name="warehouse-documents-sale-return"),
@@ -228,11 +262,14 @@ urlpatterns += [
     path("documents/<uuid:pk>/", DocumentDetailView.as_view(), name="warehouse-document-detail"),
     path("documents/<uuid:pk>/post/", DocumentPostView.as_view(), name="warehouse-document-post"),
     path("documents/<uuid:pk>/unpost/", DocumentUnpostView.as_view(), name="warehouse-document-unpost"),
+    path("documents/<uuid:pk>/returnable/", DocumentReturnableView.as_view(), name="warehouse-document-returnable"),
+    path("settings/period-close/", WarehousePeriodCloseView.as_view(), name="warehouse-period-close"),
     path("documents/<uuid:pk>/cash/approve/", DocumentCashApproveView.as_view(), name="warehouse-document-cash-approve"),
     path("documents/<uuid:pk>/cash/reject/", DocumentCashRejectView.as_view(), name="warehouse-document-cash-reject"),
     path("cash/requests/", CashApprovalRequestListView.as_view(), name="warehouse-cash-requests"),
     path("cash/requests/<uuid:pk>/approve/", CashApprovalRequestApproveView.as_view(), name="warehouse-cash-request-approve"),
     path("cash/requests/<uuid:pk>/reject/", CashApprovalRequestRejectView.as_view(), name="warehouse-cash-request-reject"),
+    path("cash/confirmation-settings/", WarehouseCashConfirmationSettingsView.as_view(), name="warehouse-cash-confirmation-settings"),
 
     # simple CRUD for products/warehouses/counterparties
     path("crud/products/", ProductListCreateView.as_view(), name="warehouse-products-crud"),

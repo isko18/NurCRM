@@ -9,6 +9,8 @@ import logging
 
 from rest_framework import generics, permissions, status
 from rest_framework.permissions import IsAuthenticated, AllowAny
+from apps.users.permissions import read_only_guard
+from apps.users.permissions_flags import EmployeesListAccess  # ТЗ Н-16
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
@@ -29,6 +31,7 @@ from .models import (
     KyrgyzstanRegion,
     Roles,
     PlatformAdminAuditLog,
+    UserUiPreferences,
 )
 from .serializers import (
     UserSerializer,
@@ -52,8 +55,9 @@ from .serializers import (
     normalize_slug,
     slug_format_error,
     slug_taken_by_other,
+    UserUiPreferencesSerializer,
 )
-from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin, IsPlatformAdmin
+from .permissions import IsCompanyOwner, IsCompanyOwnerOrAdmin, IsCompanyOwnerOrAdminOrSupervisor, IsPlatformAdmin
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +257,23 @@ class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
     permission_classes = [AllowAny]
 
+    def post(self, request, *args, **kwargs):
+        response = super().post(request, *args, **kwargs)
+        if response.status_code == 200:
+            # журнал действий (ТЗ п.8): вход в систему
+            try:
+                from apps.construction.audit import log_change
+
+                ident = request.data.get("email") or request.data.get("username")
+                u = User.objects.filter(email__iexact=str(ident).strip()).select_related("company").first() if ident else None
+                company = (getattr(u, "company", None) or getattr(u, "owned_company", None)) if u else None
+                if company is not None:
+                    log_change(company=company, user=u, action="login", object_type="user", object_id=u.pk,
+                               object_name=(f"{u.first_name} {u.last_name}".strip() or u.email), request=request)
+            except Exception:
+                pass
+        return response
+
 
 class CustomTokenRefreshView(TokenRefreshView):
     """
@@ -322,7 +343,7 @@ class CustomTokenRefreshView(TokenRefreshView):
 
 class EmployeeListAPIView(generics.ListAPIView):
     serializer_class = UserListSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, EmployeesListAccess]  # ТЗ Н-16
 
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
@@ -334,6 +355,19 @@ class EmployeeListAPIView(generics.ListAPIView):
             return User.objects.none()
 
         base_qs = _employees_qs(company).filter(is_active=True, deleted_at__isnull=True)
+        if getattr(user, "is_consulting_salesperson", False):
+            base_qs = base_qs.filter(id=user.id)
+        elif getattr(user, "is_consulting_supervisor", False):
+            my_regions = user.get_consulting_region_codes()
+            if not my_regions:
+                base_qs = base_qs.filter(id=user.id)
+            else:
+                matching_ids = [
+                    u.id for u in base_qs
+                    if u.id == user.id or any(r in my_regions for r in u.get_consulting_region_codes())
+                ]
+                base_qs = base_qs.filter(id__in=matching_ids)
+
         return _apply_branch_filter_to_users(self.request, company, base_qs)
 
 
@@ -351,16 +385,18 @@ class CurrentUserAPIView(generics.RetrieveUpdateAPIView):
         )
 
 
+@read_only_guard("can_edit_employees")
 class EmployeeCreateAPIView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = EmployeeCreateSerializer
-    permission_classes = [IsAuthenticated, IsCompanyOwner]
+    permission_classes = [IsAuthenticated, IsCompanyOwnerOrAdminOrSupervisor]
 
     def perform_create(self, serializer):
         serializer.save()
 
 
 # ✅ SOFT DELETE
+@read_only_guard("can_edit_employees")
 class EmployeeDestroyAPIView(generics.DestroyAPIView):
     queryset = User.objects.all()
     serializer_class = UserListSerializer
@@ -393,10 +429,11 @@ class EmployeeDestroyAPIView(generics.DestroyAPIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+@read_only_guard("can_edit_employees")
 class EmployeeDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
     queryset = User.objects.all()
     serializer_class = EmployeeUpdateSerializer
-    permission_classes = [IsAuthenticated, IsCompanyOwnerOrAdmin]
+    permission_classes = [IsAuthenticated, IsCompanyOwnerOrAdminOrSupervisor]
 
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
@@ -412,9 +449,35 @@ class EmployeeDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
             .filter(is_active=True, deleted_at__isnull=True)
             .exclude(id=user.id)
         )
+        if getattr(user, "is_consulting_supervisor", False):
+            my_regions = user.get_consulting_region_codes()
+            matching_ids = [
+                u.id for u in base_qs
+                if any(r in my_regions for r in u.get_consulting_region_codes())
+            ]
+            base_qs = base_qs.filter(id__in=matching_ids)
+        elif getattr(user, "is_consulting_salesperson", False):
+            return User.objects.none()
+
         return _apply_branch_filter_to_users(self.request, company, base_qs)
 
+    def perform_update(self, serializer):
+        # журнал действий (ТЗ п.8): изменение прав и роли сотрудника
+        from apps.construction.audit import log_request, user_rights
+
+        before = user_rights(serializer.instance)
+        obj = serializer.save()
+        try:
+            log_request(self.request, "rights_change", "user", obj.pk,
+                        (f"{obj.first_name} {obj.last_name}".strip() or obj.email),
+                        before=before, after=user_rights(obj))
+        except Exception:
+            pass
+
     def destroy(self, request, *args, **kwargs):
+        if getattr(request.user, "role", None) == "supervisor":
+            return Response({"detail": "Руководитель региона не может удалять сотрудников."}, status=status.HTTP_403_FORBIDDEN)
+
         employee = self.get_object()
 
         if employee == request.user:
@@ -473,9 +536,45 @@ class FeatureListAPIView(generics.ListAPIView):
 # company
 # =========================
 
-class CompanyDetailAPIView(generics.RetrieveAPIView):
+def _emit_company_updated(company, changed_fields):
+    from apps.integrations.events import emit_event
+
+    if changed_fields:
+        emit_event(
+            company.pk,
+            "company.updated",
+            {
+                "fields": sorted(changed_fields),
+                "market_sphere": company.market_sphere,
+                "name": company.name,
+            },
+        )
+
+
+@read_only_guard("can_edit_settings")
+class CompanyDetailAPIView(generics.RetrieveUpdateAPIView):
+    """
+    GET   /api/users/company/
+    PATCH /api/users/company/  — только владелец (например {"market_sphere": "clothing"})
+    """
+
     serializer_class = CompanySerializer
     permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "patch", "head", "options"]
+
+    def update(self, request, *args, **kwargs):
+        if not _is_owner_like(request.user):
+            raise PermissionDenied("Изменять данные компании может только владелец.")
+        company = self.get_object()
+        ser = CompanyUpdateSerializer(company, data=request.data, partial=True, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        try:
+            with transaction.atomic():
+                ser.save()
+        except IntegrityError:
+            raise SlugConflict()
+        _emit_company_updated(company, set(ser.validated_data))
+        return Response(CompanySerializer(company, context={"request": request}).data)
 
     def get_object(self):
         if getattr(self, "swagger_fake_view", False):
@@ -485,6 +584,30 @@ class CompanyDetailAPIView(generics.RetrieveAPIView):
         if company is None:
             raise NotFound("Вы не принадлежите ни к одной компании.")
         return company
+
+
+class CompanySubscriptionDetailAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        if getattr(self, "swagger_fake_view", False):
+            return Response({})
+
+        company = _get_company(request.user)
+        if company is None:
+            raise NotFound("Вы не принадлежите ни к одной компании.")
+
+        from apps.users.services_subscription import (
+            build_company_subscription_panel_payload,
+            is_user_owner,
+        )
+
+        if not is_user_owner(request.user, company):
+            raise PermissionDenied("Доступ к информации о подписке разрешён только владельцу компании.")
+
+        payload = build_company_subscription_panel_payload(company, is_owner=True)
+        return Response(payload, status=status.HTTP_200_OK)
+
 
 
 class ChangePasswordView(generics.UpdateAPIView):
@@ -498,10 +621,18 @@ class ChangePasswordView(generics.UpdateAPIView):
         return Response({"detail": "Пароль успешно изменён."}, status=status.HTTP_200_OK)
 
 
+@read_only_guard("can_edit_settings")
 class CompanyUpdateAPIView(generics.RetrieveUpdateAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = CompanyUpdateSerializer
     queryset = Company.objects.none()
+
+    def get_permissions(self):
+        # ТЗ 12.18: читать могут все сотрудники, менять данные компании - владелец или администратор
+        # (на сайте вкладку «Компания» видят обе роли).
+        if self.request.method in ("GET", "HEAD", "OPTIONS"):
+            return [IsAuthenticated()]
+        return [IsAuthenticated(), IsCompanyOwnerOrAdmin()]
 
     def get_object(self):
         company = _get_company(self.request.user)
@@ -516,6 +647,21 @@ class CompanyUpdateAPIView(generics.RetrieveUpdateAPIView):
                 serializer.save()
         except IntegrityError:
             raise SlugConflict()
+        _emit_company_updated(serializer.instance, set(serializer.validated_data))
+
+
+class CompanyAddonListAPIView(APIView):
+    """GET /api/users/company/addons/ — платные функции компании."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        from apps.users.serializers import company_addons_payload
+
+        company = _get_company(request.user)
+        if company is None:
+            raise NotFound("Вы не принадлежите ни к одной компании.")
+        return Response(company_addons_payload(company))
 
 
 class CompanyCheckSlugAPIView(APIView):
@@ -560,6 +706,7 @@ class RoleListAPIView(generics.ListAPIView):
         return Response(data)
 
 
+@read_only_guard("can_edit_employees")
 class CustomRoleCreateAPIView(generics.CreateAPIView):
     serializer_class = CustomRoleSerializer
     permission_classes = [IsAuthenticated, IsCompanyOwner]
@@ -569,6 +716,7 @@ class CustomRoleCreateAPIView(generics.CreateAPIView):
         serializer.save(company=company)
 
 
+@read_only_guard("can_edit_employees")
 class CustomRoleDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = CustomRoleSerializer
     permission_classes = [IsAuthenticated, IsCompanyOwner]
@@ -641,6 +789,17 @@ class BranchDetailAPIView(generics.RetrieveUpdateDestroyAPIView):
         user = self.request.user
         if not (user.is_superuser or getattr(user, "role", None) in ("owner", "admin")):
             raise PermissionDenied("Недостаточно прав для удаления филиала.")
+
+        from apps.main.models import BranchTransfer, Product
+        has_transfers = BranchTransfer.objects.filter(
+            Q(from_branch=instance) | Q(to_branch=instance)
+        ).exists()
+        has_stock = Product.objects.filter(branch=instance, quantity__gt=0).exists()
+        if has_transfers or has_stock:
+            raise ValidationError({
+                "detail": "Нельзя удалить филиал, у которого есть перемещения или ненулевые остатки товаров."
+            })
+
         try:
             instance.delete()
         except ProgrammingError as e:
@@ -708,3 +867,35 @@ class CompanySubscriptionAdminAPIView(generics.RetrieveUpdateAPIView):
         if not (user.is_superuser or getattr(user, "role", None) == "admin" or getattr(user, "owned_company_id", None)):
             raise PermissionDenied("У вас нет прав изменять подписку компании.")
         serializer.save()
+
+
+class UserUiPreferencesAPIView(APIView):
+    """
+    GET /users/ui-preferences/ — прочитать персональные настройки текущего пользователя
+    PATCH /users/ui-preferences/ — частично обновить (сам себе)
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        prefs = UserUiPreferences.objects.filter(user=request.user).first()
+        if not prefs:
+            prefs, _ = UserUiPreferences.objects.get_or_create(user=request.user)
+
+        serializer = UserUiPreferencesSerializer(prefs)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def patch(self, request, *args, **kwargs):
+        prefs = UserUiPreferences.objects.filter(user=request.user).first()
+        if not prefs:
+            prefs, _ = UserUiPreferences.objects.get_or_create(user=request.user)
+
+        serializer = UserUiPreferencesSerializer(prefs, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def put(self, request, *args, **kwargs):
+        return self.patch(request, *args, **kwargs)
+
