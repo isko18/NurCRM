@@ -236,7 +236,7 @@ def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=Non
         lines.append(vh["address"])
     lines.extend(
         [
-            f"Чек № {getattr(sale, 'doc_no', None) or sale.id}",
+            f"Чек № {getattr(sale, 'doc_number', None) or sale.id}",
             created_at.strftime("%d.%m.%Y %H:%M"),
         ]
     )
@@ -335,47 +335,46 @@ def _build_physical_receipt_text(sale, *, payment_method=None, cash_received=Non
     elif payment_label:
         lines.append(f"Оплата: {payment_label}")
 
-    lines.append("-" * 32)
-    lines.append("Спасибо за покупку")
-
-    # eKassa (если фискализация уже выполнена и данные сохранены в Sale.ekassa_fiscal)
+    # eKassa: если чек фискализирован, печатаем готовый чек ГНС от eKassa (все обязательные реквизиты:
+    # приход, СНО, НДС/НсП, наличные/безналичные, РН ККМ, ФМ, ФД, ФПД) вместо нашей копии позиций.
     try:
         meta = getattr(sale, "ekassa_fiscal", None) or {}
     except Exception:
         meta = {}
-    if isinstance(meta, dict) and meta:
+    if not isinstance(meta, dict):
+        meta = {}
+    fiscal_txt = (meta.get("receipt_txt") or "").rstrip() if meta.get("status") == "ok" else ""
+    if fiscal_txt:
+        lines = fiscal_txt.split("\n")
+        lines.append(f"Чек NurCRM № {getattr(sale, 'doc_number', None) or sale.id}")
+        for extra in (
+            ("Консультант", _user_display_name(getattr(sale, "consultant", None)) if getattr(sale, "consultant", None) else ""),
+            ("Клиент", client_name if getattr(sale, "client", None) else ""),
+        ):
+            if extra[1]:
+                lines.append(f"{extra[0]}: {extra[1]}")
+    elif meta.get("status") == "ok":
+        # Старые продажи без готового текста: реквизиты по отдельности.
+        fd_number = meta.get("fd_number") if meta.get("fd_number") is not None else (meta.get("fields") or {}).get("1040")
         lines.append("-" * 32)
-        lines.append("eKassa")
-        status = meta.get("status")
-        if status is not None:
-            lines.append(f"status: {status}")
-        # Явные реквизиты (как в «Дубликат»)
-        kkm_reg = meta.get("kkm_reg_number")
-        fm_number = meta.get("fm_number")
-        fd_number = meta.get("fd_number") if meta.get("fd_number") is not None else meta.get("fields", {}).get("1040")
-        fpd = meta.get("fpd")
-        if kkm_reg:
-            lines.append(f"РН ККМ\t{kkm_reg}")
-        if fm_number:
-            lines.append(f"ФМ\t{fm_number}")
-        if fd_number is not None:
-            lines.append(f"ФД\t{fd_number}")
-        if fpd:
-            lines.append(f"ФПД\t{fpd}")
-        if meta.get("ekassa_receipt_id") is not None:
-            lines.append(f"receipt_id: {meta.get('ekassa_receipt_id')}")
-        # Данные для QR (ссылка из ответа eKassa)
-        link = meta.get("link")
-        if link:
-            lines.append(f"QR\t{link}")
-        fields = meta.get("fields")
-        if isinstance(fields, dict) and fields:
-            lines.append("fields:")
-            for k in sorted(fields.keys(), key=lambda x: str(x)):
-                v = fields.get(k)
-                if v is None or v == "":
-                    continue
-                lines.append(f"  {k}: {v}")
+        for label, val in (
+            ("РН ККМ", meta.get("kkm_reg_number")),
+            ("ФМ", meta.get("fm_number")),
+            ("ФД", fd_number),
+            ("ФПД", meta.get("fpd")),
+        ):
+            if val not in (None, ""):
+                lines.append(f"{label}\t{val}")
+    elif meta.get("status") in ("error", "pending"):
+        lines.append("-" * 32)
+        lines.append("Фискальный чек не получен")
+
+    # Данные для QR (ссылка проверки чека на сайте ГНС)
+    link = meta.get("link") if meta.get("status") == "ok" else None
+    if link:
+        lines.append(f"QR\t{link}")
+    lines.append("-" * 32)
+    lines.append("Спасибо за покупку")
     return "\n".join(lines)
 
 
@@ -3222,9 +3221,11 @@ def _restock_product_for_sale_item_return(item: SaleItem, return_qty: Decimal) -
     stock_delta = line_qty_consume_units(return_qty, getattr(item, "sale_package", None))
     if stock_delta <= 0:
         return
-    Product.objects.filter(pk=item.product_id).exclude(kind=Product.Kind.SERVICE).update(quantity=F("quantity") + stock_delta)
+    Product.objects.filter(pk=item.product_id).exclude(kind=Product.Kind.SERVICE).update(
+        quantity=F("quantity") + stock_delta, updated_at=timezone.now()
+    )
     if getattr(item, "variant_id", None):
-        ProductVariant.objects.filter(pk=item.variant_id).update(quantity=F("quantity") + stock_delta)
+        ProductVariant.objects.filter(pk=item.variant_id).update(quantity=F("quantity") + stock_delta, updated_at=timezone.now())
 
 
 def _release_agent_allocations_for_qty(sale_item: SaleItem, return_qty_int: int) -> List[tuple]:
@@ -4078,6 +4079,10 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
         locked_qs = self._filter_qs_company_branch(locked_qs)
         sale = get_object_or_404(locked_qs, id=pk)
 
+        # Закрытие периода (ТЗ «Бухгалтер», п. 2): возврат проводится сегодняшним числом.
+        from apps.warehouse.services import ensure_period_open_api
+        ensure_period_open_api(company=sale.company, dates=[timezone.now()], user=request.user)
+
         if sale.status == Sale.Status.CANCELED:
             return Response(
                 {"detail": "Продажа уже отменена."},
@@ -4429,6 +4434,28 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
     def get_queryset(self):
         qs = super().get_queryset().annotate(sold_at=Coalesce("paid_at", "created_at"))
         qs = _apply_sale_date_filters(qs, self.request)
+
+        # ТЗ-28 §5.1: фильтры по смене, кассе, кассиру и точному времени — чтобы телефон
+        # («Мои чеки» за смену) и касса («История чеков») не грузили чеки всей компании.
+        qp = self.request.query_params
+        shift_param = (qp.get("shift") or qp.get("shift_id") or "").strip()
+        if shift_param:
+            qs = qs.filter(shift_id=shift_param)
+        cashbox_param = (qp.get("cashbox") or qp.get("cashbox_id") or "").strip()
+        if cashbox_param:
+            qs = qs.filter(cashbox_id=cashbox_param)
+        cashier_param = (qp.get("cashier") or qp.get("cashier_id") or "").strip()
+        if cashier_param:
+            qs = qs.filter(user_id=cashier_param)
+        for param, lookup in (("created_after", "created_at__gte"), ("created_before", "created_at__lte")):
+            raw = (qp.get(param) or "").strip()
+            if raw:
+                dt = parse_datetime(raw.replace(" ", "+"))
+                if dt is None:
+                    raise ValidationError({param: "Ожидается дата-время ISO 8601."})
+                if timezone.is_naive(dt):
+                    dt = timezone.make_aware(dt)
+                qs = qs.filter(**{lookup: dt})
 
         number = (self.request.query_params.get("number") or "").strip()
         if number:
