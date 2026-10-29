@@ -133,10 +133,23 @@ class SaleItemSerializer(serializers.ModelSerializer):
     kind = serializers.CharField(source="product.kind", read_only=True, default="product")
     variant_size = serializers.CharField(source="variant.size", read_only=True, default=None)
     variant_color = serializers.CharField(source="variant.color", read_only=True, default=None)
+    sale_unit = serializers.SerializerMethodField()  # ТЗ 26.10 Б-53
+    base_quantity = serializers.SerializerMethodField()
+
+    def get_sale_unit(self, obj):
+        from apps.main.tz26.hw_units.units import get_sale_unit_for_line
+
+        return get_sale_unit_for_line(obj)
+
+    def get_base_quantity(self, obj):
+        from apps.main.tz26.hw_units.units import get_base_quantity_for_line
+
+        return get_base_quantity_for_line(obj)
 
     class Meta:
         model = CartItem
         fields = (
+            "sale_unit", "base_quantity",
             "id", "cart", "product",
             "kind",
             "product_name", "barcode",
@@ -320,6 +333,8 @@ class AddItemSerializer(serializers.Serializer):
     discount_percent = serializers.DecimalField(max_digits=5, decimal_places=2, required=False)
     # Продажа поштучно из пачки: id упаковки ProductPackage (quantity_in_package = шт в пачке)
     sale_package_id = serializers.UUIDField(required=False, allow_null=True)
+    # ТЗ 26.10 Б-53: единица продажи (коробка/мешок); quantity — в этих единицах
+    sale_unit_id = serializers.IntegerField(required=False, allow_null=True)
     # Разрешить продажу "в минус" (игнорировать проверку остатка).
     # Будет применено только для owner/admin (см. pos_views).
     allow_minus = serializers.BooleanField(required=False, default=False)
@@ -833,6 +848,41 @@ def _sale_debt_amount(sale):
     return money(remaining if remaining > Decimal("0.00") else Decimal("0.00"))
 
 
+def _sale_returns_info(sale):
+    """ТЗ Н-07: (сумма возвратов, {sale_item_id: возвращённое кол-во}) по SaleReturn чека.
+    Берём prefetch `returns`, если он есть; кэшируем на объекте продажи."""
+    cached = getattr(sale, "_returns_info_cache", None)
+    if cached is not None:
+        return cached
+    total = Decimal("0.00")
+    per_line = {}
+    for r in sale.returns.all():
+        total += Decimal(str(r.returned_amount or 0))
+        for row in (r.returned_items or []):
+            sid = row.get("sale_item") if isinstance(row, dict) else None
+            if not sid:
+                continue
+            try:
+                per_line[str(sid)] = per_line.get(str(sid), Decimal("0")) + Decimal(str(row.get("qty") or 0))
+            except Exception:
+                continue
+    cached = (money(total), per_line)
+    sale._returns_info_cache = cached
+    return cached
+
+
+def _sale_refunded_total(sale):
+    return str(_sale_returns_info(sale)[0])
+
+
+def _sale_refundable_total(sale):
+    """Сколько ещё можно вернуть деньгами: текущий итог чека (после частичных возвратов
+    `total` уже уменьшен на возвращённое); у отменённого/полностью возвращённого — 0."""
+    if sale.status == Sale.Status.CANCELED:
+        return "0.00"
+    return str(money(max(Decimal(str(sale.total or 0)), Decimal("0.00"))))
+
+
 class SaleListSerializer(serializers.ModelSerializer):
     user_display = serializers.SerializerMethodField()
     consultant_display = serializers.SerializerMethodField(read_only=True)
@@ -855,10 +905,18 @@ class SaleListSerializer(serializers.ModelSerializer):
     paid_now = serializers.SerializerMethodField(read_only=True)
     debt_initial = serializers.SerializerMethodField(read_only=True)
     debt_remaining = serializers.SerializerMethodField(read_only=True)
+    refunded_total = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-07
+    refundable_total = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-07
+    debt_paid = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-14
+    prepayment = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-14
+    due_date = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-14
+    created_by = serializers.SerializerMethodField(read_only=True)  # Б-67
+    sold_at = serializers.SerializerMethodField(read_only=True)  # Б-68
 
     class Meta:
         model = Sale
         fields = (
+            "source", "device_key", "device_name", "created_by", "sold_at",  # Б-67, Б-68
             "id",
             "number",
             "branch",
@@ -894,7 +952,47 @@ class SaleListSerializer(serializers.ModelSerializer):
             "paid_now",
             "debt_initial",
             "debt_remaining",
+            "refunded_total",
+            "refundable_total",
+            "debt_paid",
+            "prepayment",
+            "due_date",
         )
+
+    def get_created_by(self, obj):
+        from apps.main.tz26.pos_sync.services import user_brief
+        return user_brief(obj.user)
+
+    def get_sold_at(self, obj):
+        # Время продажи: у досланной офлайн-продажи created_at = paid_at = время на кассе (received_at - приём сервером)
+        val = obj.paid_at or obj.created_at
+        return serializers.DateTimeField().to_representation(val) if val else None
+
+    def get_debt_paid(self, obj):
+        """ТЗ Н-14: сколько долга уже погашено = debt_initial − debt_remaining."""
+        paid = Decimal(str(obj.debt_initial or 0)) - Decimal(str(obj.debt_remaining or 0))
+        return str(money(max(paid, Decimal("0.00"))))
+
+    def get_prepayment(self, obj):
+        """ТЗ Н-14: предоплата при оформлении (= paid_now)."""
+        return str(money(obj.paid_now or Decimal("0.00")))
+
+    def get_due_date(self, obj):
+        """ТЗ Н-14: срок ближайшего непогашенного взноса связанной долговой сделки."""
+        deal = _linked_debt_deal(obj)
+        if deal is None:
+            return None
+        dues = [
+            i.due_date for i in deal.installments.all()
+            if i.due_date and (i.paid_amount or 0) < (i.amount or 0)
+        ]
+        return min(dues).isoformat() if dues else None
+
+    def get_refunded_total(self, obj):
+        return _sale_refunded_total(obj)
+
+    def get_refundable_total(self, obj):
+        return _sale_refundable_total(obj)
 
     def get_paid_now(self, obj):
         return str(money(obj.paid_now or Decimal("0.00")))
@@ -976,6 +1074,9 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
     price_manually_edited = serializers.BooleanField(read_only=True)
     price_override_reason = serializers.SerializerMethodField()
     returnable_qty = serializers.SerializerMethodField()
+    quantity_refunded = serializers.SerializerMethodField()  # ТЗ Н-07
+    sale_unit = serializers.SerializerMethodField()  # ТЗ 26.10 Б-53
+    base_quantity = serializers.SerializerMethodField()
 
     is_custom = serializers.BooleanField(read_only=True)
     price = serializers.SerializerMethodField(read_only=True)
@@ -1016,8 +1117,28 @@ class SaleItemReadSerializer(serializers.ModelSerializer):
             "price_manually_edited",
             "price_override_reason",
             "returnable_qty",
+            "quantity_refunded",
+            "sale_unit",
+            "base_quantity",
         )
         read_only_fields = fields
+
+    def get_sale_unit(self, obj):
+        from apps.main.tz26.hw_units.units import get_sale_unit_for_line
+
+        return get_sale_unit_for_line(obj)
+
+    def get_base_quantity(self, obj):
+        from apps.main.tz26.hw_units.units import get_base_quantity_for_line
+
+        return get_base_quantity_for_line(obj)
+
+    def get_quantity_refunded(self, obj):
+        """ТЗ Н-07: сколько по строке уже возвращено (по SaleReturn.returned_items)."""
+        sale = getattr(obj, "sale", None)
+        if sale is None:
+            return "0.000"
+        return str(qty3(_sale_returns_info(sale)[1].get(str(obj.id), Decimal("0"))))
 
     def get_price(self, obj):
         return str(money(obj.unit_price or Decimal("0.00")))
@@ -1090,10 +1211,14 @@ class SaleDetailSerializer(serializers.ModelSerializer):
     debt_initial = serializers.SerializerMethodField(read_only=True)
     debt_remaining = serializers.SerializerMethodField(read_only=True)
     debt_amount = serializers.SerializerMethodField(read_only=True)
+    refunded_total = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-07
+    refundable_total = serializers.SerializerMethodField(read_only=True)  # ТЗ Н-07
+    created_by = serializers.SerializerMethodField(read_only=True)  # Б-67
 
     class Meta:
         model = Sale
         fields = (
+            "source", "device_key", "device_name", "created_by",  # Б-67
             "id",
             "number",
             "branch",
@@ -1129,8 +1254,20 @@ class SaleDetailSerializer(serializers.ModelSerializer):
             "debt_initial",
             "debt_remaining",
             "debt_amount",
+            "refunded_total",
+            "refundable_total",
         )
         read_only_fields = fields
+
+    def get_created_by(self, obj):
+        from apps.main.tz26.pos_sync.services import user_brief
+        return user_brief(obj.user)
+
+    def get_refunded_total(self, obj):
+        return _sale_refunded_total(obj)
+
+    def get_refundable_total(self, obj):
+        return _sale_refundable_total(obj)
 
     def get_paid_now(self, obj):
         return str(money(obj.paid_now or Decimal("0.00")))

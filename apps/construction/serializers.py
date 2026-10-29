@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+from core.exceptions import ApiError  # Б-02
 from django.db.models import Q, Sum
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError as DRFValidationError
@@ -87,6 +88,9 @@ class CashShiftListSerializer(serializers.ModelSerializer):
     cashier_breakdown = serializers.SerializerMethodField()
     resolved_cashbox_id = serializers.SerializerMethodField()
     resolved_cashbox_name = serializers.SerializerMethodField()
+    closed_by = serializers.SerializerMethodField()
+    close_reason = serializers.SerializerMethodField()
+    auto_close_at = serializers.SerializerMethodField()
 
     class Meta:
         model = CashShift
@@ -118,8 +122,33 @@ class CashShiftListSerializer(serializers.ModelSerializer):
             "cash_diff",
             "payment_breakdown",
             "cashier_breakdown",
+            "closed_by",
+            "close_reason",
+            "auto_close_at",
         ]
         read_only_fields = fields
+
+    # ТЗ Н-09: без миграции — «кто закрыл» выводим из close_reason модели.
+    _SYSTEM_REASONS = ("auto_timeout_24h", "employee_deleted")
+
+    def get_closed_by(self, obj):
+        if obj.status != CashShift.Status.CLOSED:
+            return None
+        return "system" if (obj.close_reason or "") in self._SYSTEM_REASONS else "user"
+
+    def get_close_reason(self, obj):
+        if obj.status != CashShift.Status.CLOSED:
+            return None
+        r = obj.close_reason or ""
+        if r == "auto_timeout_24h":
+            return "auto_24h"
+        return r or "manual"
+
+    def get_auto_close_at(self, obj):
+        from apps.construction.services_shifts import shift_auto_close_at
+
+        dt = shift_auto_close_at(obj)
+        return dt.isoformat() if dt else None
 
     def get_cashbox_name(self, obj):
         if obj.cashbox and obj.cashbox.branch:
@@ -352,6 +381,15 @@ class CashFlowInsideCashboxSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+def _add_drawer_cash(data, cashbox):
+    """ТЗ Н-06: наличные в ящике (только pos_branch/pos_main), у остальных касс — null."""
+    info = cashbox.drawer_cash_info()
+    data["drawer_cash"] = str(info["drawer_cash"]) if info and info["drawer_cash"] is not None else None
+    data["drawer_cash_at"] = info["drawer_cash_at"].isoformat() if info else None
+    data["last_closed_shift"] = info["last_closed_shift"] if info else None
+    return data
+
+
 class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
     cashflows = CashFlowInsideCashboxSerializer(source="flows", many=True, read_only=True)
     is_consumption = serializers.BooleanField(read_only=True)
@@ -382,9 +420,14 @@ class CashboxWithFlowsSerializer(CompanyBranchReadOnlyMixin):
     def get_current_balance(self, obj):
         return self.get_balance(obj)
 
+    def to_representation(self, instance):
+        return _add_drawer_cash(super().to_representation(instance), instance)
+
 
 
 class CashboxSerializer(CompanyBranchReadOnlyMixin):
+    # ТЗ 11.4: филиал кассы отдаём id (null — общая касса); у ReadOnlyField(source="branch.id") ключ пропадал при null
+    branch = serializers.PrimaryKeyRelatedField(read_only=True, allow_null=True)
     analytics = serializers.SerializerMethodField()
     is_consumption = serializers.BooleanField(required=False, default=False)
     role = serializers.ChoiceField(choices=Cashbox.CashboxRole.choices, required=False, allow_null=True)
@@ -453,6 +496,8 @@ class CashboxSerializer(CompanyBranchReadOnlyMixin):
         if not data.get("role"):
             data["role"] = instance.get_inferred_role()
 
+        _add_drawer_cash(data, instance)
+
         return data
     def get_analytics(self, obj):
         amap = self.context.get("analytics_map")
@@ -495,10 +540,27 @@ class CashFlowCategorySerializer(CompanyBranchReadOnlyMixin):
         queryset=Branch.objects.all(), required=False, allow_null=True
     )
 
+    is_default = serializers.SerializerMethodField()
+
+    def get_is_default(self, obj):
+        return bool(obj.code)
+
+    def to_internal_value(self, data):
+        # ТЗ «Бухгалтер»: фронт шлёт name, исторически поле называется title.
+        if hasattr(data, "get") and "name" in data and "title" not in data:
+            data = data.copy()
+            data["title"] = data["name"]
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        rep = super().to_representation(instance)
+        rep["name"] = rep.get("title")
+        return rep
+
     class Meta:
         model = CashFlowCategory
-        fields = ["id", "company", "branch", "title", "created_at"]
-        read_only_fields = ["id", "company", "created_at"]
+        fields = ["id", "company", "branch", "title", "type", "archived", "is_default", "slug", "is_system", "created_at"]
+        read_only_fields = ["id", "company", "created_at", "slug", "is_system"]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -532,6 +594,13 @@ class CashFlowCategorySerializer(CompanyBranchReadOnlyMixin):
                 validated_data["company"] = company
         if "branch" not in validated_data:
             validated_data["branch"] = self._auto_branch()
+        # ТЗ Н-19: «Зарплата/Аренда/Налоги/Коммунальные» (без регистра) получают системный slug.
+        from apps.construction.categories import system_slug_for
+
+        slug = system_slug_for(validated_data.get("title"))
+        if slug:
+            validated_data["slug"] = slug
+            validated_data["is_system"] = True
         return serializers.ModelSerializer.create(self, validated_data)
 
     def update(self, instance, validated_data):
@@ -555,6 +624,17 @@ class TargetFlowBriefSerializer(serializers.ModelSerializer):
 DRAWER_SOURCE_KINDS = (
     CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW,
     CashFlow.SourceKind.SHIFT_DRAWER_INFLOW,
+    CashFlow.SourceKind.SHIFT_DRAWER_COLLECTION,  # ТЗ Н-19
+)
+# ТЗ Н-19: расходы «по назначению» — всегда расход, ящик не трогают.
+EXPENSE_ONLY_KINDS = (
+    CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW,
+    CashFlow.SourceKind.SHIFT_DRAWER_COLLECTION,
+)
+PURPOSE_SOURCE_KINDS = (
+    CashFlow.SourceKind.SALARY_PAYOUT,
+    CashFlow.SourceKind.RENT_PAYMENT,
+    CashFlow.SourceKind.SUPPLIER_PAYMENT,
 )
 
 
@@ -573,6 +653,10 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         allow_null=True,
     )
     category_title = serializers.CharField(source="category.title", read_only=True, default="")
+    # ТЗ «Бухгалтер»: category_id — алиас category (на запись и чтение)
+    category_id = serializers.PrimaryKeyRelatedField(
+        queryset=CashFlowCategory.objects.all(), source="category", required=False, allow_null=True
+    )
 
     cashier = serializers.ReadOnlyField(source="cashier.id")
     cashier_display = serializers.SerializerMethodField()
@@ -606,7 +690,8 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             "source_kind",
             "source_id",
             "shift",
-            "category",
+            "category", "category_id",
+            "checked_at", "checked_by", "accountant_note",
             "category_title",
             "cashier",
             "cashier_display",
@@ -639,6 +724,7 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             "resolved_by",
             "resolved_at",
             "idempotency_key",
+            "checked_at", "checked_by", "accountant_note",
         ]
 
     def __init__(self, *args, **kwargs):
@@ -662,15 +748,15 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             cb_qs = cb_qs.filter(Q(branch__isnull=True) | Q(branch=target_branch))
         self.fields["cashbox"].queryset = cb_qs
 
+        # Б-02: чужую смену не прячем в queryset (иначе общий 400 без кода): validate() даёт 400 shift_not_owned.
         sh_qs = CashShift.objects.filter(company=company)
-        if not _is_owner_like(user):
-            sh_qs = sh_qs.filter(cashier=user)
         self.fields["shift"].queryset = sh_qs
 
         cat_qs = CashFlowCategory.objects.filter(company=company)
         if target_branch is not None:
             cat_qs = cat_qs.filter(Q(branch__isnull=True) | Q(branch=target_branch))
         self.fields["category"].queryset = cat_qs
+        self.fields["category_id"].queryset = cat_qs
 
     def get_cashbox_name(self, obj):
         if obj.cashbox and obj.cashbox.branch:
@@ -718,6 +804,17 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
             raise DRFValidationError({"detail": "Касса находится в архиве.", "code": "cashbox_inactive"})
 
         category = attrs.get("category") if "category" in attrs else getattr(self.instance, "category", None)
+        if self.instance is None and category is None and "category" not in attrs:
+            # По умолчанию — статья «Прочие» (ТЗ «Бухгалтер», п. 3)
+            from apps.construction.categories import get_default_category
+
+            category = get_default_category(_get_company_from_user(user) if user else None, "other")
+            if category is not None:
+                attrs["category"] = category
+        if category is not None and "category" in attrs and getattr(category, "archived", False) and (
+            self.instance is None or self.instance.category_id != category.id
+        ):
+            raise serializers.ValidationError({"category": "Статья в архиве."})
         if category is not None:
             company = _get_company_from_user(user) if user else None
             if company and category.company_id != company.id:
@@ -764,10 +861,13 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
                 raise serializers.ValidationError({"shift": "Смена относится к другой кассе."})
 
             if shift.status != CashShift.Status.OPEN:
-                raise serializers.ValidationError({"shift": "Нельзя делать движение по закрытой смене."})
+                # Б-02: старая касса повторяет очередь на любой отказ кроме 400 — даём 400 с понятным кодом.
+                _m = "Нельзя делать движение по закрытой смене."
+                raise ApiError("shift_closed", _m, top={"shift": _m})
 
             if user and (not _is_owner_like(user)) and shift.cashier_id != user.id:
-                raise serializers.ValidationError({"shift": "Это не ваша смена."})
+                _m = "Это не ваша смена."
+                raise ApiError("shift_not_owned", _m, top={"shift": _m})
 
         # «Оплачено из кассы (ящика) смены» — shift-drawer-funding-purchases-backend.md.
         # Обычная ручная запись ящик не трогает: calc_live_totals учитывает только
@@ -777,7 +877,7 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         source_kind = attrs.get("source_kind") or getattr(self.instance, "source_kind", None)
         if source_kind in DRAWER_SOURCE_KINDS:
             flow_type = attrs.get("type") or getattr(self.instance, "type", None)
-            if source_kind == CashFlow.SourceKind.SHIFT_DRAWER_OUTFLOW and flow_type != CashFlow.Type.EXPENSE:
+            if source_kind in EXPENSE_ONLY_KINDS and flow_type != CashFlow.Type.EXPENSE:
                 raise serializers.ValidationError(
                     {"type": "Списание из кассы смены возможно только расходом."}
                 )
@@ -811,7 +911,7 @@ class CashFlowSerializer(CompanyBranchReadOnlyMixin):
         # ✅ если shift не передали или shift=None — это “общий режим”, разрешаем
         return attrs
 
-    EMPLOYEE_SOURCE_KINDS = (None, "", CashFlow.SourceKind.MANUAL) + DRAWER_SOURCE_KINDS
+    EMPLOYEE_SOURCE_KINDS = (None, "", CashFlow.SourceKind.MANUAL) + DRAWER_SOURCE_KINDS + PURPOSE_SOURCE_KINDS
 
     def _validate_employee_rights(self, attrs, user):
         """Ограничения для не-владельца (кассира): одобрение, авто-движения, закрытые смены."""

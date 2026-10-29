@@ -85,6 +85,8 @@ DEFAULT_CORS_ORIGINS = DEV_CORS_ORIGINS
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "django-insecure-dev-only-change-me")
+# Ключ support.nurcrm.kg для конструктора тарифа «По договору» (apps/users/support_views.py). Пусто — выключено.
+NURCRM_SUPPORT_TOKEN = os.getenv("NURCRM_SUPPORT_TOKEN", "")
 
 # SECURITY WARNING: don't run with debug turned on in production!
 ALLOWED_HOSTS = _get_list_env("DJANGO_ALLOWED_HOSTS", DEFAULT_ALLOWED_HOSTS)
@@ -128,14 +130,20 @@ INSTALLED_APPS = [
     'apps.ekassa',
     'apps.onec',
     'apps.releases',
+    'apps.possync',
     'apps.integrations',
     'apps.support',
     'apps.clientapp',
+    'apps.inbox',  # ТЗ 26.10 Б-73…Б-87
     # 'apps.crm',
 ]
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
+    # ТЗ-28 §2.4: сжатие JSON > 200 байт (каталог 10 000 товаров ~12 МБ → ~1,5 МБ).
+    'django.middleware.gzip.GZipMiddleware',
+    # ТЗ-28 §11.2–11.4: X-Request-Id, X-Server-Time, журнал медленных запросов.
+    'core.middleware.RequestMetaMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -271,6 +279,9 @@ CLIENT_ZIP_URL = os.getenv(
 )
 CLIENT_RELEASE_NOTES = os.getenv("CLIENT_RELEASE_NOTES", "Первый релиз")
 
+# ТЗ-28 §11.4: порог журнала медленных запросов, мс
+SLOW_REQUEST_MS = _get_int_env("SLOW_REQUEST_MS", 1000)
+
 REST_FRAMEWORK = {
     'EXCEPTION_HANDLER': 'core.exceptions.api_exception_handler',
     'DEFAULT_AUTHENTICATION_CLASSES': (
@@ -344,6 +355,10 @@ CELERY_IMPORTS = (
     'apps.main.telegram_bot.tasks',
     'apps.main.recommendations_tasks',
     'apps.main.rentals_tasks',
+    'apps.main.tz26.ai_stock.tasks',  # ТЗ 26.10 Б-65
+    'apps.main.tz26.pos_print.tasks',  # ТЗ 26.10 Б-69
+    'apps.inbox.tasks',  # ТЗ 26.10 Б-73…Б-87
+    'apps.main.tz26.staff.tasks',  # ТЗ 26.10 Б-62
     'apps.consalting.tasks',
     'apps.construction.tasks',
     'apps.integrations.tasks',
@@ -362,6 +377,21 @@ CONSALTING_FUNNEL_STRICT = False
 from celery.schedules import crontab  # noqa: E402
 
 CELERY_BEAT_SCHEDULE = {
+    'staff-task-reminders': {'task': 'apps.main.tz26.staff.tasks.send_due_task_reminders', 'schedule': crontab()},  # ТЗ 26.10 Б-62: напоминания по задачам
+    # ТЗ 26.10 Б-75…Б-77: ящик «Чаты»
+    'inbox-sweep-webhooks': {'task': 'apps.inbox.tasks.sweep_webhook_events', 'schedule': crontab(minute='*/2')},
+    'inbox-sweep-outbound': {'task': 'apps.inbox.tasks.sweep_outbound', 'schedule': crontab(minute='*/2')},
+    'inbox-wake-snoozed': {'task': 'apps.inbox.tasks.wake_snoozed', 'schedule': crontab(minute='*/5')},
+    'inbox-alert-unanswered': {'task': 'apps.inbox.tasks.alert_unanswered', 'schedule': crontab(minute='*/15')},
+    'inbox-cleanup': {'task': 'apps.inbox.tasks.cleanup_old_data', 'schedule': crontab(hour=4, minute=10)},
+    'tz26-print-jobs-purge': {  # ТЗ 26.10 Б-69: задания печати хранятся 7 дней
+        'task': 'apps.main.tz26.pos_print.tasks.purge_print_jobs',
+        'schedule': crontab(hour=3, minute=40),
+    },
+    'tz26-ai-actions-purge': {  # ТЗ 26.10 Б-65: журнал действий ИИ хранится 180 дней
+        'task': 'apps.main.tz26.ai_stock.tasks.purge_ai_actions',
+        'schedule': crontab(hour=3, minute=30),
+    },
     'support-daily-digest': {
         'task': 'apps.support.tasks.send_daily_support_digest',
         'schedule': crontab(hour=9, minute=0),
@@ -619,6 +649,11 @@ LOGGING = {
         },
     },
     'loggers': {
+        'nurcrm.slow_requests': {
+            'handlers': ['console'],
+            'level': 'WARNING',
+            'propagate': False,
+        },
         'nurcrm.websocket.auth': {
             'handlers': ['console'],
             'level': _WS_LOG_LEVEL,
@@ -683,3 +718,7 @@ WAZZUP_DEFAULT_CHANNEL_ID = os.getenv("WAZZUP_DEFAULT_CHANNEL_ID", "")
 # Consulting CRM tenant provision default sector (Sector 'Магазин' / 'Маркет')
 CONSULTING_DEFAULT_CRM_SECTOR_ID = os.getenv("CONSULTING_DEFAULT_CRM_SECTOR_ID", "e9f05beb-5e14-4153-b523-4e1600c9b2e0")
 
+
+# ТЗ Н-32: квота медиа-хранилища на компанию (МБ) и шаблон ссылки на электронный чек
+COMPANY_MEDIA_QUOTA_MB = int(os.getenv("COMPANY_MEDIA_QUOTA_MB", "500"))
+RECEIPT_PUBLIC_URL_TEMPLATE = os.getenv("RECEIPT_PUBLIC_URL_TEMPLATE", "https://market.nurcrm.kg/receipt/{token}")

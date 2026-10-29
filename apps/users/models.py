@@ -690,6 +690,9 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_view_request = models.BooleanField(default=False, verbose_name="Доступ к запросам")
     can_view_shifts = models.BooleanField(default=False, verbose_name="Доступ к смене")
     can_view_cashier = models.BooleanField(default=False, verbose_name="Доступ к интерфейсу кассы")
+    # ТЗ Н-16: «Работа на кассе» отдельно от «Финансы: кассы компании» (can_view_cashbox).
+    # По умолчанию True (db_default) — после миграции никто не теряет доступ к кассе.
+    can_use_pos = models.BooleanField(default=True, db_default=True, verbose_name="Работа на кассе (POS)")
     can_view_document = models.BooleanField(default=False, verbose_name="Доступ к документам")
     can_view_market_scales = models.BooleanField(default=False, verbose_name="Доступ к весам")
     can_view_market_label = models.BooleanField(default=False, verbose_name="Доступ к печати этикеток")
@@ -707,6 +710,16 @@ class User(AbstractBaseUser, PermissionsMixin):
     can_change_document_date = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: менять дату документа")
     can_post_closed_period = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: изменения в закрытом периоде")
     can_cash_negative = models.BooleanField(null=True, blank=True, default=None, verbose_name="Склад: расход кассы в минус")
+
+    # Режим «только смотреть» (ТЗ «Бухгалтер», п. 1). NULL — как раньше (видит → может менять), False — только просмотр.
+    can_edit_cashbox = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: кассы")
+    can_edit_products = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: товары")
+    can_edit_procurement = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: закупки")
+    can_edit_documents = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: документы склада")
+    can_edit_clients = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: клиенты и долги")
+    can_edit_salary = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: зарплата")
+    can_edit_employees = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: сотрудники")
+    can_edit_settings = models.BooleanField(null=True, blank=True, default=None, verbose_name="Менять: настройки")
 
     branches = models.ManyToManyField(
         "Branch",
@@ -960,6 +973,8 @@ class CompanyAddon(models.Model):
     active = models.BooleanField(default=True)
     until = models.DateField(null=True, blank=True, help_text="Пусто — бессрочно")
     note = models.CharField(max_length=255, blank=True, default="")
+    # ТЗ Н-32: откуда функция — key (ключ), trial (пробный доступ), support (включила поддержка)
+    source = models.CharField(max_length=16, default="support", db_default="support")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -1131,3 +1146,100 @@ class FeatureActivationKey(models.Model):
 
     def __str__(self):
         return f"{self.key} → {self.code}"
+
+
+class FeatureTrial(models.Model):
+    """ТЗ Н-32: пробный доступ к функции — один раз на функцию для компании."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="feature_trials")
+    code = models.SlugField(max_length=64)
+    expires_at = models.DateField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Пробный доступ к функции"
+        verbose_name_plural = "Пробные доступы к функциям"
+        constraints = [models.UniqueConstraint(fields=["company", "code"], name="uniq_feature_trial_company_code")]
+
+
+class FeatureKeyAttempt(models.Model):
+    """ТЗ Н-32: неверная попытка ввода ключа функции (защита от подбора, 10 в час)."""
+
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="+")
+    ip = models.GenericIPAddressField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        verbose_name = "Неверная попытка ключа"
+        verbose_name_plural = "Неверные попытки ключей"
+
+
+class AdminPin(models.Model):
+    """PIN подтверждения опасных действий (ТЗ п.10): хэш, счётчик неверных попыток, блокировка."""
+
+    user = models.OneToOneField("users.User", on_delete=models.CASCADE, related_name="admin_pin")
+    pin_hash = models.CharField(max_length=256)
+    failed_attempts = models.PositiveSmallIntegerField(default=0, db_default=0)
+    locked_until = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "PIN администратора"
+        verbose_name_plural = "PIN администраторов"
+
+
+class CompanyPinSetting(models.Model):
+    """Настройка компании «Подтверждать PIN» для опасных действий."""
+
+    company = models.OneToOneField("users.Company", on_delete=models.CASCADE, related_name="pin_setting")
+    require_pin = models.BooleanField(default=False, db_default=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Настройка PIN компании"
+        verbose_name_plural = "Настройки PIN компаний"
+
+
+class EmployeeAccessCode(models.Model):
+    """ТЗ Н-16: код доступа сотрудника к действию (например, скидка/удаление чека) — хранится хэшем."""
+
+    company = models.ForeignKey("users.Company", on_delete=models.CASCADE, related_name="employee_access_codes")
+    employee = models.ForeignKey("users.User", on_delete=models.CASCADE, related_name="access_codes")
+    action = models.CharField(max_length=64)
+    code_hash = models.CharField(max_length=256)
+    updated_by = models.ForeignKey(
+        "users.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Код доступа сотрудника"
+        verbose_name_plural = "Коды доступа сотрудников"
+        constraints = [
+            models.UniqueConstraint(fields=["employee", "action"], name="uniq_employee_access_code_action"),
+        ]
+        indexes = [models.Index(fields=["company", "action"], name="ix_empcode_company_action")]
+
+
+class ClientVersionSeen(models.Model):
+    """
+    Какие версии касс и мобилок ходят в API компании (единое ТЗ 26.10.2026, Б-01).
+    Пишет core.middleware по заголовку X-NurMarket-Client не чаще раза в час на пару компания+клиент.
+    По журналу решают, когда снимать переходный режим (флаг api_strict_2026_10, Б-02).
+    """
+
+    company = models.ForeignKey(Company, on_delete=models.CASCADE, related_name="client_versions")
+    client = models.CharField(max_length=40)  # «kassa/1.17.61», «mobile/1.18.5»; без заголовка — «none»
+    first_seen_at = models.DateTimeField(auto_now_add=True)
+    last_seen_at = models.DateTimeField()
+    hits = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        verbose_name = "Версия клиента API"
+        verbose_name_plural = "Версии клиентов API"
+        constraints = [models.UniqueConstraint(fields=["company", "client"], name="uniq_company_client_version")]
+        indexes = [models.Index(fields=["last_seen_at"])]
+
+    def __str__(self):
+        return f"{self.company_id}: {self.client}"

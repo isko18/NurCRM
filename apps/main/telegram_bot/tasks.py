@@ -195,6 +195,14 @@ def process_telegram_update(settings_id: str, update_data: dict, enqueued_at: fl
         is_owner = (settings.owner_chat_id and str(settings.owner_chat_id) == str(chat_id))
         audience = "owner" if is_owner else "customers"
 
+        # ТЗ Н-23 (2): 6 цифр от не-владельца — возможно, код подтверждения владельца
+        if not is_owner and text and not message.get("voice"):
+            from apps.main.telegram_bot.services import owner_notify
+            if owner_notify.try_bind_owner_from_message(settings, chat_id, from_user, chat_title, text):
+                from django.utils import timezone
+                TelegramBotSettings.objects.filter(id=settings.id).update(last_reply_at=timezone.now())
+                return
+
         # Логируем для detect-owner-chat
         TelegramMessageLog.objects.create(
             bot_settings=settings,
@@ -203,6 +211,12 @@ def process_telegram_update(settings_id: str, update_data: dict, enqueued_at: fl
             sender_name=sender_name,
             text=text if not is_voice else "[Голосовое сообщение]",
         )
+
+        # Ящик «Чаты» (ТЗ 26.10 Б-76): входящее покупателя пишем в диалог; в паузе после ответа человека бот молчит
+        if not is_owner:
+            from apps.inbox import bot_hooks
+            if bot_hooks.on_customer_message(settings, message):
+                return
 
         # ТЗ ч.15, п. 5: фото накладной от владельца (photo или document-картинка)
         image_part, image_mime = None, "image/jpeg"

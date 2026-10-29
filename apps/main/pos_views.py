@@ -1,3 +1,4 @@
+from apps.users.pin import pin_guard
 from apps.integrations.idempotency import idempotent
 from rest_framework import generics, status, permissions, filters
 from rest_framework.views import APIView
@@ -80,6 +81,10 @@ from apps.main.models import ProductVariant
 from apps.main.cache_utils import invalidate_cache_pattern
 from apps.main.services import checkout_cart, NotEnoughStock
 from apps.main.cart_service import abandon_cart
+from apps.main.tz26.hw_prices.services import (
+    after_checkout as hw_after_checkout,
+    reprice_for_request as hw_reprice_for_request,
+)
 from apps.ekassa.runtime import schedule_after_commit
 from apps.ekassa.shift_bridge import sync_ekassa_after_local_shift_open_by_id
 
@@ -389,7 +394,7 @@ def _cart_queryset_for_response():
         "id", "product_id", "position", "min_amount", "discount_percent", "promo_quantity"
     ).order_by("position", "id")
     item_qs = (
-        CartItem.objects.select_related("product", "variant")
+        CartItem.objects.select_related("product", "variant", "sale_unit")
         .only(
             "id",
             "cart_id",
@@ -404,6 +409,8 @@ def _cart_queryset_for_response():
             "variant__id",
             "variant__size",
             "variant__color",
+            "sale_unit_id", "base_quantity",  # ТЗ 26.10 Б-53
+            "sale_unit__id", "sale_unit__name", "sale_unit__factor",
             "product__id",
             "product__name",
             "product__barcode",
@@ -710,6 +717,12 @@ def _reprice_cart_items_for_mode(cart: Cart) -> None:
         if not it.product_id or not it.product:
             continue
         p = it.product
+        if it.sale_unit_id:  # ТЗ 26.10 Б-53: цена единицы продажи
+            from apps.main.tz26.hw_units.units import effective_unit_price
+
+            it.unit_price = effective_unit_price(p, it.sale_unit, wholesale=bool(getattr(cart, "is_wholesale", False)))
+            changed.append(it)
+            continue
         if getattr(cart, "is_wholesale", False):
             raw_wholesale = getattr(p, "wholesale_price", None)
             raw_retail = getattr(p, "price", None)
@@ -730,12 +743,22 @@ def _reprice_cart_items_for_mode(cart: Cart) -> None:
         cart.recalc()
 
 
+# ТЗ 12.11: все безналичные способы оплаты, попадающие под фильтр payment_method=transfer.
+SALE_TRANSFER_METHODS = (
+    Sale.PaymentMethod.TRANSFER,
+    Sale.PaymentMethod.MBANK,
+    Sale.PaymentMethod.OPTIMA,
+    Sale.PaymentMethod.OBANK,
+    Sale.PaymentMethod.BAKAI,
+)
+
+
 def _aware(dt_or_date, end=False):
     tz = get_current_timezone()
     if isinstance(dt_or_date, datetime):
         return dt_or_date if is_aware(dt_or_date) else make_aware(dt_or_date, tz)
     if isinstance(dt_or_date, date):
-        t = dtime(23, 59, 59) if end else dtime(0, 0, 0)
+        t = dtime(23, 59, 59, 999999) if end else dtime(0, 0, 0)
         return make_aware(datetime.combine(dt_or_date, t), tz)
     return None
 
@@ -748,12 +771,15 @@ def _parse_range_dt(v: str, *, end: bool) -> Optional[datetime]:
     """
     if not v:
         return None
+    v = v.strip()
+    # Голая дата YYYY-MM-DD: на Python 3.11+ parse_datetime() принимает её как 00:00,
+    # поэтому дату разбираем первой (конец диапазона = конец дня).
+    d = parse_date(v) if "T" not in v and " " not in v else None
+    if d:
+        return _aware(d, end=end)
     dt = parse_datetime(v)
     if dt:
         return _aware(dt, end=end)
-    d = parse_date(v)
-    if d:
-        return _aware(d, end=end)
     return None
 
 
@@ -1375,8 +1401,12 @@ def _resolve_requested_open_shift(*, company, cashier, shift_id, cashbox_id=None
         .first()
     )
     if not shift or shift.status != CashShift.Status.OPEN:
+        # ТЗ Н-09: машинный код отказа (текст и статус 400 прежние)
         raise ValidationError(
-            {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем начните продажу."}
+            {
+                "detail": "Смена не открыта. Сначала откройте смену на кассе, затем начните продажу.",
+                "code": "shift_not_found" if not shift else "shift_closed",
+            }
         )
     if cashbox_id and str(shift.cashbox_id) != str(cashbox_id):
         raise ValidationError({"cashbox_id": "Переданная смена относится к другой кассе."})
@@ -1431,6 +1461,87 @@ def _ensure_open_shift(*, company, branch, cashier, cashbox, opening_cash=None):
     return shift
 
 
+def _supplier_recon_rows(company, client, start_dt, end_dt, source="both"):
+    """
+    ТЗ Н-12: акт сверки с поставщиком — направление «мы должны».
+    Знак как в акте клиента (плюс = контрагент должен нам), поэтому наш долг поставщику —
+    отрицательное сальдо: debt.debtor = наша компания, amount = |closing| = kpis.debt поставщика.
+    Строки: сделки-долги (кредит поставщика), предоплата/зачёт возврата по сделке и оплаты (дебет);
+    приходы и возвраты поставщику — справочные строки (сумма в `doc_amount`, на сальдо не влияют:
+    долг приходов уже в сделках, возврат деньгами — движение денег, зачёт долга — в предоплате сделки).
+    Сделки kind=sale/amount у поставщика (оплаченные закупки сайта) в долг не входят.
+    Возвращает (opening, rows); rows: dict(date, title, a_debit, a_credit, b_debit, b_credit, ref_type, ref_id, extra).
+    """
+    from apps.main.models import DealPayment, SupplierReceipt, SupplierReceiptItem, SupplierReturn, SupplierReturnItem
+
+    Z = Decimal("0.00")
+    owed_before = Z
+    rows = []
+
+    def _row(dt, title, a_debit, a_credit, ref_type, ref_id, extra=None):
+        rows.append(dict(
+            date=dt, title=title, a_debit=a_debit, a_credit=a_credit,
+            b_debit=a_credit, b_credit=a_debit, ref_type=ref_type, ref_id=ref_id, extra=extra or {},
+        ))
+
+    if source in ("both", "deals"):
+        debt_deals = ClientDeal.objects.filter(company=company, client=client, kind=ClientDeal.Kind.DEBT)
+        agg = debt_deals.filter(created_at__lt=start_dt).aggregate(a=Sum("amount"), p=Sum("prepayment"))
+        owed_before += (agg["a"] or Z) - (agg["p"] or Z)
+        pay_before = DealPayment.objects.filter(
+            company=company, deal__client=client, deal__kind=ClientDeal.Kind.DEBT, paid_date__lt=start_dt.date()
+        )
+        for kind, sign in ((DealPayment.Kind.PAY, 1), (DealPayment.Kind.REFUND, -1)):
+            owed_before -= sign * (pay_before.filter(kind=kind).aggregate(s=Sum("amount"))["s"] or Z)
+
+        for d in debt_deals.filter(created_at__gte=start_dt, created_at__lte=end_dt).order_by("created_at"):
+            amt = q2(d.amount)
+            if amt > 0:
+                _row(d.created_at, f"Долг поставщику: {d.title}", Z, amt, "deal", d.id)
+            pp = q2(d.prepayment or Z)
+            if pp > 0:
+                _row(d.created_at, f"Предоплата / зачёт по сделке: {d.title}", pp, Z, "deal_prepayment", d.id)
+        pays = (
+            DealPayment.objects.filter(
+                company=company, deal__client=client, deal__kind=ClientDeal.Kind.DEBT,
+                paid_date__gte=start_dt.date(), paid_date__lte=end_dt.date(),
+            ).select_related("deal", "installment").order_by("paid_date", "created_at")
+        )
+        for pay in pays:
+            amt = q2(pay.amount)
+            sign_debit = amt if pay.kind == DealPayment.Kind.PAY else Z
+            sign_credit = amt if pay.kind == DealPayment.Kind.REFUND else Z
+            label = "Оплата" if pay.kind == DealPayment.Kind.PAY else "Возврат оплаты"
+            _row(_aware(pay.paid_date, end=False), f"{label} по сделке: {pay.deal.title} (взнос №{pay.installment.number})",
+                 sign_debit, sign_credit, "installment_payment", pay.id)
+        # сальдо «до начала» уже включает оплаты; знак: наш долг = отрицательное сальдо
+    opening = q2(-owed_before)
+
+    if source == "both":
+        rcpts = SupplierReceipt.objects.filter(
+            company=company, supplier=client, created_at__gte=start_dt, created_at__lte=end_dt
+        ).order_by("created_at")
+        for r in rcpts:
+            tot = sum(
+                (Decimal(str(i.qty)) * Decimal(str(i.purchase_price or 0)) for i in SupplierReceiptItem.objects.filter(receipt=r)),
+                Z,
+            )
+            _row(r.created_at, f"Приход поставщика {r.id}", Z, Z, "receipt", r.id, {"doc_amount": fmt(q2(tot))})
+        rets = SupplierReturn.objects.filter(
+            company=company, supplier=client, status=SupplierReturn.Status.POSTED,
+            created_at__gte=start_dt, created_at__lte=end_dt,
+        ).order_by("created_at")
+        for rt in rets:
+            tot = sum(
+                (Decimal(str(i.qty)) * Decimal(str(i.purchase_price or 0)) for i in SupplierReturnItem.objects.filter(supplier_return=rt)),
+                Z,
+            )
+            _row(rt.created_at, f"Возврат поставщику {rt.id} ({rt.get_compensation_display()})", Z, Z,
+                 "supplier_return", rt.id, {"doc_amount": fmt(q2(tot)), "compensation": rt.compensation})
+    rows.sort(key=lambda x: x["date"])
+    return opening, rows
+
+
 class ClientReconciliationJSONAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1466,11 +1577,14 @@ class ClientReconciliationJSONAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # ТЗ Н-12: поставщик — свой расчёт (направление «мы должны»)
+        is_supplier = client.type == Client.StatusClient.SUPPLIERS
+
         # ---------- opening ----------
         debit_before = Decimal("0.00")
         credit_before = Decimal("0.00")
 
-        if source in ("both", "sales"):
+        if not is_supplier and source in ("both", "sales"):
             # Отменённые продажи (полный возврат) не создают задолженности —
             # исключаем их, чтобы возврат корректно уменьшал долг в акте сверки.
             sales_before = (
@@ -1482,7 +1596,7 @@ class ClientReconciliationJSONAPIView(APIView):
             )
             debit_before += sales_before
 
-        if ClientDeal and source in ("both", "deals"):
+        if not is_supplier and ClientDeal and source in ("both", "deals"):
             deals_before = (
                 ClientDeal.objects.filter(
                     company=company,
@@ -1504,7 +1618,7 @@ class ClientReconciliationJSONAPIView(APIView):
             )
             credit_before += pre_before
 
-        if DealInstallment and source in ("both", "deals"):
+        if not is_supplier and DealInstallment and source in ("both", "deals"):
             inst_before = (
                 DealInstallment.objects.filter(
                     deal__company=company,
@@ -1519,11 +1633,14 @@ class ClientReconciliationJSONAPIView(APIView):
             credit_before += inst_before
 
         opening = q2(debit_before - credit_before)
+        sup_rows = []
+        if is_supplier:
+            opening, sup_rows = _supplier_recon_rows(company, client, start_dt, end_dt, source)
 
         # ---------- entries ----------
         entries = []
 
-        def _push(dt, title, a_debit, a_credit, b_debit, b_credit, ref_type=None, ref_id=None):
+        def _push(dt, title, a_debit, a_credit, b_debit, b_credit, ref_type=None, ref_id=None, extra=None):
             # отдаём ISO в локальном времени, чтобы фронту было проще
             dt_local = timezone.localtime(dt) if hasattr(timezone, "localtime") else dt
             entries.append(
@@ -1536,10 +1653,15 @@ class ClientReconciliationJSONAPIView(APIView):
                     "b_credit": fmt(b_credit),
                     "ref_type": ref_type,
                     "ref_id": str(ref_id) if ref_id else None,
+                    **(extra or {}),
                 }
             )
 
-        if source in ("both", "sales"):
+        for r in sup_rows:
+            _push(r["date"], r["title"], r["a_debit"], r["a_credit"], r["b_debit"], r["b_credit"],
+                  ref_type=r["ref_type"], ref_id=r["ref_id"], extra=r["extra"])
+
+        if not is_supplier and source in ("both", "sales"):
             qs = (
                 Sale.objects.filter(
                     company=company,
@@ -1564,7 +1686,7 @@ class ClientReconciliationJSONAPIView(APIView):
                         ref_id=srow.id,
                     )
 
-        if ClientDeal and source in ("both", "deals"):
+        if not is_supplier and ClientDeal and source in ("both", "deals"):
             deals_qs = (
                 ClientDeal.objects.filter(
                     company=company,
@@ -1612,7 +1734,7 @@ class ClientReconciliationJSONAPIView(APIView):
                     ref_id=d.id,
                 )
 
-        if DealInstallment and source in ("both", "deals"):
+        if not is_supplier and DealInstallment and source in ("both", "deals"):
             inst_qs = (
                 DealInstallment.objects.filter(
                     deal__company=company,
@@ -1721,6 +1843,7 @@ class ClientReconciliationJSONAPIView(APIView):
             "totals": totals,
             "closing_balance": fmt(closing),
             "as_of_date": as_of_date.isoformat(),
+            "direction": ("we_owe" if closing < 0 else "they_owe") if closing != 0 else None,
             "debt": {
                 "debtor": debtor,
                 "creditor": creditor,
@@ -1753,10 +1876,11 @@ class ClientReconciliationClassicAPIView(APIView):
         start_dt = _aware(start_dt, end=False)
         end_dt = _aware(end_dt, end=True)
 
+        is_supplier = client.type == Client.StatusClient.SUPPLIERS  # ТЗ Н-12
         debit_before = Decimal("0.00")
         credit_before = Decimal("0.00")
 
-        if source in ("both", "sales"):
+        if not is_supplier and source in ("both", "sales"):
             # Отменённые продажи (полный возврат) не создают задолженности —
             # исключаем их, чтобы возврат корректно уменьшал долг в акте сверки.
             sales_before = (
@@ -1767,7 +1891,7 @@ class ClientReconciliationClassicAPIView(APIView):
             )
             debit_before += sales_before
 
-        if ClientDeal and source in ("both", "deals"):
+        if not is_supplier and ClientDeal and source in ("both", "deals"):
             deals_before = (
                 ClientDeal.objects.filter(
                     company=company,
@@ -1787,7 +1911,7 @@ class ClientReconciliationClassicAPIView(APIView):
             )
             credit_before += pre_before
 
-        if DealInstallment and source in ("both", "deals"):
+        if not is_supplier and DealInstallment and source in ("both", "deals"):
             inst_before = (
                 DealInstallment.objects.filter(
                     deal__company=company,
@@ -1800,10 +1924,15 @@ class ClientReconciliationClassicAPIView(APIView):
             credit_before += inst_before
 
         opening = q2(debit_before - credit_before)
+        if is_supplier:
+            opening, _sup_rows = _supplier_recon_rows(company, client, start_dt, end_dt, source)
 
         entries: List[Dict] = []
+        if is_supplier:
+            for r in _sup_rows:
+                entries.append({k: r[k] for k in ("date", "title", "a_debit", "a_credit", "b_debit", "b_credit")})
 
-        if source in ("both", "sales"):
+        if not is_supplier and source in ("both", "sales"):
             for s in (
                 Sale.objects.filter(
                     company=company,
@@ -1826,7 +1955,7 @@ class ClientReconciliationClassicAPIView(APIView):
                         )
                     )
 
-        if ClientDeal and source in ("both", "deals"):
+        if not is_supplier and ClientDeal and source in ("both", "deals"):
             for d in (
                 ClientDeal.objects.filter(
                     company=company,
@@ -1870,7 +1999,7 @@ class ClientReconciliationClassicAPIView(APIView):
                     )
                 )
 
-        if DealInstallment and source in ("both", "deals"):
+        if not is_supplier and DealInstallment and source in ("both", "deals"):
             for inst in (
                 DealInstallment.objects.filter(
                     deal__company=company,
@@ -2311,7 +2440,7 @@ class SaleStartAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, API
 
         if not shift:
             raise ValidationError(
-                {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем начните продажу."}
+                {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем начните продажу.", "code": "shift_closed"}
             )
 
         if not cashbox:
@@ -2527,6 +2656,12 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
         barcode = ser.validated_data["barcode"].strip()
         qty = ser.validated_data["quantity"]
 
+        from apps.main.tz26.hw_units.units import find_sale_unit_by_barcode, scan_sale_unit_response
+
+        _unit = find_sale_unit_by_barcode(url_cart.company_id, barcode)  # ТЗ 26.10 Б-53: скан коробки/мешка
+        if _unit is not None:
+            return scan_sale_unit_response(request, url_cart, _unit, qty)
+
         variant = (
             ProductVariant.objects.select_related("product")
             .filter(company_id=url_cart.company_id, barcode=barcode, is_active=True)
@@ -2543,6 +2678,10 @@ class SaleScanAPIView(MarketCashierOnlyMixin, APIView):
                 return Response({"not_found": True, "message": lookup_error or "Товар не найден"}, status=404)
 
         effective_qty = _effective_qty_from_scale_data(scale_data, qty)
+        if variant is None:  # ТЗ 26.10 Б-52: шаг и минимум (под флагом hardware_2026_11)
+            from apps.main.tz26.hw_units.services import check_line_quantity
+
+            check_line_quantity(request, url_cart.company, product, effective_qty)
 
         with transaction.atomic():
             cart = _lock_pos_target_cart(
@@ -2581,6 +2720,10 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
         qty = ser.validated_data["quantity"]
         allow_minus = bool(ser.validated_data.get("allow_minus"))
         can_minus = allow_minus and _is_owner_like(request.user)
+        if ser.validated_data.get("sale_unit_id"):  # ТЗ 26.10 Б-53 п.4: строка в единице продажи
+            from apps.main.tz26.hw_units.units import add_sale_unit_item_response
+
+            return add_sale_unit_item_response(request, cart, product, ser.validated_data, can_minus=can_minus)
         variant = None
         if ser.validated_data.get("variant_id"):
             variant = get_object_or_404(
@@ -2653,6 +2796,10 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
             combined_consume = line_qty_consume_units(target.quantity + qty, pkg)
         else:
             combined_consume = line_qty_consume_units(qty, pkg)
+        if pkg is None:  # ТЗ 26.10 Б-52: шаг и минимум (под флагом hardware_2026_11)
+            from apps.main.tz26.hw_units.services import check_line_quantity
+
+            check_line_quantity(request, cart.company, product, (target.quantity + qty) if target else qty)
         have = Decimal(str(product.quantity or 0))
         if product.kind != Product.Kind.SERVICE and (not can_minus) and qty3(other + combined_consume) > have:
             return Response(
@@ -2708,6 +2855,62 @@ class SaleAddItemAPIView(MarketCashierOnlyMixin, APIView):
         return resp
 
 
+def _checkout_value_error_body(e, cart, cash_received=None) -> dict:
+    """ТЗ Н-15: машинный код к ValueError из checkout_cart/mark_paid; `detail` остаётся как был."""
+    msg = str(e)
+    body = {"detail": msg}
+    code = None
+    if msg.startswith("Сумма оплат"):
+        code = "mixed_sum_mismatch"
+        body["total"] = fmt_money(cart.total)
+    elif msg.startswith("Сумма, полученная наличными"):
+        code = "cash_less_than_total"
+        body["total"] = fmt_money(cart.total)
+        body["cash_received"] = fmt_money(cash_received or Decimal("0.00"))
+    elif "имеет размеры/цвета" in msg:
+        code = "variant_required"
+    elif msg == "Вариант позиции не найден.":
+        code = "variant_not_found"
+    elif msg == "Товар позиции не найден.":
+        code = "product_not_found"
+    if code:
+        body["code"] = code
+        body["errors"] = [{"index": None, "code": code, "detail": msg}]
+    return body
+
+
+def _raise_checkout_serializer_error(errors, cart, data):
+    """ТЗ Н-15: ошибки оплаты получают коды mixed_sum_mismatch / cash_less_than_total, ключи полей — прежние."""
+    from core.exceptions import ApiError, _flatten_fields
+
+    def _texts(key):
+        v = errors.get(key)
+        if isinstance(v, (list, tuple)):
+            return " ".join(str(x) for x in v)
+        return str(v or "")
+
+    code = None
+    extra = {}
+    if "должна равняться сумме чека" in _texts("payments"):
+        code = "mixed_sum_mismatch"
+        extra = {"total": fmt_money(cart.total)}
+    elif "меньше наличной части" in _texts("cash_received"):
+        code = "cash_less_than_total"
+        raw = data.get("cash_received") if hasattr(data, "get") else None
+        try:
+            received = Decimal(str(raw))
+        except Exception:  # noqa: BLE001
+            received = Decimal("0.00")
+        extra = {"total": fmt_money(cart.total), "cash_received": fmt_money(received)}
+    if code is None:
+        raise ValidationError(errors)
+    detail = _texts("payments") or _texts("cash_received")
+    top = dict(errors)
+    top.update(extra)
+    top["errors"] = [{"index": None, "code": code, "detail": detail, **extra}]
+    raise ApiError(code, detail, fields=_flatten_fields(dict(errors)), top=top)
+
+
 class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -2715,7 +2918,8 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
     def post(self, request, pk, *args, **kwargs):
         return self.checkout(request, pk, request.data)
 
-    def checkout(self, request, pk, data, *, allow_offset=False):
+    def checkout(self, request, pk, data, *, allow_offset=False, force_negative_stock=False, lenient_variants=False):
+        # ТЗ Н-15: force_negative_stock/lenient_variants — только для офлайн-досылки (pos/checkout/ с offline=true).
         with transaction.atomic():
             cart = get_object_or_404(
                 Cart.objects.select_related("company", "branch", "user", "shift"),
@@ -2727,11 +2931,12 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
             ser = CheckoutSerializer(
                 data=data, context={"request": request, "cart": cart, "allow_offset": allow_offset}
             )
-            ser.is_valid(raise_exception=True)
+            if not ser.is_valid():
+                _raise_checkout_serializer_error(ser.errors, cart, data)
 
             print_receipt = ser.validated_data["print_receipt"]
             allow_minus = bool(ser.validated_data.get("allow_minus"))
-            can_minus = allow_minus and _is_owner_like(request.user)
+            can_minus = (allow_minus and _is_owner_like(request.user)) or bool(force_negative_stock)
             client_id = ser.validated_data.get("client_id")
             payment_method = ser.validated_data.get("payment_method") or Sale.PaymentMethod.CASH
             cash_received = ser.validated_data.get("cash_received") or Decimal("0.00")
@@ -2761,7 +2966,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
 
                 if not shift:
                     raise ValidationError(
-                        {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем завершите продажу."}
+                        {"detail": "Смена не открыта. Сначала откройте смену на кассе, затем завершите продажу.", "code": "shift_closed"}
                     )
                 cart.shift = shift
                 if (branch or shift.branch) and cart.branch_id != getattr(shift.branch, "id", None):
@@ -2770,10 +2975,20 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                 else:
                     cart.save(update_fields=["shift"])
 
+            hw_reprice_for_request(request, cart, client_id)  # ТЗ 26.10 Б-55: цена по уровню клиента (под флагом)
             cart.recalc()
             if not payments and payment_method == Sale.PaymentMethod.CASH and cash_received < cart.total:
+                # ТЗ Н-15: код и суммы; старый ключ detail сохранён
+                transaction.set_rollback(True)
                 return Response(
-                    {"detail": "Сумма, полученная наличными, меньше суммы продажи."},
+                    {
+                        "detail": "Сумма, полученная наличными, меньше суммы продажи.",
+                        "code": "cash_less_than_total",
+                        "total": fmt_money(cart.total),
+                        "cash_received": fmt_money(cash_received),
+                        "errors": [{"index": None, "code": "cash_less_than_total",
+                                    "total": fmt_money(cart.total), "cash_received": fmt_money(cash_received)}],
+                    },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -2788,6 +3003,10 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
             card_amount = ser.validated_data.get("card_amount")
             card_method = ser.validated_data.get("card_method")
             prepayment_method = ser.validated_data.get("prepayment_method")
+
+            # ТЗ 26.10 Б-61: партии и отрезной товар (None — нет ни партий, ни отрезов)
+            from apps.main.tz26.hw_batches.services import commit_checkout, plan_checkout
+            batches_plan = plan_checkout(cart, getattr(request, "data", None))
 
             try:
                 sale = checkout_cart(
@@ -2804,11 +3023,27 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
                     consultant=consultant_obj,
                     consultant_commission_enabled=consultant_comm_enabled,
                     consultant_commission_percent=consultant_comm_pct,
+                    lenient_variants=lenient_variants,
                 )
             except NotEnoughStock as e:
-                return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+                transaction.set_rollback(True)
+                errs = [
+                    {"index": None, "code": "insufficient_stock", "detail": str(e),
+                     "product_id": str(sh["product_id"]),
+                     "variant_id": str(sh["variant_id"]) if sh.get("variant_id") else None,
+                     "available": str(sh["available"]), "requested": str(sh["requested"])}
+                    for sh in getattr(e, "shortages", [])
+                ] or [{"index": None, "code": "insufficient_stock", "detail": str(e)}]
+                return Response(
+                    {"detail": str(e), "code": "insufficient_stock", "errors": errs},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             except ValueError as e:
-                return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+                transaction.set_rollback(True)
+                return Response(_checkout_value_error_body(e, cart, cash_received), status=status.HTTP_400_BAD_REQUEST)
+
+            commit_checkout(batches_plan, sale, request.user)  # ТЗ 26.10 Б-61
+            hw_after_checkout(request, cart, sale, client_obj)  # ТЗ 26.10 Б-55, Б-56: цены строк, объект, лимит долга
 
             cons_name = None
             if sale.consultant:
@@ -2820,6 +3055,7 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
 
             payload = {
                 "sale_id": str(sale.id),
+                "number": sale.doc_number,  # ТЗ Н-15: постоянный номер чека во всех ответах
                 "status": sale.status,
                 "subtotal": fmt_money(sale.subtotal),
                 "discount_total": fmt_money(sale.discount_total),
@@ -2989,6 +3225,14 @@ class SaleCheckoutAPIView(MarketCashierOnlyMixin, APIView):
         return Response(payload, status=status.HTTP_201_CREATED)
 
 
+def _is_uuid(value) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     """
     Погасить долг конкретной продажи одним запросом (ТЗ ч.12, 2.3).
@@ -2996,13 +3240,16 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
     Idempotency-Key: <строка>  (или поле idempotency_key; повтор с тем же ключом ничего не создаёт)
     Body: {
       "amount": "40.00",            # необязательно; по умолчанию — весь остаток
-      "payment_method": "cash",     # обязательно
+      "payment_method": "cash",     # обязательно (ТЗ Н-13: можно и под именем "method"; разные → 400 field_conflict)
       "shift": "<id смены>",        # необязательно; по умолчанию — открытая смена кассира
       "cashbox_id": "<id кассы>"    # необязательно
     }
-    200 → {"paid": "40.00", "left": "0.00", "sale": {...}, "cashflows": [...]}
+    200 → {"paid": "40.00", "left": "0.00", "sale": {...}, "cashflows": [...],
+           "method", "payment_method", "received_by": {"id", "name"}, "received_at", "shift", "cashbox"}
     400 → {"detail": "Долг по продаже уже погашен", "code": "no_debt"}
 
+    Без `shift` платёж привязывается к открытой смене кассира (как и раньше); «вне смены»
+    не делаем, чтобы не менять expected_cash у действующих касс (ТЗ Н-13, см. `shift` в ответе).
     Деньги гасят взносы сделки продажи по порядку; в кассу пишется один приход на всю сумму,
     наличные попадают в смену один раз (debt_payments_cash / expected_cash).
     """
@@ -3015,7 +3262,9 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
         from apps.construction.auto_cashflow import create_auto_cashflow, serialize_auto_cashflows
         from apps.construction.models import CashFlow
         from apps.main.models import ClientDeal, DealInstallment, DealPayment
-        from apps.main.services_debt import VALID_DEBT_PAYMENT_METHODS, normalize_debt_payment_method
+        from apps.main.services_debt import (
+            VALID_DEBT_PAYMENT_METHODS, normalize_debt_payment_method, pick_debt_method,
+        )
 
         qs = self._filter_qs_company_branch(Sale.objects.select_for_update(of=("self",)))
         sale = get_object_or_404(qs, id=pk)
@@ -3023,21 +3272,33 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
         data = request.data if isinstance(request.data, dict) else {}
         errors = {}
         allowed_pm = set(VALID_DEBT_PAYMENT_METHODS)
-        raw_pm = (str(data.get("payment_method") or "")).strip().lower()
+        # ТЗ Н-13: имя поля method или payment_method; card — синоним transfer
+        raw_pm = pick_debt_method(data) or ""
+        if raw_pm == "card":
+            raw_pm = "transfer"
+        error_code = None
         if not raw_pm:
             errors["payment_method"] = ["Укажите способ оплаты."]
+            error_code = "method_required"
         elif raw_pm not in allowed_pm:
             errors["payment_method"] = [f"Неизвестный способ оплаты. Допустимо: {', '.join(sorted(allowed_pm))}."]
+            error_code = "method_not_allowed"
         amount = None
         if data.get("amount") not in (None, ""):
             try:
                 amount = Decimal(str(data.get("amount"))).quantize(Decimal("0.01"))
                 if amount <= 0:
                     errors["amount"] = ["Сумма должна быть больше 0."]
+                    error_code = error_code or "amount_invalid"
             except Exception:
                 errors["amount"] = ["Некорректная сумма."]
+                error_code = error_code or "amount_invalid"
         if errors:
-            raise ValidationError(errors)
+            body = dict(errors)
+            body["code"] = error_code
+            if error_code == "method_not_allowed":
+                body["data"] = {"allowed": sorted(allowed_pm)}
+            return Response(body, status=status.HTTP_400_BAD_REQUEST)
 
         is_debt_sale = sale.status == Sale.Status.DEBT or sale.payment_method == Sale.PaymentMethod.DEBT
         if not is_debt_sale or sale.status not in (Sale.Status.DEBT, Sale.Status.PAID):
@@ -3083,7 +3344,15 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
             replay = DealPayment.objects.filter(deal=deal, idempotency_key__in=list(inst_keys.values()))
             if replay.exists():
                 paid = replay.aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
-                return self._response(request, sale, deal, paid, [], replayed=True)
+                from apps.construction.models import CashFlow as _CF
+                prior_cf = list(_CF.objects.filter(
+                    company=sale.company, idempotency_key=f"sale-pay-debt:{base_key}"
+                ))
+                return self._response(
+                    request, sale, deal, paid, prior_cf, replayed=True,
+                    payments=list(replay.select_related("created_by").order_by("created_at")),
+                    pm=normalize_debt_payment_method(raw_pm),
+                )
 
         remaining = deal.remaining_debt
         if remaining <= 0:
@@ -3091,7 +3360,11 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
         pay_total = remaining if amount is None else amount
         if pay_total > remaining:
             return Response(
-                {"amount": [f"Сумма больше остатка долга. Максимум: {remaining}."], "code": "amount_exceeds_debt"},
+                {
+                    "amount": [f"Сумма больше остатка долга. Максимум: {remaining}."],
+                    "code": "amount_exceeds_debt",
+                    "data": {"max": str(money(remaining))},
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -3100,7 +3373,23 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
         shift = None
         shift_id = data.get("shift") or data.get("shift_id")
         cashbox_id = data.get("cashbox_id")
+        if cashbox_id and not (_is_uuid(cashbox_id) and Cashbox.objects.filter(id=cashbox_id, company=sale.company).exists()):
+            return Response(
+                {"detail": "Касса не найдена или не принадлежит компании.", "code": "cashbox_not_found"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if shift_id:
+            _req = CashShift.objects.filter(id=str(shift_id), company=sale.company).first() if _is_uuid(shift_id) else None
+            if _req is not None:
+                if _req.status != CashShift.Status.OPEN:
+                    return Response(
+                        {"detail": "Смена закрыта.", "code": "shift_closed"}, status=status.HTTP_400_BAD_REQUEST
+                    )
+                if _req.cashier_id != request.user.id and not _is_owner_like(request.user):
+                    return Response(
+                        {"detail": "Эта смена открыта другим кассиром.", "code": "shift_not_owned"},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
             shift = _resolve_requested_open_shift(
                 company=sale.company, cashier=request.user, shift_id=shift_id, cashbox_id=cashbox_id
             )
@@ -3159,9 +3448,13 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
 
         from apps.main.models import sync_sale_status_from_deal
         sync_sale_status_from_deal(deal.id)  # статус и остаток продажи — сразу, не дожидаясь сигнала
-        return self._response(request, sale, deal, pay_total, [cf] if cf else [])
+        made = list(DealPayment.objects.filter(deal=deal, idempotency_key__in=list(inst_keys.values()))
+                    .select_related("created_by").order_by("created_at")) if raw_key else []
+        return self._response(request, sale, deal, pay_total, [cf] if cf else [], payments=made, pm=pm)
 
-    def _response(self, request, sale, deal, paid, cashflows, replayed=False):
+    def _response(self, request, sale, deal, paid, cashflows, replayed=False, payments=None, pm=None):
+        from apps.main.services_debt import debt_receipt_info
+
         from apps.construction.auto_cashflow import serialize_auto_cashflows
 
         deal.refresh_from_db()
@@ -3174,6 +3467,10 @@ class SalePayDebtAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, A
                 "replayed": replayed,
                 "sale": SaleDetailSerializer(sale, context={"request": request}).data,
                 "cashflows": serialize_auto_cashflows(cashflows),
+                # ТЗ Н-13: оба имени поля способа оплаты, кто принял, смена, касса
+                "method": pm,
+                "payment_method": pm,
+                **debt_receipt_info(request.user, cashflows, payments),
             },
             status=status.HTTP_200_OK,
         )
@@ -3220,11 +3517,17 @@ def _restock_product_for_sale_item_return(item: SaleItem, return_qty: Decimal) -
     if item.product and item.product.kind == Product.Kind.SERVICE:
         return
     stock_delta = line_qty_consume_units(return_qty, getattr(item, "sale_package", None))
+    if getattr(item, "sale_unit_id", None):  # ТЗ 26.10 Б-53 п.6: возврат в единицах продажи -> базовые
+        from apps.main.tz26.hw_units.units import unit_factor
+
+        stock_delta = qty3(stock_delta * unit_factor(item))
     if stock_delta <= 0:
         return
-    Product.objects.filter(pk=item.product_id).exclude(kind=Product.Kind.SERVICE).update(quantity=F("quantity") + stock_delta)
+    Product.objects.filter(pk=item.product_id).exclude(kind=Product.Kind.SERVICE).update(
+        quantity=F("quantity") + stock_delta, updated_at=timezone.now()
+    )
     if getattr(item, "variant_id", None):
-        ProductVariant.objects.filter(pk=item.variant_id).update(quantity=F("quantity") + stock_delta)
+        ProductVariant.objects.filter(pk=item.variant_id).update(quantity=F("quantity") + stock_delta, updated_at=timezone.now())
 
 
 def _release_agent_allocations_for_qty(sale_item: SaleItem, return_qty_int: int) -> List[tuple]:
@@ -3358,8 +3661,12 @@ def _rescale_sale_payments_after_partial_return(sale: Sale, old_total: Decimal, 
         p.save(update_fields=["amount"])
 
 
-def _recalc_sale_headers_from_items(sale: Sale) -> None:
-    """Пересчитать суммы шапки чека по оставшимся строкам."""
+def _recalc_sale_headers_from_items(sale: Sale, total_override: Optional[Decimal] = None) -> None:
+    """Пересчитать суммы шапки чека по оставшимся строкам.
+
+    total_override — точный остаток чека после возврата (ТЗ Н-02): скидка на чек
+    сохраняется в discount_total, а не теряется при пересчёте по строкам.
+    """
     rows = list(SaleItem.objects.filter(sale=sale).order_by("id"))
     if not rows:
         return
@@ -3379,6 +3686,9 @@ def _recalc_sale_headers_from_items(sale: Sale) -> None:
     else:
         new_tax = d0
     new_total = money(new_taxable + new_tax)
+    if total_override is not None:
+        new_total = money(total_override)
+        new_line_disc = money(new_subtotal + new_tax - new_total)
     sale.subtotal = new_subtotal
     sale.discount_total = new_line_disc
     sale.tax_total = new_tax
@@ -3590,7 +3900,10 @@ def _resolve_return_cashbox(sale: Sale, payload: Optional[Dict] = None):
     if not cb and sale.branch_id:
         cb = Cashbox.objects.filter(company=sale.company, branch_id=sale.branch_id, role=Cashbox.CashboxRole.POS_BRANCH).first()
     if not cb:
-        cb = Cashbox.objects.filter(company=sale.company).first()
+        # ТЗ Н-33: сейф и расчётный счёт — не ящик кассы, выбирать их запасным вариантом нельзя
+        cb = Cashbox.objects.filter(company=sale.company).exclude(
+            role__in=(Cashbox.CashboxRole.SAFE, Cashbox.CashboxRole.BANK)
+        ).first()
     return cb
 
 
@@ -3750,6 +4063,45 @@ def _effective_refund_method(sale, refund_method) -> str:
     return str(sale.payment_method or "cash")[:16]
 
 
+def _refund_exceeds_paid_error(request, sale):
+    """ТЗ Б-04 / Б-02: повтор возврата по полностью возвращённому чеку.
+    Новый клиент или флаг компании — 409, старая касса — 400 (она не уходит в бесконечный повтор).
+    data: {paid, refunded, requested, refundable}."""
+    from core.api_compat import is_strict
+    from core.exceptions import ApiError
+    from apps.main.pos_serializers import _sale_refunded_total
+
+    refunded = Decimal(_sale_refunded_total(sale))
+    return ApiError(
+        "refund_exceeds_paid",
+        "Продажа уже отменена или полностью возвращена.",
+        status_code=409 if is_strict(request, sale.company) else 400,
+        data={
+            "paid": str(money(refunded)),
+            "refunded": str(money(refunded)),
+            "requested": str(money(Decimal(str(sale.total or 0)))),
+            "refundable": "0.00",
+        },
+    )
+
+
+def _refund_summary(sale, debt_adj) -> Optional[Dict]:
+    """ТЗ Н-02: разбивка последнего возврата — {id, amount, cash, noncash, debt_reduced, method}."""
+    from apps.main.models import SaleReturn
+
+    ret = SaleReturn.objects.filter(sale=sale).order_by("-created_at").first()
+    if ret is None:
+        return None
+    return {
+        "id": str(ret.id),
+        "amount": str(money(ret.returned_amount or 0)),
+        "cash": str(money(ret.refund_cash or 0)),
+        "noncash": str(money(ret.refund_noncash or 0)),
+        "debt_reduced": str(money(Decimal(str((debt_adj or {}).get("reduced_by") or 0)))),
+        "method": ret.refund_method,
+    }
+
+
 def _execute_sale_return(
     sale: Sale,
     partial_items: Optional[List[tuple]],
@@ -3808,6 +4160,14 @@ def _execute_sale_return(
             raise ValidationError({"items": "Есть позиции не из этого чека или несуществующие sale_item_id."})
 
         total_returned_money = Decimal("0.00")
+        # ТЗ Н-02: доля скидки на чек. Строка возвращается по цене после скидки
+        # на позицию × (итог чека / сумма строк); последний возврат — ровно остаток.
+        old_total = money(sale.total or Decimal("0.00"))
+        lines_net = money(sum(
+            (Decimal(str(it.unit_price or 0)) * Decimal(str(it.quantity or 0)) - Decimal(str(it.line_discount or 0)))
+            for it in sale.items.all()
+        ))
+        check_ratio = (old_total / lines_net) if lines_net > 0 else Decimal("1")
 
         for sid, rq in partial_items:
             item = (
@@ -3823,9 +4183,13 @@ def _execute_sale_return(
             unit_price = item.unit_price or Decimal("0.00")
             old_disc = Decimal(str(item.line_discount or 0))
             item_disc = money(old_disc * (rq / old_q)) if old_q > 0 else Decimal("0.00")
-            item_returned_money = money((unit_price * rq) - item_disc)
+            item_net = money((unit_price * rq) - item_disc)
+            item_returned_money = money(item_net * check_ratio)
             total_returned_money += item_returned_money
-            returned_lines.append(_return_line(item, rq, item_disc, reason=line_reason, restock=not is_defect))
+            # В строке возврата — цена со скидкой (и на позицию, и на чек), чтобы сверка сходилась.
+            returned_lines.append(_return_line(
+                item, rq, money(item_disc + item_net - item_returned_money), reason=line_reason, restock=not is_defect,
+            ))
 
             if is_agent_sale:
                 if rq != rq.to_integral_value():
@@ -3852,13 +4216,21 @@ def _execute_sale_return(
 
         is_full = not SaleItem.objects.filter(sale=sale).exists()
         if is_full:
+            # Последний возврат — ровно остаток чека (копейки округления — в последнюю строку).
+            diff = old_total - total_returned_money
+            total_returned_money = old_total
+            if diff and returned_lines:
+                last = returned_lines[-1]
+                last["discount"] = str(money(Decimal(last["discount"]) - diff))
+                last["total"] = last["amount"] = str(money(Decimal(last["total"]) + diff))
             sale.status = Sale.Status.CANCELED
         else:
+            total_returned_money = min(total_returned_money, old_total)
             sale.status = getattr(Sale.Status, "PARTIALLY_RETURNED", "partially_returned")
         sale.save(update_fields=["status"])
 
         if not is_full:
-            _recalc_sale_headers_from_items(sale)
+            _recalc_sale_headers_from_items(sale, total_override=old_total - total_returned_money)
 
         returned_money = total_returned_money
         debt_adj = adjust_sale_debt_on_return(sale, total_returned_money, is_full_return=is_full)
@@ -4053,6 +4425,7 @@ def _execute_sale_return(
     return debt_adj
 
 
+@pin_guard("POST")
 class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
     """
     Возврат продажи (владелец и кассир).
@@ -4072,17 +4445,19 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
                 sale_id=pk, idempotency_key=str(idempotency_key)
             ).first()
             if existing_ret and existing_ret.response_data:
-                return Response(existing_ret.response_data, status=status.HTTP_200_OK)
+                return Response({**existing_ret.response_data, "replayed": True}, status=status.HTTP_200_OK)
 
         locked_qs = Sale.objects.select_for_update()
         locked_qs = self._filter_qs_company_branch(locked_qs)
         sale = get_object_or_404(locked_qs, id=pk)
 
+        # Закрытие периода (ТЗ «Бухгалтер», п. 2): возврат проводится сегодняшним числом.
+        from apps.warehouse.services import ensure_period_open_api
+        ensure_period_open_api(company=sale.company, dates=[timezone.now()], user=request.user)
+
         if sale.status == Sale.Status.CANCELED:
-            return Response(
-                {"detail": "Продажа уже отменена."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            # ТЗ Н-02: всё уже возвращено (или чек отменён) — больше вернуть нельзя.
+            raise _refund_exceeds_paid_error(request, sale)
         valid_return_statuses = (
             Sale.Status.PAID,
             Sale.Status.DEBT,
@@ -4108,8 +4483,11 @@ class SaleReturnAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, AP
         invalidate_cache_pattern(f"products:list:{sale.company_id}:")
 
         sale.refresh_from_db()
+        from apps.main.tz26.pos_sync.services import record_return_origin
+        record_return_origin(request, sale)  # Б-67: с какого устройства возврат
         data = SaleDetailSerializer(sale, context={"request": request}).data
         data["debt_adjustment"] = debt_adj
+        data["refund"] = _refund_summary(sale, debt_adj)
 
         if idempotency_key:
             from apps.main.models import SaleReturn
@@ -4144,7 +4522,7 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
                 sale_id=pk, idempotency_key=str(idempotency_key)
             ).first()
             if existing_ret and existing_ret.response_data:
-                return Response(existing_ret.response_data, status=status.HTTP_200_OK)
+                return Response({**existing_ret.response_data, "replayed": True}, status=status.HTTP_200_OK)
 
         allowed_qs = (
             Sale.objects.filter(
@@ -4160,10 +4538,8 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
         sale = Sale.objects.select_for_update().get(id=pk)
 
         if sale.status == Sale.Status.CANCELED:
-            return Response(
-                {"detail": "Продажа уже отменена."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            # ТЗ Н-02: всё уже возвращено (или чек отменён) — больше вернуть нельзя.
+            raise _refund_exceeds_paid_error(request, sale)
         valid_return_statuses = (
             Sale.Status.PAID,
             Sale.Status.DEBT,
@@ -4190,6 +4566,7 @@ class AgentSaleReturnAPIView(SaleReturnAPIView):
         sale.refresh_from_db()
         data = SaleDetailSerializer(sale, context={"request": request}).data
         data["debt_adjustment"] = debt_adj
+        data["refund"] = _refund_summary(sale, debt_adj)
 
         if idempotency_key:
             from apps.main.models import SaleReturn
@@ -4230,6 +4607,15 @@ class ProductFindByBarcodeAPIView(MarketCashierOnlyMixin, APIView):
         if not barcode:
             return Response([], status=200)
 
+        from apps.main.tz26.hw_units.units import find_sale_unit_by_barcode, sale_unit_scan_payload
+
+        unit = find_sale_unit_by_barcode(request.user.company_id, barcode)  # ТЗ 26.10 Б-53 п.3
+        if unit is not None:
+            return Response([{
+                "id": str(unit.product_id), "name": unit.product.name, "barcode": barcode,
+                "price": str(unit.price if unit.price is not None else unit.product.price),
+                **sale_unit_scan_payload(unit),
+            }], status=200)
         try:
             product = _resolve_product_by_barcode_for_pos(
                 request.user.company_id,
@@ -4407,7 +4793,7 @@ class SaleListOrderingFilter(filters.OrderingFilter):
             return terms
         mapped = [("-" if t.startswith("-") else "") + "sold_at" if t.lstrip("-") == "paid_at" else t for t in terms]
         if not any(t.lstrip("-") == "id" for t in mapped):
-            mapped.append("-id")
+            mapped.append("-id" if mapped[-1].startswith("-") else "id")  # Б-68: id в ту же сторону
         return mapped
 
 
@@ -4415,7 +4801,7 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
     serializer_class = SaleListSerializer
     queryset = (
         Sale.objects.select_related("user", "consultant", "client", "cashbox", "cashbox__branch")
-        .prefetch_related("items__product", "payments", "deals")
+        .prefetch_related("items__product", "payments", "deals", "deals__installments", "returns")
         .all()
     )
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, SaleListOrderingFilter]
@@ -4429,6 +4815,31 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
     def get_queryset(self):
         qs = super().get_queryset().annotate(sold_at=Coalesce("paid_at", "created_at"))
         qs = _apply_sale_date_filters(qs, self.request)
+
+        # ТЗ-28 §5.1: фильтры по смене, кассе, кассиру и точному времени — чтобы телефон
+        # («Мои чеки» за смену) и касса («История чеков») не грузили чеки всей компании.
+        qp = self.request.query_params
+        shift_param = (qp.get("shift") or qp.get("shift_id") or "").strip()
+        if shift_param:
+            qs = qs.filter(shift_id=shift_param)
+        cashbox_param = (qp.get("cashbox") or qp.get("cashbox_id") or "").strip()
+        if cashbox_param:
+            qs = qs.filter(cashbox_id=cashbox_param)
+        cashier_param = (qp.get("cashier") or qp.get("cashier_id") or "").strip()
+        if cashier_param:
+            qs = qs.filter(user_id=cashier_param)
+        for param, lookup in (("created_after", "created_at__gte"), ("created_before", "created_at__lte")):
+            raw = (qp.get(param) or "").strip()
+            if raw:
+                dt = parse_datetime(raw.replace(" ", "+"))
+                if dt is None:
+                    raise ValidationError({param: "Ожидается дата-время ISO 8601."})
+                if timezone.is_naive(dt):
+                    dt = timezone.make_aware(dt)
+                qs = qs.filter(**{lookup: dt})
+
+        from apps.main.tz26.pos_sync.sales_api import apply_sync_filters
+        qs = apply_sync_filters(qs, self.request)  # Б-67/Б-68: source, device_key, created_by, updated_after
 
         number = (self.request.query_params.get("number") or "").strip()
         if number:
@@ -4479,7 +4890,11 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
         # Аналитический фильтр (страница /crm/market/analytics → «Транзакции»)
         payment_method = (self.request.query_params.get("payment_method") or "").strip()
         if payment_method:
-            qs = qs.filter(payment_method=payment_method)
+            if payment_method == Sale.PaymentMethod.TRANSFER:
+                # ТЗ 12.11: безнал разных банков тоже считается переводом.
+                qs = qs.filter(payment_method__in=SALE_TRANSFER_METHODS)
+            else:
+                qs = qs.filter(payment_method=payment_method)
 
         cashbox_param = (self.request.query_params.get("cashbox") or "").strip()
         if cashbox_param:
@@ -4514,12 +4929,26 @@ class SaleListAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, gene
 
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
+        from apps.main.tz26.pos_sync.sales_api import etag_matches, sales_etag
+        etag = sales_etag(request, queryset)  # Б-68: ETag + If-None-Match -> 304
+        if etag_matches(request, etag):
+            return Response(status=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
         status_param = (request.query_params.get("status") or "").strip()
         total_amount = _aggregate_pos_sales_total_amount(queryset, status_filter=status_param)
 
         page = self.paginate_queryset(queryset)
         serializer = self.get_serializer(page, many=True)
-        return self.paginator.get_paginated_response(serializer.data, total_amount=total_amount)
+        response = self.paginator.get_paginated_response(serializer.data, total_amount=total_amount)
+        if etag:
+            response["ETag"] = etag
+        return response
+
+
+def _audit_sale_deleted(request, infos):
+    from apps.construction.audit import log_request
+
+    for company, pk, before in infos[:500]:
+        log_request(request, "delete", "sale", pk, f"Чек {pk[:8]}", before=before, company=company)
 
 
 class SaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, generics.RetrieveUpdateDestroyAPIView):
@@ -4529,7 +4958,7 @@ class SaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, 
 
     queryset = (
         Sale.objects.select_related("user")
-        .prefetch_related("items__product")
+        .prefetch_related("items__product", "returns")
         .all()
     )
 
@@ -4576,7 +5005,12 @@ class SaleRetrieveAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, 
             active = get_object_or_404(_cart_queryset_for_response(), id=active.id, company=company)
             return _pos_multi_cart_response(request, active)
 
-        return super().destroy(request, *args, **kwargs)
+        # журнал (ТЗ п.8): удаление чека
+        _sale = self.get_object()
+        _info = (_sale.company, str(_sale.pk), {"total": str(_sale.total), "status": str(_sale.status)})
+        response = super().destroy(request, *args, **kwargs)
+        _audit_sale_deleted(request, [_info])
+        return response
 
 
 class SaleBulkDeleteAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin, APIView):
@@ -4611,8 +5045,9 @@ class SaleBulkDeleteAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
         if paid_ids and not allow_paid:
             return Response(
                 {
-                    "detail": "Среди переданных продаж есть оплаченные. "
-                              "Если хочешь удалить их тоже, передай allow_paid=true.",
+                    "code": "paid_sales_need_confirmation",
+                    "detail": "Среди выбранных чеков есть оплаченные. "
+                              "Удалить их можно только после подтверждения.",
                     "paid_ids": [str(x) for x in paid_ids],
                 },
                 status=400,
@@ -4628,7 +5063,9 @@ class SaleBulkDeleteAPIView(MarketCashierOnlyMixin, CompanyBranchRestrictedMixin
         found_ids = set(str(sid) for sid in base_qs.values_list("id", flat=True))
         not_found_ids = [str(x) for x in valid_ids if str(x) not in found_ids]
 
+        _infos = [(x.company, str(x.pk), {"total": str(x.total), "status": str(x.status)}) for x in deletable_qs.select_related("company")]
         deleted_count, _ = deletable_qs.delete()
+        _audit_sale_deleted(request, _infos)
 
         return Response(
             {
@@ -4968,6 +5405,10 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         if Decimal(str(getattr(item, "line_discount", None) or 0)) > 0:
             return unit_price
         min_price = _q2(Decimal(str(getattr(item.product, "purchase_price", None) or 0)))
+        if item.sale_unit_id:  # ТЗ 26.10 Б-53: закупочная цена единицы = базовая x factor
+            from apps.main.tz26.hw_units.units import unit_factor
+
+            min_price = _q2(min_price * unit_factor(item))
         if unit_price < min_price:
             return min_price
         return unit_price
@@ -4997,7 +5438,13 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
                 item.delete()
                 cart.recalc()
                 return Response(SaleCartSerializer(cart).data, status=200)
+            if item.product_id and not item.sale_package_id:  # ТЗ 26.10 Б-52 (под флагом hardware_2026_11)
+                from apps.main.tz26.hw_units.services import check_line_quantity
+
+                check_line_quantity(request, cart.company, item.product, qty, sale_unit=item.sale_unit)
             item.quantity = qty
+            if item.sale_unit_id:
+                item.base_quantity = qty3(qty * item.sale_unit.factor)
 
         unit_price = data.get("unit_price")
         line_discount = data.get("discount_total")
@@ -5030,6 +5477,7 @@ class CartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         update_fields = []
         if qty is not None:
             update_fields.append("quantity")
+            update_fields.append("base_quantity")  # ТЗ 26.10 Б-53
         if unit_price is not None:
             update_fields.append("unit_price")
             update_fields.append("price_manually_edited")
@@ -5095,9 +5543,26 @@ class SaleAddCustomItemAPIView(MarketCashierOnlyMixin, APIView):
             return Response({"name": "Название не может быть пустым."}, status=400)
 
         price = _q2(ser.validated_data["price"])
+        negative_expense = price < 0
+        if negative_expense:
+            # ТЗ Н-15 / Б-02: новый клиент (или флаг api_strict_2026_10) — 400; старая касса — «Расход»
+            # проводим как скидку на чек на эту сумму (сумма на сервере = сумме в кассе).
+            from core.api_compat import is_strict
+            from core.exceptions import ApiError
+
+            if is_strict(request, cart.company):
+                msg = "Цена своей позиции не может быть отрицательной. Для уменьшения суммы используйте скидку."
+                raise ApiError("negative_price", msg, fields={"price": [msg]}, top={"price": msg})
         qty = _to_decimal(ser.validated_data.get("quantity", "1.000"), default=Decimal("1.000"))
         qty = qty3(qty)
 
+        if negative_expense:
+            extra = _q2(-price * qty)
+            cart.order_discount_percent = None
+            cart.order_discount_total = _q2((cart.order_discount_total or Decimal("0")) + extra)
+            cart.save(update_fields=["order_discount_total", "order_discount_percent", "updated_at"])
+            cart.recalc()
+            return Response(SaleCartSerializer(cart).data, status=status.HTTP_201_CREATED)
 
         item = CartItem.objects.filter(
             cart=cart,
@@ -5872,7 +6337,13 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
                 item.delete()
                 cart.recalc()
                 return Response(SaleCartSerializer(cart).data, status=200)
+            if item.product_id and not item.sale_package_id:  # ТЗ 26.10 Б-52 (под флагом hardware_2026_11)
+                from apps.main.tz26.hw_units.services import check_line_quantity
+
+                check_line_quantity(request, cart.company, item.product, qty, sale_unit=item.sale_unit)
             item.quantity = qty
+            if item.sale_unit_id:
+                item.base_quantity = qty3(qty * item.sale_unit.factor)
 
         unit_price = data.get("unit_price")
         line_discount = data.get("discount_total")
@@ -5901,6 +6372,7 @@ class AgentCartItemUpdateDestroyAPIView(MarketCashierOnlyMixin, APIView):
         update_fields = []
         if qty is not None:
             update_fields.append("quantity")
+            update_fields.append("base_quantity")  # ТЗ 26.10 Б-53
         if unit_price is not None:
             update_fields.append("unit_price")
             update_fields.append("price_manually_edited")

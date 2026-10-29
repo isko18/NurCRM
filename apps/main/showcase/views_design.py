@@ -32,6 +32,7 @@ from apps.main.models import (
     ShowcaseDesignVersion,
     ShowcaseMedia,
     ShowcaseOrder,
+    ShowcaseStockRequest,
     ShowcaseOrderItem,
     ShowcasePage,
     ShowcaseProductSettings,
@@ -43,7 +44,7 @@ from apps.main.showcase import design_schema as ds
 from apps.main.showcase import entities
 from apps.main.showcase import services as svc
 from apps.main.showcase.design_schema import ShowcaseFieldError
-from apps.main.showcase.serializers_design import ShowcaseDesignVersionSerializer, ShowcaseOrderSerializer
+from apps.main.showcase.serializers_design import ShowcaseDesignVersionSerializer, ShowcaseOrderSerializer, ShowcaseStockRequestSerializer
 from apps.main.showcase.services import (
     IsShowcaseEditorPermission,
     IsShowcaseStaffPermission,
@@ -112,6 +113,7 @@ class ShowcaseEditorOptionsAPIView(EditorAPIView):
             "badges": ["hit", "sale", "new"],
             "media_kinds": list(ShowcaseMedia.Kind.values),
             "link_types": list(ds.LINK_TYPES),
+            "variant_pickers": list(ds.VARIANT_PICKERS),  # ТЗ Н-33
             "defaults": ds.default_document(self.company().name or "", self.company().phones_howcase),
         })
 
@@ -864,6 +866,14 @@ class ShowcaseOrderDetailAPIView(ShowcaseErrorMixin, generics.RetrieveUpdateAPIV
                 order.status = new_status
                 update_fields.append("status")
 
+            if "pickup_code" in request.data:  # ТЗ Н-33: код выдачи пишет владелец
+                code = str(request.data.get("pickup_code") or "").strip()
+                if code and not (code.isdigit() and 4 <= len(code) <= 6):
+                    raise ValidationError({"pickup_code": "Код выдачи — 4–6 цифр."})
+                if code != order.pickup_code:
+                    order.pickup_code = code
+                    update_fields.append("pickup_code")
+
             if sale_id:
                 if order.status == ShowcaseOrder.Status.CANCELED:
                     raise ValidationError({"sale": "Нельзя привязать продажу к отменённому заказу."})
@@ -947,3 +957,25 @@ class ShowcaseStatsAPIView(EditorAPIView):
             "banner_clicks": banner_clicks,
             "daily": daily,
         })
+
+
+class ShowcaseStockRequestListAPIView(ShowcaseErrorMixin, generics.ListAPIView):
+    """
+    ТЗ Н-27. GET main/showcase/stock-requests/?status=open|ready|notified|canceled
+    Заявки «сообщить о поступлении» (по умолчанию все). Пагинация count/next/previous/results.
+    """
+
+    serializer_class = ShowcaseStockRequestSerializer
+    permission_classes = [IsShowcaseStaffPermission]
+
+    def get_queryset(self):
+        company = _get_user_company(self.request)
+        qs = ShowcaseStockRequest.objects.filter(company=company).select_related("product", "variant")
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            statuses = [x.strip() for x in status_param.split(",") if x.strip()]
+            bad = [x for x in statuses if x not in ShowcaseStockRequest.Status.values]
+            if bad:
+                raise ShowcaseFieldError("status", f"Недопустимый статус. Допустимые: {', '.join(ShowcaseStockRequest.Status.values)}")
+            qs = qs.filter(status__in=statuses)
+        return qs.order_by("-created_at")
