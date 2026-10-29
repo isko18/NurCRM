@@ -3,6 +3,7 @@ from datetime import timedelta
 import secrets
 import string
 
+from apps.users.permissions import READ_ONLY_FIELDS
 from django.conf import settings
 from django.contrib.auth.password_validation import validate_password
 from django.core.mail import send_mail
@@ -151,6 +152,14 @@ def _generate_password(length=6):
 # ======================
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        from apps.arenda.security import stamp_token  # версия сеанса для «Аренды» (завершение сеансов)
+
+        stamp_token(token, user)
+        return token
+
     def validate(self, attrs):
         email_val = attrs.get("email") or attrs.get("username")
         if isinstance(email_val, str):
@@ -159,7 +168,18 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
                 attrs["email"] = clean_email
             if "username" in attrs:
                 attrs["username"] = clean_email
-        data = super().validate(attrs)
+        # Аренда помещений: блокировка после 5 неверных паролей на 15 минут (только для «арендных» пользователей)
+        from apps.arenda import security as _arenda_security
+        from rest_framework.exceptions import AuthenticationFailed as _AuthFailed
+
+        _ident = email_val if isinstance(email_val, str) else ""
+        _arenda_security.guard_before_login(_ident)
+        try:
+            data = super().validate(attrs)
+        except _AuthFailed:
+            _arenda_security.register_failure(_ident)
+            raise
+        _arenda_security.register_success(_ident)
 
         user = (
             User.objects.filter(pk=self.user.pk)
@@ -387,13 +407,14 @@ class UserSerializer(serializers.ModelSerializer):
             "can_view_sales", "can_view_services",
             "can_view_agent", "can_view_catalog",
             "can_view_branch", "can_view_logistics", "can_view_request", "can_view_shifts",
-            "can_view_cashier", "can_view_document", "can_view_market_scales", "can_view_market_label",
+            "can_view_cashier", "can_use_pos", "can_view_document", "can_view_market_scales", "can_view_market_label",
             "can_view_market_discount", "can_view_market_edit_price", "can_view_market_delete_cart_item",
             "can_view_market_procurement", "can_view_market_supplier", "can_view_market_employee_return",
 
             # Склад: опасные операции (null — по умолчанию для роли)
             "can_post_negative_stock", "can_unpost_documents", "can_change_document_date",
             "can_post_closed_period", "can_cash_negative",
+            *READ_ONLY_FIELDS,
 
             # Consulting: воронка продаж
             "can_view_funnel", "can_manage_funnel_leads", "can_manage_funnel_stages", "can_create_funnel", "can_manage_lead_ad_spend", "can_view_leads_inbox", "funnel_grants",
@@ -585,9 +606,9 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            "email", "first_name", "last_name", "track_number", "phone_number", "avatar",
+            "id", "email", "first_name", "last_name", "track_number", "phone_number", "avatar",
             "role", "custom_role", "role_display",
-            "region_code", "consulting_region_codes",
+            "region_code", "consulting_region_codes", "can_use_pos",  # ТЗ Н-16: id всегда в ответе
 
             # все can_view_* которые ты раньше использовал
             *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
@@ -722,6 +743,8 @@ class EmployeeCreateSerializer(serializers.ModelSerializer):
                 if v is not None:
                     setattr(user, k, v)
 
+        if "can_use_pos" in validated_data:  # ТЗ Н-16
+            user.can_use_pos = bool(validated_data["can_use_pos"])
         user.save()
 
         # Funnel grant for region
@@ -817,12 +840,13 @@ class EmployeeUpdateSerializer(serializers.ModelSerializer):
         fields = [
             "id", "first_name", "last_name", "track_number", "phone_number", "avatar",
             "role", "custom_role", "role_display",
-            "consulting_region_codes",
+            "consulting_region_codes", "can_use_pos",
             *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
             "can_manage_funnel_leads",
             "can_manage_funnel_stages",
             "can_create_funnel",
             "can_manage_lead_ad_spend",
+            *READ_ONLY_FIELDS,
             "funnel_grants",
             "branch_ids",
         ]
@@ -941,9 +965,10 @@ class UserListSerializer(serializers.ModelSerializer):
         fields = [
             "id", "email", "first_name", "last_name", "track_number", "phone_number",
             "role", "custom_role", "role_display", "avatar",
-            "consulting_region_codes", "consulting_regions",
+            "consulting_region_codes", "consulting_regions", "can_use_pos",
             *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
             "can_manage_funnel_leads", "can_manage_funnel_stages", "can_create_funnel", "can_manage_lead_ad_spend",
+            *READ_ONLY_FIELDS,
             "branch_ids", "primary_branch_id",
         ]
 
@@ -970,9 +995,10 @@ class UserWithPermissionsSerializer(serializers.ModelSerializer):
         fields = [
             "id", "email", "first_name", "last_name", "track_number", "phone_number",
             "role", "custom_role", "role_display", "avatar",
-            "consulting_region_codes", "consulting_regions",
+            "consulting_region_codes", "consulting_regions", "can_use_pos",
             *[f.name for f in User._meta.fields if f.name.startswith("can_view_")],
             "can_manage_funnel_leads", "can_manage_funnel_stages", "can_create_funnel", "can_manage_lead_ad_spend",
+            *READ_ONLY_FIELDS,
             "branch_ids", "primary_branch_id",
         ]
 
@@ -1076,6 +1102,28 @@ def company_features_detail(company, *, plan_until=None):
     if free is not None and free[0] not in out:
         out[free[0]] = free[1]
     return [{"code": code, "until": until} for code, until in out.items()]
+
+
+def company_features_with_source(company, *, plan_until=None):
+    """ТЗ Н-32: [{code, until, source}], source: tariff | key | trial | support."""
+    from apps.users.models import CompanyAddon
+
+    out = {}
+    plan = getattr(company, "subscription_plan", None)
+    if plan is not None:
+        for code in plan.features.order_by("name").values_list("name", flat=True):
+            if code:
+                out[code] = {"code": code, "until": plan_until, "source": "tariff"}
+    for a in CompanyAddon.objects.filter(company=company).order_by("code"):
+        if a.is_effective():
+            out[a.code] = {"code": a.code, "until": a.until.isoformat() if a.until else None,
+                           "source": a.source if a.source in ("key", "trial", "support") else "support"}
+    if getattr(company, "can_view_showcase", False) and "showcase_editor" not in out:
+        out["showcase_editor"] = {"code": "showcase_editor", "until": plan_until, "source": "tariff"}
+    free = _client_app_free()
+    if free is not None and free[0] not in out:
+        out[free[0]] = {"code": free[0], "until": free[1], "source": "support"}
+    return list(out.values())
 
 
 class CompanySerializer(serializers.ModelSerializer):

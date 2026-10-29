@@ -2,8 +2,14 @@ from django.urls import path, include
 
 from apps.main.mass_incoming_views import ProductMassIncomingAPIView
 from .views import *
+from .purchase_orders import PurchaseOrderListCreateAPIView, PurchaseOrderDetailAPIView
 from .price_check import ProductCatalogVersionView, ProductPriceCheckView
+from .change_views import ChangesFeedView  # ТЗ Н-31
+from .pos_requests import (PosRequestAcceptView, PosRequestCancelView, PosRequestDeclineView,
+                           PosRequestListCreateView)
 from .pos_views import *
+from apps.construction.views_buhgalter import AuditLogView
+from apps.construction.views_admin import TrashListView, TrashRestoreView
 from .kassa_stage3 import (
     AppointmentDetailAPIView,
     AppointmentListCreateAPIView,
@@ -29,7 +35,10 @@ from .kassa_views import (
 from .analytics_market import *
 from .analytics_dashboard import *
 from .document import SaleReceiptAPIView, SaleInvoiceAPIView
-from apps.main.showcase.views_public import PublicCompanyProductDetailAPIView, PublicCompanyAPIView, PublicCompanyShowcaseAPIView
+from apps.main.showcase.size_charts import SizeChartListCreateAPIView, SizeChartDetailAPIView
+from apps.main.supplier_receipt_pdf import SupplierReceiptPdfAPIView
+from apps.main.media_receipts import MainMediaListCreateAPIView, MainMediaDetailAPIView, SalePublicLinkAPIView
+from apps.main.showcase.views_public import PublicCompanyShowcaseFacetsAPIView, PublicCompanyProductDetailAPIView, PublicCompanyAPIView, PublicCompanyShowcaseAPIView
 from apps.main.recommendations import (
     RecommendationEventsAPIView,
     RecommendationLinkSaleAPIView,
@@ -39,6 +48,7 @@ from apps.main.recommendations import (
 )
 from apps.main.showcase.views_design import (
     ShowcaseDesignAPIView,
+    ShowcaseStockRequestListAPIView,
     ShowcaseDraftUpdateAPIView,
     ShowcaseDraftProductOrderAPIView,
     ShowcasePreviewLinkAPIView,
@@ -79,6 +89,7 @@ from apps.main.showcase.views_public_design import (
     PublicCompanyShowcasePageAPIView,
     PublicCompanyShowcaseCategoriesAPIView,
     PublicCompanyShowcaseCartQuoteAPIView,
+    PublicCompanyShowcaseNotifyAPIView,
 )
 from apps.main.inventory_views import (
     ProductInventorySessionListCreateAPIView,
@@ -102,6 +113,7 @@ from apps.main.production_salary_views import (
     ProductionSalarySummaryAPIView,
     ProductionPayoutListCreateAPIView,
 )
+from apps.main.market_salary_views import MarketSalaryPayoutDetailAPIView, MarketSalaryPayoutListCreateAPIView
 from apps.construction.views import CashFlowListCreateView
 from apps.users.app_settings_views import CompanyAppSettingsAPIView
 from apps.main.part12_views import (
@@ -112,7 +124,26 @@ from apps.main.part12_views import (
 )
 
 
+from apps.main.views_payables import SupplierPayablesAPIView
+from apps.main.telegram_bot.views import BotNotifyOwnerView
+from apps.main.ai_agent_api import (
+    ProductVoiceSearchAPIView, OrderDraftAPIView, OrderDraftStatusAPIView, VoiceCallAPIView,
+)
+from apps.main.views_idempotency import IdempotencyLookupAPIView
+
+from apps.main.client_documents import (
+    ClientDocumentDetailAPIView,
+    ClientDocumentListCreateAPIView,
+    ClientDocumentPayAPIView,
+)
+
+from apps.main.pos_bulk import CartClearAPIView, SaleItemsBulkAPIView  # ТЗ Н-15
+
 urlpatterns = [
+    # ТЗ «Админка»: журнал действий (тот же, что construction/audit-log/) и корзина удалённого
+    path("audit-log/", AuditLogView.as_view(), name="main-audit-log"),
+    path("trash/", TrashListView.as_view(), name="main-trash"),
+    path("trash/<str:type>/<str:object_id>/restore/", TrashRestoreView.as_view(), name="main-trash-restore"),
     # Приложение клиентов: поиск по телефону, QR, перенос бонусов, магазин в приложении, приглашения
     path("", include("apps.clientapp.staff_urls")),
 
@@ -148,6 +179,11 @@ urlpatterns = [
     path('products/list/', ProductListView.as_view(), name='product-list'),
     path('products/compact-list/', ProductCompactListView.as_view(), name='product-compact-list'),
     path('products/price-check/', ProductPriceCheckView.as_view(), name='product-price-check'),
+    path('pos/requests/', PosRequestListCreateView.as_view(), name='pos-requests'),  # ТЗ Н-31
+    path('pos/requests/<uuid:pk>/accept/', PosRequestAcceptView.as_view(), name='pos-request-accept'),
+    path('pos/requests/<uuid:pk>/decline/', PosRequestDeclineView.as_view(), name='pos-request-decline'),
+    path('pos/requests/<uuid:pk>/cancel/', PosRequestCancelView.as_view(), name='pos-request-cancel'),
+    path('changes/', ChangesFeedView.as_view(), name='changes-feed'),  # ТЗ Н-31
     path('products/catalog-version/', ProductCatalogVersionView.as_view(), name='product-catalog-version'),
     path('products/scale-export/', WeightProductsScaleExportAPIView.as_view(), name='product-scale-export'),
     path('products/create-by-barcode/', ProductCreateByBarcodeAPIView.as_view(), name='product-create-by-barcode'),
@@ -193,6 +229,8 @@ urlpatterns = [
     path("production/salary/accruals/", ProductionAccrualListAPIView.as_view(), name="production-salary-accruals"),
     path("production/salary/summary/", ProductionSalarySummaryAPIView.as_view(), name="production-salary-summary"),
     path("production/salary/payouts/", ProductionPayoutListCreateAPIView.as_view(), name="production-salary-payouts"),
+    path("market-salary/payouts/", MarketSalaryPayoutListCreateAPIView.as_view(), name="market-salary-payouts"),
+    path("market-salary/payouts/<uuid:pk>/", MarketSalaryPayoutDetailAPIView.as_view(), name="market-salary-payout-detail"),
 
     # Инвентаризация товаров (остаток Product.quantity)
     path("inventory/sessions/", ProductInventorySessionListCreateAPIView.as_view(), name="product-inventory-session-list"),
@@ -239,6 +277,7 @@ urlpatterns = [
 
     # 🔹 Уведомления
     path('notifications/', NotificationListView.as_view(), name='notification-list'),
+    path('notifications/unread-count/', NotificationUnreadCountView.as_view(), name='notification-unread-count'),
     path('notifications/mark-all-read/', MarkAllNotificationsReadView.as_view(), name='mark-all-notifications-read'),
     # алиас: часть клиентов зовёт read-all/ (см. realtime-notifications-backend.md)
     path('notifications/read-all/', MarkAllNotificationsReadView.as_view(), name='notifications-read-all'),
@@ -251,6 +290,10 @@ urlpatterns = [
     path('events/<uuid:pk>/', EventRetrieveUpdateDestroyAPIView.as_view(), name='event-detail'),
     path('orders/analytics/', OrderAnalyticsView.as_view(), name='order-analytics'),
     
+    # ТЗ Н-22: клиентские документы (КП, счёт, накладная)
+    path("client-documents/", ClientDocumentListCreateAPIView.as_view(), name="client-documents"),
+    path("client-documents/<uuid:pk>/", ClientDocumentDetailAPIView.as_view(), name="client-document-detail"),
+    path("client-documents/<uuid:pk>/pay/", ClientDocumentPayAPIView.as_view(), name="client-document-pay"),
     path("clients/", ClientListCreateAPIView.as_view(), name="client-list"),
     path("clients/<uuid:pk>/", ClientRetrieveUpdateDestroyAPIView.as_view(), name="client-detail"),
     path(
@@ -330,6 +373,7 @@ urlpatterns = [
     path("clients/with-debts/", ClientWithDebtsListAPIView.as_view(), name="clients-with-debts"),
     path("clients/debtors/", ClientDebtorsAPIView.as_view(), name="clients-debtors"),
     path("clients/<uuid:pk>/pay-debt/", ClientPayDebtAPIView.as_view(), name="client-pay-debt"),
+    path("clients/<uuid:client_id>/pay-supplier-debt/", SupplierDebtPayAPIView.as_view(), name="client-pay-supplier-debt"),
     path("clients/<uuid:client_id>/debts/", ClientDirectDebtAPIView.as_view(), name="client-direct-debt"),
     path("clients/<uuid:pk>/bonus/", ClientBonusAPIView.as_view(), name="client-bonus"),
     path("clients/<uuid:pk>/bonus/history/", ClientBonusHistoryAPIView.as_view(), name="client-bonus-history"),
@@ -349,6 +393,9 @@ urlpatterns = [
     path("pos/checkout/batch/", PosCheckoutBatchAPIView.as_view(), name="pos-checkout-batch"),
     path("pos/checkout/", PosQuickCheckoutAPIView.as_view(), name="pos-quick-checkout"),
     path("pos/returns/", SaleReturnListAPIView.as_view(), name="pos-return-list"),
+    path("pos/sales/<uuid:pk>/public-link/", SalePublicLinkAPIView.as_view(), name="pos-sale-public-link"),  # ТЗ Н-32
+    path("media/", MainMediaListCreateAPIView.as_view(), name="main-media"),  # ТЗ Н-32
+    path("media/<uuid:pk>/", MainMediaDetailAPIView.as_view(), name="main-media-detail"),
     path("pos/sales/<uuid:pk>/exchange/", SaleExchangeAPIView.as_view(), name="pos-sale-exchange"),
     path("products/<uuid:pk>/variants/", ProductVariantListCreateAPIView.as_view(), name="product-variants"),
     path("products/<uuid:pk>/variants/<uuid:vid>/", ProductVariantDetailAPIView.as_view(), name="product-variant-detail"),
@@ -369,6 +416,9 @@ urlpatterns = [
     path("pos/customer-display-settings/", MarketCustomerDisplaySettingsAPIView.as_view(), name="pos-customer-display-settings"),
     path("pos/sales/start/", SaleStartAPIView.as_view(), name="pos-sale-start"),
     path("pos/carts/<uuid:pk>/custom-item/", SaleAddCustomItemAPIView.as_view(), name="pos-cart-add-custom-item"),
+    # ТЗ Н-15: быстрые операции над корзиной
+    path("pos/sales/<uuid:pk>/items/bulk/", SaleItemsBulkAPIView.as_view(), name="pos-sale-items-bulk"),
+    path("pos/carts/<uuid:pk>/clear/", CartClearAPIView.as_view(), name="pos-cart-clear"),
     path("pos/carts/<uuid:pk>/", CartDetailAPIView.as_view(), name="pos-cart-detail"),
     path("sales/bulk-delete/", SaleBulkDeleteAPIView.as_view(), name="sale-bulk-delete"),
     path("pos/sales/<uuid:pk>/", SaleRetrieveAPIView.as_view(), name="pos-sale-detail"),
@@ -426,8 +476,14 @@ urlpatterns = [
     # -------------------------
     # Поставщики -> товары -> оприходование
     # -------------------------
+    path("suppliers/payables/", SupplierPayablesAPIView.as_view(), name="supplier-payables"),
+    # ТЗ Н-08: исход операции по ключу повтора
+    path("idempotency/<str:key>/", IdempotencyLookupAPIView.as_view(), name="idempotency-lookup"),
+    path("purchase-orders/", PurchaseOrderListCreateAPIView.as_view(), name="purchase-orders"),  # ТЗ Н-29
+    path("purchase-orders/<uuid:pk>/", PurchaseOrderDetailAPIView.as_view(), name="purchase-order-detail"),
     path("suppliers/", SupplierListAPIView.as_view(), name="supplier-list"),
     path("suppliers/receipts/", SupplierReceiptListAPIView.as_view(), name="supplier-receipts"),
+    path("suppliers/receipts/<uuid:pk>/pdf/", SupplierReceiptPdfAPIView.as_view(), name="supplier-receipt-pdf"),  # ТЗ Н-33
     path("suppliers/receipts/<uuid:pk>/", SupplierReceiptRetrieveAPIView.as_view(), name="supplier-receipt-detail"),
     path("suppliers/returns/", SupplierReturnListAPIView.as_view(), name="supplier-returns-list"),
     path("suppliers/returns/<uuid:pk>/", SupplierReturnRetrieveAPIView.as_view(), name="supplier-returns-detail"),
@@ -526,6 +582,8 @@ urlpatterns = [
 
     path("public/companies/<slug:slug>/", PublicCompanyAPIView.as_view()),
     path("public/companies/<slug:slug>/showcase/", PublicCompanyShowcaseAPIView.as_view()),
+    path("public/companies/<slug:slug>/showcase/<uuid:product_id>/notify/", PublicCompanyShowcaseNotifyAPIView.as_view(), name="public-company-showcase-notify"),
+    path("public/companies/<slug:slug>/showcase/facets/", PublicCompanyShowcaseFacetsAPIView.as_view(), name="public-company-showcase-facets"),
     path("public/companies/<slug:slug>/showcase/<uuid:product_id>/", PublicCompanyProductDetailAPIView.as_view()),
     path("public/companies/<slug:slug>/showcase/design/", PublicCompanyShowcaseDesignAPIView.as_view(), name="public-company-showcase-design"),
     path("public/companies/<slug:slug>/orders/", PublicCompanyShowcaseOrderCreateAPIView.as_view(), name="public-company-showcase-orders"),
@@ -553,6 +611,8 @@ urlpatterns = [
     path("showcase/design/versions/", ShowcaseVersionsListAPIView.as_view(), name="showcase-design-versions"),
     path("showcase/design/versions/<int:version>/restore/", ShowcaseVersionRestoreAPIView.as_view(), name="showcase-design-restore"),
 
+    path("showcase/size-charts/", SizeChartListCreateAPIView.as_view(), name="showcase-size-charts"),  # ТЗ Н-33
+    path("showcase/size-charts/<uuid:pk>/", SizeChartDetailAPIView.as_view(), name="showcase-size-chart-detail"),
     path("showcase/media/", ShowcaseMediaListCreateAPIView.as_view(), name="showcase-media-list-create"),
     path("showcase/media/<uuid:pk>/", ShowcaseMediaDetailAPIView.as_view(), name="showcase-media-detail"),
 
@@ -578,6 +638,7 @@ urlpatterns = [
 
     path("showcase/slug-check/", ShowcaseSlugCheckAPIView.as_view(), name="showcase-slug-check"),
 
+    path("showcase/stock-requests/", ShowcaseStockRequestListAPIView.as_view(), name="showcase-stock-requests"),
     path("showcase/orders/", ShowcaseOrderListAPIView.as_view(), name="showcase-orders-list"),
     path("showcase/orders/<uuid:pk>/", ShowcaseOrderDetailAPIView.as_view(), name="showcase-orders-detail"),
 
@@ -595,6 +656,12 @@ urlpatterns = [
     # ==========================
     # Telegram Bot & AI (TZ-BE-2026-06 / Часть 5)
     # ==========================
+    # ТЗ Н-24: голосовой агент и ИИ
+    path("products/search/", ProductVoiceSearchAPIView.as_view(), name="product-voice-search"),
+    path("orders/draft/", OrderDraftAPIView.as_view(), name="order-draft"),
+    path("orders/draft/status/", OrderDraftStatusAPIView.as_view(), name="order-draft-status"),
+    path("voice/calls/", VoiceCallAPIView.as_view(), name="voice-calls"),
+    path("bot/notify-owner/", BotNotifyOwnerView.as_view(), name="bot-notify-owner"),  # ТЗ Н-23
     path("telegram-bot/", include("apps.main.telegram_bot.urls")),
     path("telegram/", include("apps.main.telegram_bot.urls")),
 ]

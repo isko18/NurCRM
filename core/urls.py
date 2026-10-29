@@ -23,6 +23,8 @@ from .views_media_proxy import media_proxy
 from .views_version import ClientVersionView
 from .views_health import health_check
 from apps.main.telegram_bot.views_public import TelegramWebhookPublicView
+from apps.clientapp.landing import ReferralLandingView
+from apps.main.media_receipts import PublicReceiptAPIView, PublicReceiptPdfAPIView, PublicReceiptRatingAPIView
 
 if settings.ENABLE_API_DOCS:
     from rest_framework import permissions
@@ -44,10 +46,15 @@ if settings.ENABLE_API_DOCS:
 
 # Пути для включения различных приложений
 apps_includes = [
-    path('main/', include('apps.main.urls')),  
-    path('users/', include('apps.users.urls')),  
+    # ТЗ-28: bootstrap, stock/movements, products/stock, clients/<id>/debts (GET),
+    # pos/checkout с проверкой тела по Idempotency-Key, shifts/current.
+    # Стоят ПЕРЕД apps.main.urls и apps.construction.urls намеренно — перекрывают старые пути.
+    path('main/', include('apps.possync.urls')),
+    path('construction/', include('apps.possync.urls_construction')),
+    path('main/', include('apps.main.urls')),
+    path('users/', include('apps.users.urls')),
     path('platform-admin/', include('apps.users.platform_admin_urls')),
-    path('construction/', include('apps.construction.urls')),  
+    path('construction/', include('apps.construction.urls')),
     path('building/', include('apps.building.urls')),
     path('booking/', include('apps.booking.urls')),  
     path('barbershop/', include('apps.barber.urls')),   
@@ -64,18 +71,24 @@ apps_includes = [
     path('support/', include('apps.support.urls')),
     path('onec/', include('apps.onec.urls')),
     # path('crm/', include('apps.crm.urls')),
+    path('arenda/', include('apps.arenda.urls')),
 ]
 
 # API-роуты
 api_urlpatterns = [
     path("api/media-proxy/", media_proxy, name="media-proxy"),
     path("api/version/", ClientVersionView.as_view(), name="client-version"),
+    path("api/public/receipts/<str:token>/", PublicReceiptAPIView.as_view(), name="public-receipt"),  # ТЗ Н-32
+    path("api/public/receipts/<str:token>/pdf/", PublicReceiptPdfAPIView.as_view(), name="public-receipt-pdf"),
+    path("api/public/receipts/<str:token>/rating/", PublicReceiptRatingAPIView.as_view(), name="public-receipt-rating"),
     path("api/health/", health_check, name="api-health-check"),
     path("api/telegram/webhook/<uuid:bot_uuid>/", TelegramWebhookPublicView.as_view(), name="telegram-bot-webhook"),
     path("api/telegram/webhook/", TelegramWebhookPublicView.as_view(), name="telegram-bot-webhook-info"),
     path("telegram/webhook/<uuid:bot_uuid>/", TelegramWebhookPublicView.as_view(), name="telegram-bot-webhook-alt"),
     path("telegram/webhook/", TelegramWebhookPublicView.as_view(), name="telegram-bot-webhook-alt-info"),
     path('api/v1/', include('apps.clientapp.urls')),  # приложение клиентов (покупателей)
+    path('r/<str:code>/', ReferralLandingView.as_view(), name='capp-referral-landing'),  # ссылка-приглашение
+    path('r/<str:code>', ReferralLandingView.as_view()),
     path('api/', include(apps_includes)),
     path('', include(apps_includes)),
 ]

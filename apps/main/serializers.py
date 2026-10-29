@@ -12,6 +12,7 @@ from django.utils import timezone as dj_tz
 from django.utils.dateparse import parse_datetime, parse_date
 
 from apps.main.models import (
+    SizeChart,
     Contact, Pipeline, Deal, Task, Integration, Analytics, Order, Product, Review,
     ProductInventorySession, ProductInventoryItem,
     Notification, Event, Warehouse, WarehouseEvent, ProductCategory, ProductBrand,
@@ -160,7 +161,7 @@ class ProductImageReadSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProductImage
-        fields = ["id", "image_url", "alt", "is_primary", "created_at"]
+        fields = ["id", "image_url", "alt", "is_primary", "color", "created_at"]
         read_only_fields = fields  # всё только на чтение тут
 
     def get_image_url(self, obj):
@@ -805,7 +806,7 @@ class ProductImageSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProductImage
-        fields = ["id", "image", "image_url", "alt", "is_primary", "created_at"]
+        fields = ["id", "image", "image_url", "alt", "is_primary", "color", "created_at"]
         read_only_fields = ["id", "image_url", "created_at"]
 
     def get_image_url(self, obj):
@@ -1106,6 +1107,21 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
     # ====== рецепт (сырьё + расход на 1 ед.) ======
     recipe = RecipeItemReadSerializer(source="recipe_items", many=True, read_only=True)
 
+    # ТЗ Н-33: таблица размеров товара (id из showcase/size-charts/)
+    size_chart = serializers.PrimaryKeyRelatedField(
+        queryset=SizeChart.objects.all(), required=False, allow_null=True
+    )
+
+    def validate_size_chart(self, value):
+        if value is not None:
+            req = self.context.get("request")
+            cid = getattr(getattr(req, "user", None), "company_id", None) or getattr(
+                getattr(getattr(req, "user", None), "owned_company", None), "id", None
+            )
+            if cid and value.company_id != cid:
+                raise serializers.ValidationError("Таблица размеров другой компании.")
+        return value
+
     # ====== клиент ======
     client = serializers.PrimaryKeyRelatedField(
         queryset=Client.objects.all(),
@@ -1270,6 +1286,7 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             "total_price",
             "purchase_batches",
             "cashflows",
+            "size_chart",  # ТЗ Н-33
         ]
 
         read_only_fields = [
@@ -1652,6 +1669,8 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             data = super().to_representation(instance)
         if "stock" in data:
             data["is_promo"] = data["stock"]
+        if hasattr(self, "_price_changed"):
+            data["price_changed"] = self._price_changed
         try:
             data["alternate_barcodes"] = [
                 {"barcode": item.barcode, "name": item.name, "quantity": item.quantity}
@@ -1659,6 +1678,13 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             ]
         except Exception:
             data["alternate_barcodes"] = []
+        if self.context.get("include_variants"):  # ТЗ Н-33: ?include=variants
+            from apps.main.kassa_stage3 import ProductVariantSerializer
+
+            data["variants"] = ProductVariantSerializer(
+                sorted(instance.variants.all(), key=lambda v: (v.sort_order, v.size, v.color)), many=True,
+                context={"product": instance},
+            ).data
         return data
 
     # ==== CREATE / UPDATE ====
@@ -1812,6 +1838,22 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
         promotion_raw = validated_data.pop("promotion_rules_input", None) if promotion_in else None
         alt_in = "alternate_barcodes" in getattr(self, "initial_data", {})
         alternate_raw = validated_data.pop("alternate_barcodes", None) if alt_in else None
+        # ТЗ 11.6: characteristics (read-only в схеме) принимаем из тела PATCH, как в create-manual.
+        chars_raw = getattr(self, "initial_data", {}).get("characteristics") if hasattr(getattr(self, "initial_data", None), "get") else None
+        if isinstance(chars_raw, dict):
+            chars_ser = ProductCharacteristicsSerializer(
+                instance=getattr(instance, "characteristics", None), data=chars_raw, partial=True
+            )
+            chars_ser.is_valid(raise_exception=True)
+            chars_obj, _ = ProductCharacteristics.objects.update_or_create(
+                product=instance,
+                defaults={
+                    "company": instance.company,
+                    "branch": instance.branch,
+                    **chars_ser.validated_data,
+                },
+            )
+            instance.characteristics = chars_obj  # сбросить кэш, чтобы ответ показал новые значения
         if promotion_in and promotion_raw:
             try:
                 pr_rows = parse_product_promotion_tiers_payload(promotion_raw)
@@ -1860,16 +1902,25 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
             markup_percent = self._to_dec(validated_data["markup_percent"])
             price = self._calc_price(purchase_price, markup_percent)
 
-        # 3) иначе пришёл только purchase_price -> пересчитываем разумно
+        # 3) иначе пришёл только purchase_price -> цена продажи не меняется,
+        #    наценка пересчитывается к текущей цене. Пересчёт цены от наценки —
+        #    только по явному "recalc_price": true (ТЗ Н-04: иначе 11 → 1 → 11
+        #    давало цену 165 вместо 15).
         elif has_purchase:
-            if Decimal(instance.markup_percent or 0) != Decimal("0"):
+            raw_recalc = getattr(self, "initial_data", {}).get("recalc_price")
+            if str(raw_recalc).lower() in ("true", "1") and Decimal(instance.markup_percent or 0) != Decimal("0"):
                 price = self._calc_price(purchase_price, markup_percent)
             else:
                 markup_percent = self._calc_markup(purchase_price, price)
 
+        old_price = instance.price
         instance.purchase_price = purchase_price
         instance.markup_percent = markup_percent
         instance.price = price
+        # save() пересчитывает цену от наценки; цена здесь уже согласована —
+        # не даём округлению наценки сдвинуть её на копейки.
+        instance._manual_price = True
+        self._price_changed = Decimal(str(old_price or 0)) != Decimal(str(price or 0))
 
         # ===== PATCH-friendly обновление остальных полей =====
         updatable_fields = (
@@ -1902,6 +1953,9 @@ class ProductSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer)
                     )
                 else:
                     setattr(instance, field, validated_data[field])
+
+        if "size_chart" in validated_data:  # ТЗ Н-33
+            instance.size_chart = validated_data["size_chart"]
 
         if "stock" in validated_data:
             instance.stock = validated_data["stock"]
@@ -2205,6 +2259,21 @@ class ClientSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
             'id', 'company', 'branch', 'created_at', 'updated_at',
             'salesperson_display', 'service_display', 'bonus_balance'
         ]
+        # ТЗ 12.16: телефон обязателен всем, кроме поставщиков (см. validate)
+        extra_kwargs = {'phone': {'required': False, 'allow_blank': True}}
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        inst = getattr(self, 'instance', None)
+        client_type = attrs.get('type', getattr(inst, 'type', None))
+        # проверяем при создании или когда телефон явно присылают (старых клиентов без телефона не трогаем)
+        if inst is None or 'phone' in attrs:
+            phone = (attrs.get('phone') or '').strip()
+            if not phone and client_type != Client.StatusClient.SUPPLIERS:
+                raise serializers.ValidationError({'phone': 'Укажите телефон.'})
+        if inst is None:
+            attrs.setdefault('phone', '')
+        return attrs
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2272,6 +2341,37 @@ class DealPaymentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
     installment_number = serializers.IntegerField(source="installment.number", read_only=True)
 
     created_by = serializers.ReadOnlyField(source="created_by.id")
+    # ТЗ Н-11: кто принял/выплатил и из какой кассы (касса — по связанному движению денег)
+    created_by_name = serializers.SerializerMethodField()
+    cashbox = serializers.SerializerMethodField()
+    cashbox_name = serializers.SerializerMethodField()
+
+    def get_created_by_name(self, obj):
+        u = obj.created_by
+        if u is None:
+            return None
+        full = f"{getattr(u, 'first_name', '') or ''} {getattr(u, 'last_name', '') or ''}".strip()
+        return full or getattr(u, "email", None)
+
+    def _cashflow(self, obj):
+        cache = self.context.setdefault("_deal_pay_cf", {})
+        if obj.pk not in cache:
+            from django.db.models import Q
+            from apps.construction.models import CashFlow
+            cache[obj.pk] = (
+                CashFlow.objects.select_related("cashbox")
+                .filter(Q(idempotency_key=f"deal-pay:{obj.pk}") | Q(source_id=str(obj.pk)))
+                .order_by("created_at").first()
+            )
+        return cache[obj.pk]
+
+    def get_cashbox(self, obj):
+        cf = self._cashflow(obj)
+        return str(cf.cashbox_id) if cf and cf.cashbox_id else None
+
+    def get_cashbox_name(self, obj):
+        cf = self._cashflow(obj)
+        return cf.cashbox.name if cf and cf.cashbox_id else None
 
     class Meta:
         model = DealPayment
@@ -2290,6 +2390,9 @@ class DealPaymentSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSeriali
             "note",
             "payment_method",
             "created_at",
+            "created_by_name",
+            "cashbox",
+            "cashbox_name",
         )
         read_only_fields = fields
 
@@ -3359,6 +3462,14 @@ class SupplierReceiptItemSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
     )
+    # ТЗ Н-04: пересчитать цену продажи от новой закупки по текущей наценке.
+    recalc_price = serializers.BooleanField(required=False, default=False)
+    # ТЗ Н-27: приход по варианту (размер/цвет): всё количество строки — в этот вариант;
+    # либо раскладка variants=[{variant, qty}], сумма которой должна равняться qty строки.
+    variant = serializers.UUIDField(required=False, allow_null=True)
+    variants = serializers.ListField(
+        child=serializers.DictField(), required=False, allow_empty=True
+    )
 
 
 class SupplierReceiptCreateSerializer(serializers.Serializer):
@@ -3416,11 +3527,21 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
     returned_amount = serializers.SerializerMethodField()
     returned_qty = serializers.SerializerMethodField()
     has_returns = serializers.SerializerMethodField()
+    # ТЗ Н-10: способ оплаты прихода (выводится из сделки/расхода/журнала закупок)
+    payment_type = serializers.SerializerMethodField()
+    paid_amount = serializers.SerializerMethodField()
+    debt_amount = serializers.SerializerMethodField()
+    deal_id = serializers.SerializerMethodField()
+    cashbox = serializers.SerializerMethodField()
+    cashbox_name = serializers.SerializerMethodField()
+    shift = serializers.SerializerMethodField()
+    order_id = serializers.UUIDField(read_only=True, allow_null=True)  # ТЗ Н-29
 
     class Meta:
         model = SupplierReceipt
         fields = [
             "id",
+            "order_id",
             "company",
             "branch",
             "supplier_id",
@@ -3435,8 +3556,49 @@ class SupplierReceiptReadSerializer(serializers.ModelSerializer):
             "returned_amount",
             "returned_qty",
             "has_returns",
+            "payment_type",
+            "paid_amount",
+            "debt_amount",
+            "deal_id",
+            "cashbox",
+            "cashbox_name",
+            "shift",
+            "discount",  # ТЗ Н-33
+            "discount_percent",
+            "extra_costs",
             "items",
         ]
+
+    def _pay_info(self, obj):
+        from apps.main.views import _receipt_payment_info
+        cache = self.context.get("receipt_info")
+        if cache is None:
+            cache = self.context["receipt_info"] = {}
+        key = str(obj.id)
+        if key not in cache:
+            cache.update(_receipt_payment_info([obj]))
+        return cache.get(key) or {}
+
+    def get_payment_type(self, obj):
+        return self._pay_info(obj).get("payment_type")
+
+    def get_paid_amount(self, obj):
+        return self._pay_info(obj).get("paid_amount")
+
+    def get_debt_amount(self, obj):
+        return self._pay_info(obj).get("debt_amount")
+
+    def get_deal_id(self, obj):
+        return self._pay_info(obj).get("deal_id")
+
+    def get_cashbox(self, obj):
+        return self._pay_info(obj).get("cashbox")
+
+    def get_cashbox_name(self, obj):
+        return self._pay_info(obj).get("cashbox_name")
+
+    def get_shift(self, obj):
+        return self._pay_info(obj).get("shift")
 
     def get_created_by_name(self, obj):
         u = obj.created_by
@@ -4319,7 +4481,11 @@ class AgentRequestCartSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSe
 
 class MarketSaleEmployeePayProfileSerializer(CompanyBranchReadOnlyMixin, serializers.ModelSerializer):
     company = serializers.ReadOnlyField(source="company.id")
-    branch = serializers.ReadOnlyField(source="branch.id")
+    # ТЗ 12.21: branch можно передать явно (null = схема для всех филиалов) и он всегда возвращается.
+    # Не передан -> как раньше: активный филиал запроса или null.
+    branch = serializers.PrimaryKeyRelatedField(
+        queryset=Branch.objects.all(), required=False, allow_null=True
+    )
 
     class Meta:
         model = MarketSaleEmployeePayProfile
@@ -4340,7 +4506,23 @@ class MarketSaleEmployeePayProfileSerializer(CompanyBranchReadOnlyMixin, seriali
         company = self._user_company()
         if company and hasattr(User, "company_id"):
             fields["user"].queryset = User.objects.filter(company_id=company.id)
+        if company and "branch" in fields:
+            fields["branch"].queryset = Branch.objects.filter(company_id=company.id)
         return fields
+
+    def create(self, validated_data):
+        company = self._user_company()
+        if company:
+            validated_data["company"] = company
+        if "branch" not in validated_data:
+            validated_data["branch"] = self._auto_branch()
+        return serializers.ModelSerializer.create(self, validated_data)
+
+    def update(self, instance, validated_data):
+        company = self._user_company()
+        if company:
+            validated_data["company"] = company
+        return serializers.ModelSerializer.update(self, instance, validated_data)
 
     def validate(self, attrs):
         data = super().validate(attrs)

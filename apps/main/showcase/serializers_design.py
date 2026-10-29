@@ -17,6 +17,7 @@ from apps.main.models import (
     ShowcaseOrderItem,
     ShowcasePromoBlock,
     ShowcaseStats,
+    ShowcaseStockRequest,
     _cart_item_promotion,
     _money,
 )
@@ -337,11 +338,19 @@ class ShowcaseOrderSerializer(serializers.ModelSerializer):
             "source",
             "sale",
             "stock_reserved",
+            "pickup_code",  # ТЗ Н-33
             "items",
             "created_at",
             "updated_at",
         ]
         read_only_fields = ["id", "number", "total", "sale", "stock_reserved", "created_at", "updated_at"]
+        extra_kwargs = {"pickup_code": {"required": False}}
+
+    def validate_pickup_code(self, value):
+        value = (value or "").strip()
+        if value and not (value.isdigit() and 4 <= len(value) <= 6):
+            raise serializers.ValidationError("Код выдачи — 4–6 цифр.")
+        return value
 
 
 class ShowcaseOrderCreateItemSerializer(serializers.Serializer):
@@ -374,3 +383,21 @@ class ShowcaseOrderCreateSerializer(serializers.Serializer):
     delivery = ShowcaseOrderDeliverySerializer(required=False, default=dict)
     comment = serializers.CharField(required=False, allow_blank=True, default="", max_length=2000)
     source = serializers.CharField(required=False, default="showcase", allow_blank=True, max_length=32)
+
+
+class ShowcaseStockRequestSerializer(serializers.ModelSerializer):
+    """ТЗ Н-27: заявка «сообщить о поступлении» для владельца."""
+
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    variant_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ShowcaseStockRequest
+        fields = ["id", "product", "product_name", "variant", "variant_label", "phone", "telegram_chat_id",
+                  "status", "created_at", "notified_at"]
+        read_only_fields = fields
+
+    def get_variant_label(self, obj):
+        from apps.main.variant_utils import variant_label
+
+        return variant_label(obj.variant)

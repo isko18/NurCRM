@@ -128,14 +128,20 @@ INSTALLED_APPS = [
     'apps.ekassa',
     'apps.onec',
     'apps.releases',
+    'apps.possync',
     'apps.integrations',
     'apps.support',
     'apps.clientapp',
     # 'apps.crm',
+    'apps.arenda',
 ]
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
+    # ТЗ-28 §2.4: сжатие JSON > 200 байт (каталог 10 000 товаров ~12 МБ → ~1,5 МБ).
+    'django.middleware.gzip.GZipMiddleware',
+    # ТЗ-28 §11.2–11.4: X-Request-Id, X-Server-Time, журнал медленных запросов.
+    'core.middleware.RequestMetaMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -270,6 +276,9 @@ CLIENT_ZIP_URL = os.getenv(
     "CLIENT_ZIP_URL", "https://app.nurcrm.kg/downloads/NurCRM-1.0.0.zip"
 )
 CLIENT_RELEASE_NOTES = os.getenv("CLIENT_RELEASE_NOTES", "Первый релиз")
+
+# ТЗ-28 §11.4: порог журнала медленных запросов, мс
+SLOW_REQUEST_MS = _get_int_env("SLOW_REQUEST_MS", 1000)
 
 REST_FRAMEWORK = {
     'EXCEPTION_HANDLER': 'core.exceptions.api_exception_handler',
@@ -619,6 +628,11 @@ LOGGING = {
         },
     },
     'loggers': {
+        'nurcrm.slow_requests': {
+            'handlers': ['console'],
+            'level': 'WARNING',
+            'propagate': False,
+        },
         'nurcrm.websocket.auth': {
             'handlers': ['console'],
             'level': _WS_LOG_LEVEL,
@@ -683,3 +697,7 @@ WAZZUP_DEFAULT_CHANNEL_ID = os.getenv("WAZZUP_DEFAULT_CHANNEL_ID", "")
 # Consulting CRM tenant provision default sector (Sector 'Магазин' / 'Маркет')
 CONSULTING_DEFAULT_CRM_SECTOR_ID = os.getenv("CONSULTING_DEFAULT_CRM_SECTOR_ID", "e9f05beb-5e14-4153-b523-4e1600c9b2e0")
 
+
+# ТЗ Н-32: квота медиа-хранилища на компанию (МБ) и шаблон ссылки на электронный чек
+COMPANY_MEDIA_QUOTA_MB = int(os.getenv("COMPANY_MEDIA_QUOTA_MB", "500"))
+RECEIPT_PUBLIC_URL_TEMPLATE = os.getenv("RECEIPT_PUBLIC_URL_TEMPLATE", "https://market.nurcrm.kg/receipt/{token}")
