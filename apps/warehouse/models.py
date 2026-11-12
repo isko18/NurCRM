@@ -2025,7 +2025,17 @@ class DocumentItem(models.Model):
                 # Для документов агента возможны два режима списания:
                 # - use_common_stock=True: списываем со склада (общий товар) — не требуем AgentStockBalance
                 # - use_common_stock=False: списываем с остатков агента — требуем AgentStockBalance
-                if not bool(getattr(doc, "use_common_stock", False)):
+                # Входящие операции (возврат продажи, приход) остаток агента не требуют:
+                # при проведении запись AgentStockBalance создаётся автоматически.
+                _incoming_types = (
+                    Document.DocType.SALE_RETURN,
+                    Document.DocType.PURCHASE,
+                    Document.DocType.RECEIPT,
+                )
+                if (
+                    not bool(getattr(doc, "use_common_stock", False))
+                    and doc.doc_type not in _incoming_types
+                ):
                     has_balance = AgentStockBalance.objects.filter(
                         agent_id=doc.agent_id,
                         warehouse_id=item_warehouse_id,
